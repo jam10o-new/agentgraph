@@ -1,0 +1,20 @@
+[package]
+name = "agentgraph"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+notify = "6"
+base64 = "0.22"
+walkdir = "2"
+image = "0.25" 
+mistralrs = { version = "0.7.1-alpha.1", features = ["cuda", "cudnn", "flash-attn"], git = "https://github.com/guoqingbao/mistral.rs" }
+humantime = "2.3.0"
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+rand = { version = "0.10.0" }
+chrono = { version = "0.4.44", features = ["serde"] }
+futures = "0.3.32"
