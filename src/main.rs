@@ -1408,11 +1408,17 @@ enum StreamOutcome {
     /// `output_buffer` and restart inference.
     CommandExecuted(String),
     /// Inference was cancelled because a new audio chunk arrived.
-    AudioInterrupted { response: String, audio: Option<Vec<u8>> },
+    AudioInterrupted {
+        response: String,
+        audio: Option<Vec<u8>>,
+    },
     /// Inference was cancelled by a filesystem event (or the coroutine returned
     /// `Interrupted` for another reason). If `event` is `Some`, the caller
     /// should call `handle_interrupt` before restarting.
-    FsInterrupted { response: String, event: Option<notify::Event> },
+    FsInterrupted {
+        response: String,
+        event: Option<notify::Event>,
+    },
 }
 
 /// Drives a single streaming inference to completion (or interruption).
@@ -1436,6 +1442,7 @@ async fn run_streaming_loop(
     let mut cmd_parser = CommandParser::new();
     let mut tool_context = String::new();
     let mut response = String::new();
+    let mut last_modify_interrupt: Option<std::time::Instant> = None;
     let mut inference_fut = std::pin::pin!(run_inference_coroutine(
         model,
         params,
@@ -1527,21 +1534,23 @@ async fn run_streaming_loop(
                 }
             } => {
                 if let Some(Ok(ev)) = event {
-                    if is_interrupt_event(&ev) {
+                    if is_interrupt_event(&ev, &mut last_modify_interrupt, args.sleep_ms) {
                         let _ = cancel_tx.send(true);
                         return Ok(StreamOutcome::FsInterrupted { response, event: Some(ev) });
                     }
                 }
             }
+
         }
     }
 }
-
 
 async fn run_once(
     model: &Arc<mistralrs::Model>,
     args: &Args,
     mut interrupt_rx: Option<broadcast::Receiver<Result<notify::Event, Arc<notify::Error>>>>,
+    audio_channels: Option<(broadcast::Receiver<()>, watch::Receiver<Option<Vec<u8>>>)>,
+    pending_audio: Vec<Vec<u8>>,
 ) -> Result<()> {
     if args.verbose {
         eprintln!("Building messages..");
@@ -1589,34 +1598,24 @@ async fn run_once(
         None
     };
 
-    // Spawn realtime listener if needed
-    let mut _realtime_listener_guard = None;
-    let (latest_audio_tx, latest_audio_rx) = watch::channel::<Option<Vec<u8>>>(None);
-    let mut _audio_buffer_task = None;
-    let mut speech_detected_rx = None;
+    // Use externally-owned audio channels when supplied (leader path).
+    // handle_request (worker path) passes None for both.
+    let (mut speech_detected_rx, latest_audio_rx): (Option<broadcast::Receiver<()>>, watch::Receiver<Option<Vec<u8>>>) =
+        match audio_channels {
+            Some((sdr, lar)) => (Some(sdr), lar),
+            None => {
+                let (_, rx) = watch::channel::<Option<Vec<u8>>>(None);
+                (None, rx)
+            }
+        };
 
     let (_primary_messages, secondary_messages) = build_messages(model, args).await?;
     let has_secondary = secondary_messages.is_some() && args.secondary_model != "none";
 
-    if (args.realtime_listener.is_some() && stream_realtime) || has_secondary {
-        let source = args.realtime_listener.as_ref().unwrap();
-        let listener = spawn_realtime_listener(source, args, model.clone())
-            .await
-            .context("Failed to spawn realtime listener")?;
-        speech_detected_rx = Some(listener.speech_detected_rx.resubscribe());
-        let mut chunk_rx = listener.chunk_rx;
-        _audio_buffer_task = Some(tokio::spawn(async move {
-            while let Some(chunk) = chunk_rx.recv().await {
-                let _ = latest_audio_tx.send(Some(chunk));
-            }
-        }));
-        _realtime_listener_guard = Some(listener.shutdown_tx);
-    }
-
     let mut output_buffer = String::new();
     let mut restart_count = 0;
-    let mut audio_interrupt_pending = false;
-    let mut pending_audio_queue: Vec<Vec<u8>> = Vec::new();
+    let mut audio_interrupt_pending = !pending_audio.is_empty();
+    let mut pending_audio_queue: Vec<Vec<u8>> = pending_audio;
     let mut subprocesses: Vec<CommandIO> = Vec::new();
 
     'restart_loop: loop {
@@ -1831,15 +1830,13 @@ async fn run_once(
         }
     } // end 'restart_loop
 
-    // Cleanup
-    if let Some(shutdown) = _realtime_listener_guard.take() {
-        if args.verbose {
-            eprintln!("Closing audio listener.");
-        }
-        let _ = shutdown.send(());
-    }
+    // Cleanup — listener is now owned by main, nothing to shut down here.
 
-    drop(realtime_file);
+    // Explicitly close the realtime file handle so the OS flushes and fires
+    // IN_CLOSE_WRITE before we return — downstream watchers rely on this event.
+    if let Some(mut f) = realtime_file.take() {
+        let _ = f.shutdown().await;
+    }
     drop(subprocesses);
 
     if !stream_realtime {
@@ -1984,11 +1981,30 @@ async fn execute_command(
     }
 }
 
-fn is_interrupt_event(event: &notify::Event) -> bool {
-    matches!(
-        event.kind,
-        notify::EventKind::Create(_) | notify::EventKind::Modify(_)
-    )
+fn is_interrupt_event(
+    event: &notify::Event,
+    last_modify: &mut Option<std::time::Instant>,
+    cooldown_ms: u64,
+) -> bool {
+    match &event.kind {
+        notify::EventKind::Create(_) => true,
+        notify::EventKind::Access(notify::event::AccessKind::Close(
+            notify::event::AccessMode::Write | notify::event::AccessMode::Any,
+        )) => true,
+        notify::EventKind::Modify(_) => {
+            let now = std::time::Instant::now();
+            let elapsed = last_modify
+                .map(|t| now.duration_since(t).as_millis() as u64)
+                .unwrap_or(u64::MAX);
+            if elapsed >= cooldown_ms {
+                *last_modify = Some(now);
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 async fn handle_interrupt(
@@ -1998,7 +2014,10 @@ async fn handle_interrupt(
     args: &Args,
 ) -> Result<()> {
     match event.kind {
-        notify::EventKind::Create(_) => {
+        notify::EventKind::Create(_)
+        | notify::EventKind::Access(notify::event::AccessKind::Close(
+            notify::event::AccessMode::Write | notify::event::AccessMode::Any,
+        )) => {
             if args.output_new.is_some() {
                 let new_timestamp = chrono::Utc::now().timestamp_millis();
                 let new_path = args
@@ -2201,6 +2220,13 @@ async fn main() -> Result<()> {
 
     let mut model: Option<Arc<mistralrs::Model>> = None;
 
+    // Persistent realtime listener — lives for the full process lifetime.
+    // Spawned lazily on first model load so we have a model handle for detect_speech.
+    let mut persistent_listener: Option<(broadcast::Receiver<()>, watch::Receiver<Option<Vec<u8>>>)> = None;
+    let mut _listener_guard: Option<oneshot::Sender<()>> = None;
+    // Audio chunks queued by the main loop to be handed to the next run_once call.
+    let mut queued_audio: Vec<Vec<u8>> = Vec::new();
+
     loop {
         let upstream = find_oldest_pipe(my_pid).await;
 
@@ -2249,6 +2275,28 @@ async fn main() -> Result<()> {
                                 if args.verbose {
                                     eprintln!("Model initialized");
                                 }
+                                // Spawn the persistent audio listener now that we have a model.
+                                if args.realtime_listener.is_some() && persistent_listener.is_none() {
+                                    let source = args.realtime_listener.as_ref().unwrap();
+                                    match spawn_realtime_listener(source, &args, model.as_ref().unwrap().clone()).await {
+                                        Ok(rl) => {
+                                            let (latest_audio_tx, latest_audio_rx) = watch::channel::<Option<Vec<u8>>>(None);
+                                            let speech_rx = rl.speech_detected_rx.resubscribe();
+                                            let mut chunk_rx = rl.chunk_rx;
+                                            tokio::spawn(async move {
+                                                while let Some(chunk) = chunk_rx.recv().await {
+                                                    let _ = latest_audio_tx.send(Some(chunk));
+                                                }
+                                            });
+                                            persistent_listener = Some((speech_rx, latest_audio_rx));
+                                            _listener_guard = Some(rl.shutdown_tx);
+                                            if args.verbose {
+                                                eprintln!("Persistent audio listener spawned.");
+                                            }
+                                        }
+                                        Err(e) => eprintln!("Failed to spawn realtime listener: {}", e),
+                                    }
+                                }
                             }
                             let req = InferenceRequest {
                                 args: args.clone(),
@@ -2279,19 +2327,72 @@ async fn main() -> Result<()> {
                         if args.verbose {
                             eprintln!("Model initialized");
                         }
+                        // Spawn persistent listener if not yet running.
+                        if args.realtime_listener.is_some() && persistent_listener.is_none() {
+                            let source = args.realtime_listener.as_ref().unwrap();
+                            match spawn_realtime_listener(source, &args, model.as_ref().unwrap().clone()).await {
+                                Ok(rl) => {
+                                    let (latest_audio_tx, latest_audio_rx) = watch::channel::<Option<Vec<u8>>>(None);
+                                    let speech_rx = rl.speech_detected_rx.resubscribe();
+                                    let mut chunk_rx = rl.chunk_rx;
+                                    tokio::spawn(async move {
+                                        while let Some(chunk) = chunk_rx.recv().await {
+                                            let _ = latest_audio_tx.send(Some(chunk));
+                                        }
+                                    });
+                                    persistent_listener = Some((speech_rx, latest_audio_rx));
+                                    _listener_guard = Some(rl.shutdown_tx);
+                                    if args.verbose {
+                                        eprintln!("Persistent audio listener spawned.");
+                                    }
+                                }
+                                Err(e) => eprintln!("Failed to spawn realtime listener: {}", e),
+                            }
+                        }
                     }
 
                     let m = model.as_ref().unwrap().clone();
                     let lock = inference_lock.clone();
-                    // Clone the broadcast sender to pass to the task
                     let interrupt_tx = fs_tx.clone();
+                    // Pass a resubscribed speech receiver + current audio snapshot.
+                    let audio_chans = persistent_listener.as_ref().map(|(sdr, lar)| {
+                        (sdr.resubscribe(), lar.clone())
+                    });
+                    let audio_queue = std::mem::take(&mut queued_audio);
 
                     tokio::spawn(async move {
                         let _guard = lock.lock().await;
-                        // Pass the sender to handle_request so it can subscribe
-                        handle_request(stream, m, interrupt_tx).await;
+                        handle_request(stream, m, interrupt_tx, audio_chans, audio_queue).await;
                     });
                 }
+            }
+
+            // Audio-triggered inference: speech detected by the persistent listener.
+            _ = async {
+                if let Some((ref mut sdr, _)) = persistent_listener {
+                    sdr.recv().await.ok().map(|_| ())
+                } else {
+                    std::future::pending::<Option<()>>().await
+                }
+            }, if inference_lock.try_lock().is_ok() => {
+                if args.verbose {
+                    eprintln!("Speech detected — triggering audio-first inference.");
+                }
+                // Snapshot the latest audio chunk into the queue.
+                if let Some((_, ref lar)) = persistent_listener {
+                    if let Some(chunk) = lar.borrow().clone() {
+                        queued_audio.push(chunk);
+                    }
+                }
+                if model.is_none() {
+                    println!("Loading model for audio-triggered inference...");
+                    model = Some(Arc::new(load_model(&args).await?));
+                }
+                let req = InferenceRequest {
+                    args: args.clone(),
+                    requesting_pid: my_pid,
+                };
+                let _ = send_request(&my_pipe_path, req).await;
             }
         }
 
@@ -2343,15 +2444,19 @@ async fn load_model(args: &Args) -> Result<mistralrs::Model> {
         builder = builder.add_model_with_alias(&primary_alias, primary_builder);
     };
 
-    if args.verbose {
-        eprintln!("Loading Secondary Model");
+    // Only load secondary (audio) model when it is actually needed.
+    if args.secondary_model != "none" && args.realtime_listener.is_some() {
+        if args.verbose {
+            eprintln!("Loading Secondary Model");
+        }
+        let secondary_builder = mistralrs::VisionModelBuilder::new(&args.secondary_model)
+            .with_auto_isq(IsqBits::Four)
+            .with_dtype(mistralrs::ModelDType::F32)
+            .with_logging();
+        builder = builder.add_model_with_alias(&secondary_alias, secondary_builder);
+    } else if args.verbose {
+        eprintln!("Skipping secondary model (not needed).");
     }
-    // Add secondary model (audio)
-    let secondary_builder = mistralrs::VisionModelBuilder::new(&args.secondary_model)
-        .with_auto_isq(IsqBits::Four)
-        .with_dtype(mistralrs::ModelDType::F32)
-        .with_logging();
-    builder = builder.add_model_with_alias(&secondary_alias, secondary_builder);
     if args.verbose {
         eprintln!("Building Models");
     }
@@ -2376,15 +2481,16 @@ async fn handle_request(
     stream: UnixStream,
     model: Arc<mistralrs::Model>,
     interrupt_tx: broadcast::Sender<Result<notify::Event, Arc<notify::Error>>>,
+    audio_channels: Option<(broadcast::Receiver<()>, watch::Receiver<Option<Vec<u8>>>)>,
+    pending_audio: Vec<Vec<u8>>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     if let Ok(_) = reader.read_line(&mut line).await {
         if let Ok(req) = serde_json::from_str::<InferenceRequest>(&line) {
             println!("Handling request from PID {}", req.requesting_pid);
-            // Subscribe to interrupts for this specific run
             let interrupt_rx = interrupt_tx.subscribe();
-            let _ = run_once(&model, &req.args, Some(interrupt_rx)).await;
+            let _ = run_once(&model, &req.args, Some(interrupt_rx), audio_channels, pending_audio).await;
         }
     }
 }
