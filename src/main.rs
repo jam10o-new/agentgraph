@@ -1,26 +1,25 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use notify::{RecursiveMode, Watcher};
-use std::{
-    path::{Path, PathBuf}
-};
+use std::fmt::Debug;
+use std::path::{Path, PathBuf};
 
-use mistralrs::{TextMessageRole, VisionMessages, VisionModelBuilder, GgufModelBuilder, IsqType};
+use mistralrs::{GgufModelBuilder, IsqBits, TextMessageRole, VisionMessages, VisionModelBuilder};
 use std::sync::Arc;
 
 use walkdir::WalkDir;
 
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{channel, Sender, Receiver};
-use tokio::sync::{Mutex, broadcast};
-use tokio::sync::oneshot;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::fs::{self, File};
-use tokio::process::Command;
 use std::collections::BTreeSet;
 use std::time::Duration;
-use rand::RngExt;
+use tokio::fs::{self, File};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::process::Command;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::oneshot;
+use tokio::sync::{Mutex, broadcast};
 
 // Add these constants near the top of your file
 const CMD_OPEN_EXEC: &str = "【EXEC ";
@@ -36,9 +35,9 @@ const MAX_OPENER_LEN: usize = 6; // "【EXEC " is 6 chars
 
 // Command types
 enum CommandType {
-    Exec(String), // full command string: "command arg arg"
-    Kill(usize),  // index
-    Read(usize),  // index
+    Exec(String),        // full command string: "command arg arg"
+    Kill(usize),         // index
+    Read(usize),         // index
     Writ(usize, String), // index and input
 }
 
@@ -67,10 +66,9 @@ impl CommandParser {
     // Check if combined (buffer + new content) contains a command opener
     // Returns (bytes_before_opener, opener_type, bytes_after_opener) if found
     fn find_opener(&self, combined: &str) -> Option<(usize, CmdOpenType, usize)> {
-        
         // Check for each opener type, find earliest occurrence
         let mut earliest: Option<(usize, CmdOpenType, usize)> = None;
-        
+
         if let Some(pos) = combined.find(CMD_OPEN_EXEC) {
             let after_pos = pos + CMD_OPEN_EXEC.len();
             if earliest.is_none() || pos < earliest.unwrap().0 {
@@ -95,7 +93,7 @@ impl CommandParser {
                 earliest = Some((pos, CmdOpenType::Writ, after_pos));
             }
         }
-        
+
         earliest
     }
 
@@ -108,7 +106,7 @@ impl CommandParser {
             CmdOpenType::Read => CMD_CLOSE_READ,
             CmdOpenType::Writ => CMD_CLOSE_WRIT,
         };
-        
+
         self.buffer.find(closer).map(|pos| {
             let content = self.buffer[..pos].to_string();
             let remaining = self.buffer[pos + closer.len()..].to_string();
@@ -119,71 +117,71 @@ impl CommandParser {
     // Process new content with sliding window handling
     // Returns (content_to_output, completed_command, leftover_for_next_iteration)
     fn process(&mut self, content: &str) -> (String, Option<CommandType>, String) {
-    	if !self.active {
-        	// PRE-ACTIVE MODE: Check if opener appears across buffer+content boundary
-        	
+        if !self.active {
+            // PRE-ACTIVE MODE: Check if opener appears across buffer+content boundary
+
             let combined = format!("{}{}", self.buffer, content);
-        	if let Some((before_pos, cmd_type, after_pos)) = self.find_opener(&combined) {
-            	// Found opener! Transition to active mode
-            	
-            	// Content before opener goes to output
-            	let before_opener = &combined[..before_pos];
-            	
-            	// Content after opener goes into command buffer
-            	let after_opener = &combined[after_pos..];
-            	
-            	self.active = true;
-            	self.cmd_type = Some(cmd_type);
-            	self.buffer.clear();
-            	self.buffer.push_str(after_opener);
-            	
-            	// Check if closer is already in the remaining content
-            	if let Some((cmd_content, remaining)) = self.find_closer(cmd_type) {
-                	let cmd = self.parse_command_content(cmd_type, &cmd_content);
-                	self.reset();
-                	return (before_opener.to_string(), cmd, remaining);
-            	}
-            	
-            	return (before_opener.to_string(), None, String::new());
-        	}
-        	
-        	// No opener found - update sliding window buffer
-        	let combined = format!("{}{}", self.buffer, content);
-        	if combined.len() <= MAX_OPENER_LEN {
-            	// Still building up to max opener length
-            	self.buffer = combined;
-            	return (String::new(), None, String::new());
-        	} else {
-            	// Find a valid char boundary to split at, rounding UP buffer size if needed
-            	// We want to keep at least MAX_OPENER_LEN bytes in buffer, but may keep more
-            	// to ensure we don't split a multi-byte character
-            	
-            	let split_point = combined.floor_char_boundary(combined.len() - MAX_OPENER_LEN);
-            	
-            	// Everything before split_point goes to output
-            	let output = combined[..split_point].to_string();
-            	// Everything from split_point onward stays in buffer (may be > MAX_OPENER_LEN)
-            	self.buffer = combined[split_point..].to_string();
-            	
-            	return (output, None, String::new());
-        	}
-    	}
-    	
-    	// ACTIVE MODE: Accumulating command content
-    	self.buffer.push_str(content);
-    	
-    	// Check for closer in the accumulated buffer
-    	if let Some(cmd_type) = self.cmd_type {
-        	if let Some((cmd_content, remaining)) = self.find_closer(cmd_type) {
-            	let cmd = self.parse_command_content(cmd_type, &cmd_content);
-            	self.reset();
-            	return (String::new(), cmd, remaining);
-        	}
-    	}
-    	
-    	// Still accumulating - no output, no command, no leftover
-    	(String::new(), None, String::new())
-	}
+            if let Some((before_pos, cmd_type, after_pos)) = self.find_opener(&combined) {
+                // Found opener! Transition to active mode
+
+                // Content before opener goes to output
+                let before_opener = &combined[..before_pos];
+
+                // Content after opener goes into command buffer
+                let after_opener = &combined[after_pos..];
+
+                self.active = true;
+                self.cmd_type = Some(cmd_type);
+                self.buffer.clear();
+                self.buffer.push_str(after_opener);
+
+                // Check if closer is already in the remaining content
+                if let Some((cmd_content, remaining)) = self.find_closer(cmd_type) {
+                    let cmd = self.parse_command_content(cmd_type, &cmd_content);
+                    self.reset();
+                    return (before_opener.to_string(), cmd, remaining);
+                }
+
+                return (before_opener.to_string(), None, String::new());
+            }
+
+            // No opener found - update sliding window buffer
+            let combined = format!("{}{}", self.buffer, content);
+            if combined.len() <= MAX_OPENER_LEN {
+                // Still building up to max opener length
+                self.buffer = combined;
+                return (String::new(), None, String::new());
+            } else {
+                // Find a valid char boundary to split at, rounding UP buffer size if needed
+                // We want to keep at least MAX_OPENER_LEN bytes in buffer, but may keep more
+                // to ensure we don't split a multi-byte character
+
+                let split_point = combined.floor_char_boundary(combined.len() - MAX_OPENER_LEN);
+
+                // Everything before split_point goes to output
+                let output = combined[..split_point].to_string();
+                // Everything from split_point onward stays in buffer (may be > MAX_OPENER_LEN)
+                self.buffer = combined[split_point..].to_string();
+
+                return (output, None, String::new());
+            }
+        }
+
+        // ACTIVE MODE: Accumulating command content
+        self.buffer.push_str(content);
+
+        // Check for closer in the accumulated buffer
+        if let Some(cmd_type) = self.cmd_type {
+            if let Some((cmd_content, remaining)) = self.find_closer(cmd_type) {
+                let cmd = self.parse_command_content(cmd_type, &cmd_content);
+                self.reset();
+                return (String::new(), cmd, remaining);
+            }
+        }
+
+        // Still accumulating - no output, no command, no leftover
+        (String::new(), None, String::new())
+    }
 
     // Parse command content based on type
     fn parse_command_content(&self, cmd_type: CmdOpenType, content: &str) -> Option<CommandType> {
@@ -203,38 +201,15 @@ impl CommandParser {
             }
         }
     }
-
-    // Force parse on stream end - check if we have partial command
-    fn force_parse(&mut self) -> Option<CommandType> {
-        if !self.active {
-            // Flush any remaining pre-active buffer as normal output
-            let _remaining = self.buffer.clone();
-            self.buffer.clear();
-            // This should be handled by caller - we return None but indicate leftover exists
-            return None;
-        }
-        
-        // Best-effort parse of accumulated content without closer
-        if let Some(cmd_type) = self.cmd_type {
-            self.parse_command_content(cmd_type, &self.buffer)
-        } else {
-            None
-        }
-    }
-
-    // Get any remaining buffered content (for flushing on stream end)
-    fn flush_buffer(&mut self) -> String {
-        let remaining = self.buffer.clone();
-        self.reset();
-        remaining
-    }
 }
 
 #[derive(Clone, Copy)]
 enum CmdOpenType {
-    Exec, Kill, Read, Writ,
+    Exec,
+    Kill,
+    Read,
+    Writ,
 }
-
 
 // Hardcoded pipe directory
 const PIPE_DIR: &str = "/tmp/agentgraph_pipes";
@@ -252,7 +227,7 @@ pub struct CommandIO {
     pub stdout_rx: Receiver<Vec<u8>>,
     pub stderr_rx: Receiver<Vec<u8>>,
     kill_tx: Option<oneshot::Sender<()>>,
-    pub exited_rx: Option<oneshot::Receiver<()>>, 
+    pub exited_rx: Option<oneshot::Receiver<()>>,
 }
 
 impl Drop for CommandIO {
@@ -289,10 +264,7 @@ where
     }
 }
 
-pub async fn spawn_command_io<S, I>(
-    program: S,
-    args: I,
-) -> Result<CommandIO>
+pub async fn spawn_command_io<S, I>(program: S, args: I) -> Result<CommandIO>
 where
     S: AsRef<str>,
     I: IntoIterator,
@@ -362,30 +334,34 @@ struct Args {
     /// Verbose logging
     #[arg(short, long)]
     verbose: bool,
-    
+
     /// Enable tool use and system prompt addendum for tools.
     #[arg(short, long)]
     tools: bool,
-    
-    /// Realtime output 
+
+    /// Realtime output
     /// recommended for final agent -> human nodes
-    /// STRONGLY discouraged for agent -> agent nodes, or if the output is intended to be structured - 
+    /// STRONGLY discouraged for agent -> agent nodes, or if the output is intended to be structured -
     #[arg(long)]
     stream_realtime: bool,
-    
+
     /// GGUF file list (which files are we downloading and loading as our local model).
     /// This flag is only relevant when running as a leader - all inference happens using the model running on the current leader node
     #[arg(long, value_delimiter = ',')]
     gguf: Vec<String>,
 
     /// Model name (HF repo) - PRIMARY slot (vision model)
-    #[arg(short = 'm', long, default_value = "Qwen/Qwen3.5-9B")]
+    #[arg(short = 'm', long, default_value = "Qwen/Qwen3-VL-8B-Instruct")]
     model: String,
-    
+
     /// Secondary model name (HF repo) - SECONDARY slot (audio model, default: Voxtral)
-    #[arg(short = 'M', long, default_value = "mistralai/Voxtral-Mini-4B-Realtime-2602")]
+    #[arg(
+        short = 'M',
+        long,
+        default_value = "mistralai/Voxtral-Mini-4B-Realtime-2602"
+    )]
     secondary_model: String,
-    
+
     /// Number of latest files to include (for -I, -S, -A flags)
     #[arg(long, default_value_t = 1)]
     latest_n: usize,
@@ -393,32 +369,32 @@ struct Args {
     /// Realtime audio listener - RTSP/RTMP URL or "pipewire" for local input
     #[arg(long)]
     realtime_listener: Option<String>,
-    
+
     /// Audio chunk min duration in seconds (for realtime listener)
     #[arg(long, default_value_t = 3.0)]
     audio_chunk_min_secs: f32,
-    
+
     /// Audio chunk max duration in seconds (for realtime listener)
     #[arg(long, default_value_t = 8.0)]
     audio_chunk_max_secs: f32,
-    
+
     /// Path to a local model file
-	#[arg(long)]
-	model_path: Option<String>,
- 
+    #[arg(long)]
+    model_path: Option<String>,
+
     /// Sleep / debounce duration in milliseconds
     #[arg(long, default_value_t = 250)]
-	sleep_ms: u64,
+    sleep_ms: u64,
 
-    /// Latest file in directory is treated as user input (you can use this flag multiple times) 
-	#[arg(short = 'I')]
-	input_final: Vec<PathBuf>,
+    /// Latest file in directory is treated as user input (you can use this flag multiple times)
+    #[arg(short = 'I')]
+    input_final: Vec<PathBuf>,
 
-	/// All files in directory are treated as user input (you can use this flag multiple times)
-	#[arg(short = 'i')]
-	input_cat: Vec<PathBuf>,
+    /// All files in directory are treated as user input (you can use this flag multiple times)
+    #[arg(short = 'i')]
+    input_cat: Vec<PathBuf>,
 
-    /// Latest file in directory is treated as system messages (you can use this flag multiple times) 
+    /// Latest file in directory is treated as system messages (you can use this flag multiple times)
     #[arg(short = 'S')]
     system_final: Vec<PathBuf>,
 
@@ -428,7 +404,7 @@ struct Args {
 
     /// Latest file in directory is treated as assistant messages (you can use this flag multiple times)
     /// New assistant messages do not trigger inference!
-    /// Output flags are not automatically stored in context, so at least one assistant flag is required for the agent to be aware of it's own responses 
+    /// Output flags are not automatically stored in context, so at least one assistant flag is required for the agent to be aware of it's own responses
     #[arg(short = 'A')]
     assistant_final: Vec<PathBuf>,
 
@@ -440,50 +416,9 @@ struct Args {
     #[arg(short = 'O')]
     output_new: Option<PathBuf>,
 
-	/// Each assistant response clears and overwrites this file
-	#[arg(short = 'o')]
-	output_overwrite: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ModelSlot {
-    Primary,   // Vision model
-    Secondary, // Audio model
-}
-
-#[derive(Debug, Clone)]
-struct ModelConfig {
-    slot: ModelSlot,
-    model_id: String,
-    is_vision: bool,
-    is_audio: bool,
-}
-
-impl ModelConfig {
-    fn new(slot: ModelSlot, model_id: String) -> Self {
-        let is_vision = Self::detect_vision(&model_id);
-        let is_audio = Self::detect_audio(&model_id);
-        Self { slot, model_id, is_vision, is_audio }
-    }
-    
-    fn detect_vision(model_id: &str) -> bool {
-        let vision_keywords = ["vl", "vision", "gemma", "llava", "qwen3-vl", "qwen2-vl", "phi-4-multimodal"];
-        let lower = model_id.to_lowercase();
-        vision_keywords.iter().any(|k| lower.contains(k))
-    }
-    
-    fn detect_audio(model_id: &str) -> bool {
-        let audio_keywords = ["voxtral", "whisper", "audio", "speech"];
-        let lower = model_id.to_lowercase();
-        audio_keywords.iter().any(|k| lower.contains(k))
-    }
-    
-    fn alias(&self) -> String {
-        match self.slot {
-            ModelSlot::Primary => "primary".to_string(),
-            ModelSlot::Secondary => "secondary".to_string(),
-        }
-    }
+    /// Each assistant response clears and overwrites this file
+    #[arg(short = 'o')]
+    output_overwrite: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -502,25 +437,18 @@ enum ContentType {
 }
 
 fn detect_content_type(path: &Path) -> ContentType {
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .unwrap_or_default();
-    
+
     match ext.as_str() {
         "wav" | "mp3" | "ogg" | "flac" | "m4a" | "aac" => ContentType::Audio,
         "mp4" | "avi" | "mkv" | "mov" | "webm" => ContentType::Video,
         "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" => ContentType::Image,
         _ => ContentType::Text,
     }
-}
-
-fn is_audio(path: &Path) -> bool {
-    detect_content_type(path) == ContentType::Audio
-}
-
-fn is_video(path: &Path) -> bool {
-    detect_content_type(path) == ContentType::Video
 }
 
 fn to_mistral_role(role: &str) -> TextMessageRole {
@@ -548,9 +476,16 @@ struct FileMessage {
 }
 
 impl FileMessage {
-    fn format_for_model(&self, target_slot: ModelSlot) -> Option<(String, Option<Vec<image::DynamicImage>>, Option<Vec<mistralrs::AudioInput>>)> {
+    fn format_for_model(
+        &self,
+        target_slot: ModelSlot,
+    ) -> Option<(
+        String,
+        Option<Vec<image::DynamicImage>>,
+        Option<Vec<mistralrs::AudioInput>>,
+    )> {
         let include_metadata = self.role == "user";
-        
+
         // Route content to appropriate model slot
         match &self.content {
             MessageContent::Text(text) => {
@@ -584,10 +519,9 @@ impl FileMessage {
                 } else {
                     "".to_string()
                 };
-                
-                let audio_input = mistralrs::AudioInput::from_bytes(audio_bytes)
-                    .ok()?;
-                
+
+                let audio_input = mistralrs::AudioInput::from_bytes(audio_bytes).ok()?;
+
                 Some((text_prompt, None, Some(vec![audio_input])))
             }
         }
@@ -600,7 +534,10 @@ async fn process_video_to_messages(
     // Create temp directory for frames
     let temp_dir = std::env::temp_dir().join(format!(
         "agentgraph_video_{}",
-        metadata.created.duration_since(std::time::UNIX_EPOCH)?.as_secs()
+        metadata
+            .created
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
     ));
     fs::create_dir_all(&temp_dir).await?;
 
@@ -716,7 +653,8 @@ async fn collect_viewer_dirs(args: &Args) -> Result<Vec<PathBuf>> {
     let mut dirs = BTreeSet::new();
 
     let all_paths = args
-        .input_final.iter()
+        .input_final
+        .iter()
         .chain(&args.input_cat)
         .chain(&args.system_final)
         .chain(&args.system_cat)
@@ -769,7 +707,7 @@ async fn load_dir_messages(
 
     for (created, modified, path) in entries {
         let content_type = detect_content_type(&path);
-        
+
         let content = match content_type {
             ContentType::Image => {
                 let bytes = fs::read(&path).await?;
@@ -781,12 +719,8 @@ async fn load_dir_messages(
                 let bytes = fs::read(&path).await?;
                 MessageContent::Audio(bytes)
             }
-            ContentType::Video => {
-                MessageContent::Text(format!("[Video file: {}]", path.display()))
-            }
-            ContentType::Text => {
-                MessageContent::Text(fs::read_to_string(&path).await?)
-            }
+            ContentType::Video => MessageContent::Text(format!("[Video file: {}]", path.display())),
+            ContentType::Text => MessageContent::Text(fs::read_to_string(&path).await?),
         };
 
         messages.push(FileMessage {
@@ -823,9 +757,9 @@ fn latest_file(dir: &Path) -> Result<PathBuf> {
             Some((time, e.path().to_path_buf()))
         })
         .collect();
-    
+
     files.sort_by_key(|(t, _)| *t);
-    
+
     files
         .last()
         .map(|(_, p)| p.clone())
@@ -843,16 +777,9 @@ async fn concat_files(dir: &Path) -> Result<String> {
     Ok(out)
 }
 
-fn is_image(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()),
-        Some(ref e) if e == "png" || e == "jpg" || e == "jpeg" || e == "webp"
-    )
-}
-
 async fn build_messages(
-    model: &Arc<mistralrs::Model>, 
-    args: &Args
+    model: &Arc<mistralrs::Model>,
+    args: &Args,
 ) -> Result<(VisionMessages, Option<VisionMessages>)> {
     // Primary messages (vision + text)
     let mut primary_messages = VisionMessages::new();
@@ -862,17 +789,13 @@ async fn build_messages(
     // --- System messages go to primary only ---
     for dir in &args.system_final {
         let p = latest_file(dir)?;
-        primary_messages = primary_messages.add_message(
-            TextMessageRole::System,
-            fs::read_to_string(p).await?,
-        );
+        primary_messages =
+            primary_messages.add_message(TextMessageRole::System, fs::read_to_string(p).await?);
     }
 
     for dir in &args.system_cat {
-        primary_messages = primary_messages.add_message(
-            TextMessageRole::System,
-            concat_files(dir).await?,
-        );
+        primary_messages =
+            primary_messages.add_message(TextMessageRole::System, concat_files(dir).await?);
     }
 
     // --- Tool system message ---
@@ -882,7 +805,7 @@ async fn build_messages(
         }
         let tool_instructions = format!(
             "The following is an addendum to any prior instruction, if you have no prior instruction, you should follow any instruction provided to you by the user. You have access to command execution tools. To spawn a process, provide the binary and arguments: {open_exec}command arg1 arg2 ...{close_exec} (returns index). To kill: {open_kill}idx{close_kill}. To read output: {open_read}idx{close_read}. To write stdin: {open_writ}idx input text{close_writ}. Commands execute immediately and return results. You will need to perform multiple Commands execution tool calls to execute and then read the outputs of commands you executed. Do not repeat these instructions to the user, these tools only execute within the scope of parsing your responses.",
-            open_exec = CMD_OPEN_EXEC, 
+            open_exec = CMD_OPEN_EXEC,
             close_exec = CMD_CLOSE_EXEC,
             open_kill = CMD_OPEN_KILL,
             close_kill = CMD_CLOSE_KILL,
@@ -911,15 +834,19 @@ async fn build_messages(
                 eprintln!("adding messages from: {}", dir.display());
             }
             let msgs = load_dir_messages(dir, role, concat, args.latest_n).await?;
-            
+
             // Handle videos specially
             for msg in msgs {
                 if msg.content_type == ContentType::Video {
                     if let MessageContent::Text(path_str) = &msg.content {
-                        let path = PathBuf::from(path_str.trim_start_matches("[Video file: ").trim_end_matches(']'));
+                        let path = PathBuf::from(
+                            path_str
+                                .trim_start_matches("[Video file: ")
+                                .trim_end_matches(']'),
+                        );
                         let metadata = msg.metadata.clone();
                         if let Ok(tuple) = process_video_to_messages(&path, &metadata).await {
-                        	video_tasks.push(tuple);
+                            video_tasks.push(tuple);
                         }
                     }
                 } else {
@@ -939,11 +866,11 @@ async fn build_messages(
     }
 
     timeline.sort_by_key(|msg| msg.metadata.created);
-    
+
     if args.verbose {
         eprintln!("Building {} messages.", timeline.len());
     }
-    
+
     // --- Route messages to appropriate model slots ---
     // if we only have text messages and one kind of media, disable the other model.
     let mut maybe_switchable = (false, false);
@@ -951,17 +878,14 @@ async fn build_messages(
         // Try primary slot
         if let Some((text, images, _)) = msg.format_for_model(ModelSlot::Primary) {
             if let Some(images) = images {
-                primary_messages = primary_messages.add_image_message(
-                    to_mistral_role(&msg.role),
-                    text,
-                    images
-                );
+                primary_messages =
+                    primary_messages.add_image_message(to_mistral_role(&msg.role), text, images);
                 maybe_switchable = (true, maybe_switchable.1 || false);
             } else {
                 primary_messages = primary_messages.add_message(to_mistral_role(&msg.role), text);
             }
         }
-        
+
         // Try secondary slot (audio)
         if let Some((text, _, audio)) = msg.format_for_model(ModelSlot::Secondary) {
             if let Some(audio) = audio {
@@ -974,24 +898,25 @@ async fn build_messages(
                 );
                 maybe_switchable = (maybe_switchable.0 || false, true);
             } else {
-            	let sec_msgs = secondary_messages.get_or_insert_with(VisionMessages::new);
-                *sec_msgs = sec_msgs.clone().add_message(to_mistral_role(&msg.role), text);
+                let sec_msgs = secondary_messages.get_or_insert_with(VisionMessages::new);
+                *sec_msgs = sec_msgs
+                    .clone()
+                    .add_message(to_mistral_role(&msg.role), text);
             }
         }
     }
-    
+
     if args.verbose {
         eprintln!("Messages built.");
     }
-    
+
     match maybe_switchable {
-    	(true, true) => Ok((primary_messages, secondary_messages)),
-    	(false, true) => Ok((primary_messages, secondary_messages)),
-    	(true, false) => Ok((primary_messages, None)),
-    	(false, false) => Ok((primary_messages, None)),
+        (true, true) => Ok((primary_messages, secondary_messages)),
+        (false, true) => Ok((primary_messages, secondary_messages)),
+        (true, false) => Ok((primary_messages, None)),
+        (false, false) => Ok((primary_messages, None)),
     }
 }
-
 
 // ============================================================================
 // COLLABORATIVE MODEL SYSTEM MESSAGES (hardcoded per-turn injection)
@@ -1002,9 +927,44 @@ const PRIMARY_AFTER_SECONDARY: &str = "You are a Vision-capable model running co
 const SECONDARY_BEFORE_PRIMARY: &str = "You are an Audio-capable model running collaboratively alongside a Vision-capable model. You are responding BEFORE your collaborator, and they will continue the response to the user. Provide your auditory observations completely, as your collaborator will build upon them.";
 const SECONDARY_AFTER_PRIMARY: &str = "You are an Audio-capable model running collaboratively alongside a Vision-capable model. You are responding AFTER your collaborator, and they have already begun the response to the user. You may provide a brief preamble acknowledging their observations before adding your audio analysis.";
 struct RealtimeListener {
-	pub chunk_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    pub chunk_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     pub shutdown_tx: oneshot::Sender<()>,
     pub speech_detected_rx: broadcast::Receiver<()>,
+}
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use flume;
+
+fn create_wav_header(data_len: usize) -> [u8; 44] {
+    const SAMPLE_RATE: u32 = 48000;
+    const BITS_PER_SAMPLE: u16 = 32;
+    const CHANNELS: u16 = 1;
+    const BYTES_PER_SECOND: u32 = SAMPLE_RATE * CHANNELS as u32 * (BITS_PER_SAMPLE as u32 / 8);
+    const BLOCK_ALIGN: u16 = CHANNELS * (BITS_PER_SAMPLE / 8);
+    const AUDIO_FORMAT: u16 = 3;
+
+    let mut header = [0u8; 44];
+
+    // RIFF chunk
+    header[0..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&(36 + data_len as u32).to_le_bytes());
+    header[8..12].copy_from_slice(b"WAVE");
+
+    // fmt subchunk
+    header[12..16].copy_from_slice(b"fmt ");
+    header[16..20].copy_from_slice(&(16u32).to_le_bytes()); // fmt chunk size (16)
+    header[20..22].copy_from_slice(&AUDIO_FORMAT.to_le_bytes()); // 3 = float
+    header[22..24].copy_from_slice(&CHANNELS.to_le_bytes());
+    header[24..28].copy_from_slice(&SAMPLE_RATE.to_le_bytes());
+    header[28..32].copy_from_slice(&BYTES_PER_SECOND.to_le_bytes());
+    header[32..34].copy_from_slice(&BLOCK_ALIGN.to_le_bytes());
+    header[34..36].copy_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
+
+    // data subchunk
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&(data_len as u32).to_le_bytes());
+
+    header
 }
 
 async fn spawn_realtime_listener(
@@ -1012,131 +972,172 @@ async fn spawn_realtime_listener(
     args: &Args,
     model: Arc<mistralrs::Model>,
 ) -> Result<RealtimeListener> {
-    let (chunk_tx, mut chunk_rx) = channel::<Vec<u8>>(32);
+    // Only support pipewire (default PulseAudio input) for simplicity.
+    if source != "pipewire" {
+        anyhow::bail!("Only 'pipewire' source is supported");
+    }
+
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let (speech_detected_tx, speech_detected_rx) = broadcast::channel(16);
 
     let min_duration = Duration::from_secs_f32(args.audio_chunk_min_secs);
     let max_duration = Duration::from_secs_f32(args.audio_chunk_max_secs);
 
-    let source = source.to_string();
     let verbose = args.verbose;
     let model_clone = model.clone();
-
+    let model_id = args.secondary_model.clone();
     tokio::spawn(async move {
-        // Build ffmpeg command
-        let mut cmd = if source == "pipewire" {
-            let mut c = Command::new("ffmpeg");
-            c.args(&[
-                "-f", "pulse", "-i", "default",
-                "-acodec", "pcm_s16le",
-                "-ar", "16000",
-                "-ac", "1",
-                "-f", "wav", "pipe:1"
-            ]);
-            c
-        } else if source.starts_with("rtsp://") || source.starts_with("rtmp://") {
-            let mut c = Command::new("ffmpeg");
-            c.args(&[
-                "-i", &source,
-                "-vn",
-                "-acodec", "pcm_s16le",
-                "-ar", "16000",
-                "-ac", "1",
-                "-f", "wav", "pipe:1"
-            ]);
-            c
-        } else {
-            eprintln!("Unknown audio source: {}", source);
-            return;
-        };
+        let (audio_tx, audio_rx) = flume::bounded::<Vec<u8>>(128);
 
-        cmd.stdout(std::process::Stdio::piped())
-           .stderr(std::process::Stdio::null());
+        // Channel to signal the blocking audio thread to shut down.
+        let (shutdown_tx_blocking, shutdown_rx_blocking) = std::sync::mpsc::channel();
 
-        let mut ffmpeg_child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                eprintln!("Failed to spawn ffmpeg: {}", e);
+        // Spawn a blocking thread for cpal audio capture.
+        let audio_handle = tokio::task::spawn_blocking(move || {
+            // Get default host and input device.
+            let host = cpal::default_host();
+            let device = match host.default_input_device() {
+                Some(dev) => dev,
+                None => {
+                    eprintln!("No default input device found");
+                    return;
+                }
+            };
+
+            let config = {
+                let mut best = None;
+                for cfg in device.supported_input_configs().unwrap() {
+                    if cfg.channels() == 1 && cfg.sample_format() == cpal::SampleFormat::F32 {
+                        let rate = 48000;
+                        if cfg.min_sample_rate() <= rate && rate <= cfg.max_sample_rate() {
+                            best = Some(cfg.with_sample_rate(rate));
+                            break;
+                        }
+                    }
+                }
+                match best {
+                    Some(cfg) => cfg,
+                    None => {
+                        eprintln!("No supported 48kHz mono F32 input config");
+                        return;
+                    }
+                }
+            };
+
+            // Build the input stream.
+            let tx = audio_tx.clone();
+            let stream = device.build_input_stream(
+                config.into(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let bytes: &[u8] = bytemuck::cast_slice(data); // f32 -> [u8; 4] per sample
+                    let _ = tx.try_send(bytes.to_vec());
+                },
+                |err| eprintln!("Audio stream error: {}", err),
+                None,
+            );
+
+            let stream = match stream {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to build input stream: {}", e);
+                    return;
+                }
+            };
+
+            // Start the stream.
+            if let Err(e) = stream.play() {
+                eprintln!("Failed to start audio stream: {}", e);
                 return;
             }
-        };
 
-        let mut stdout = match ffmpeg_child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                eprintln!("Failed to take stdout from ffmpeg child");
-                let _ = ffmpeg_child.kill().await;
-                return;
-            }
-        };
+            // Block until shutdown signal is received.
+            let _ = shutdown_rx_blocking.recv();
+            // Stream is dropped here, stopping capture.
+        });
 
-        
+        // Main async loop: receive audio bytes from flume and perform chunking.
         let mut chunk_start = std::time::Instant::now();
-        let mut current_chunk_duration = rand::rng()
-            .random_range(min_duration..=max_duration);
-        let mut temp_buf = [0u8; 4096];
+        let mut current_chunk_duration = rand::rng().random_range(min_duration..=max_duration);
+        let mut accumulated_buffer = Vec::new();
 
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
-                    let _ = ffmpeg_child.kill().await;
+                    // Signal the blocking thread to stop.
+                    let _ = shutdown_tx_blocking.send(());
                     break;
                 }
-                result = stdout.read(&mut temp_buf) => {
+                result = audio_rx.recv_async() => {
                     match result {
-                        Ok(0) => break,
-                        Ok(n) => {
-                        	let mut buffer = Vec::new();
-                            buffer.extend_from_slice(&temp_buf[..n]);
+                        Ok(bytes) => {
+                            // Add new bytes to the current chunk.
+                            accumulated_buffer.extend_from_slice(&bytes);
 
+                            // Check if it's time to send a chunk.
                             if chunk_start.elapsed() >= current_chunk_duration {
-                                // Send chunk (ignore errors)
-                                
-
-                                let model_clone = model_clone.clone();
-                                let speech_detected_tx = speech_detected_tx.clone();
-                                let chunk = buffer.clone();
-								let tx_clone = chunk_tx.clone();
-                                tokio::spawn(async move {
-                                    match detect_speech(&chunk, &model_clone).await {
-                                        Ok(true) => {
-                                            let _ = speech_detected_tx.send(());
-                                            let _ = tx_clone.send(chunk.clone()).await;
+                                if !accumulated_buffer.is_empty() {
+                                    let model_clone = model_clone.clone();
+                                    let speech_detected_tx = speech_detected_tx.clone();
+                                    let chunk = accumulated_buffer.clone();
+                                    let tx_clone = chunk_tx.clone();
+                                    let model_id = model_id.clone();
+                                    tokio::spawn(async move {
+                                        let mut wav = create_wav_header(chunk.len()).to_vec();
+                                        wav.append(&mut chunk.clone());
+                                        match detect_speech(&wav, &model_clone, &model_id).await {
+                                            Ok(true) => {
+                                                let _ = speech_detected_tx.send(());
+                                                let _ = tx_clone.send(wav.to_vec()).await;
+                                            }
+                                            Ok(false) => {}
+                                            Err(e) => {
+                                                eprintln!("Speech detection error: {}", e);
+                                            }
                                         }
-                                        Ok(false) => {}
-                                        Err(e) => {
-                                            eprintln!("Speech detection error: {}", e);
-                                        }
-                                    }
-                                });
+                                    });
 
-                                buffer.clear();
-                                chunk_start = std::time::Instant::now();
-                                current_chunk_duration = rand::rng()
-                                    .random_range(min_duration..=max_duration);
+                                    accumulated_buffer.clear();
+                                    chunk_start = std::time::Instant::now();
+                                    current_chunk_duration = rand::rng()
+                                        .random_range(min_duration..=max_duration);
+                                }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("Error reading from ffmpeg stdout: {}", e);
+                        Err(flume::RecvError::Disconnected) => {
+                            // Audio thread exited; end the loop.
                             break;
                         }
                     }
                 }
             }
         }
+
+        // Ensure the audio thread is stopped.
+        let _ = shutdown_tx_blocking.send(());
+        let _ = audio_handle.await;
     });
 
     Ok(RealtimeListener {
-    	chunk_rx,
+        chunk_rx,
         shutdown_tx,
         speech_detected_rx,
     })
 }
 
-async fn detect_speech(audio_chunk: &[u8], model: &mistralrs::Model) -> Result<bool> {
-    if !model.is_model_loaded("secondary").context("Failed to check secondary model load state")? {
-        model.reload_model("secondary").await.context("Failed to reload secondary model")?;
+async fn detect_speech(
+    audio_chunk: &[u8],
+    model: &mistralrs::Model,
+    audio_model_id: &str,
+) -> Result<bool> {
+    if !model
+        .is_model_loaded(audio_model_id)
+        .context("Failed to check secondary model load state")?
+    {
+        model
+            .reload_model(audio_model_id)
+            .await
+            .context("Failed to reload secondary model")?;
     }
 
     let audio = mistralrs::AudioInput::from_bytes(audio_chunk)
@@ -1149,14 +1150,27 @@ async fn detect_speech(audio_chunk: &[u8], model: &mistralrs::Model) -> Result<b
         vec![audio],
     );
 
-    let response = model.send_chat_request_with_model(messages, Some("secondary"))
+    let response = model
+        .send_chat_request_with_model(messages, Some(audio_model_id))
         .await
-        .context("Speech detection request failed")?;
-    let content = response.choices[0].message.content.as_ref()
+        .map_err(|e| {
+            eprintln!("Full error from mistralrs: {:?}", e);
+            anyhow::anyhow!("Speech detection request failed: {}", e)
+        })?;
+    let content = response.choices[0]
+        .message
+        .content
+        .as_ref()
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
 
     Ok(content.contains("true"))
+}
+
+#[derive(PartialEq)]
+enum ModelSlot {
+    Primary,
+    Secondary,
 }
 
 async fn run_once(
@@ -1172,13 +1186,17 @@ async fn run_once(
     let has_secondary = secondary_messages.is_some() && args.secondary_model != "none";
 
     let timestamp = chrono::Utc::now().timestamp_millis();
-    let new_file_path = args.output_new.as_ref().map(|dir| {
-        dir.join(format!("out-{}.txt", timestamp))
-    });
+    let new_file_path = args
+        .output_new
+        .as_ref()
+        .map(|dir| dir.join(format!("out-{}.txt", timestamp)));
 
     if let Some(overwrite_path) = &args.output_overwrite {
         if args.verbose {
-            eprintln!("Pre-clearing file for overwrite: {}", overwrite_path.display());
+            eprintln!(
+                "Pre-clearing file for overwrite: {}",
+                overwrite_path.display()
+            );
         }
         if let Some(parent) = overwrite_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -1197,7 +1215,9 @@ async fn run_once(
 
     let mut realtime_file: Option<File> = if stream_realtime {
         if let Some(ref path) = current_file_path {
-            if args.verbose { eprintln!("File created: {}", path.display()); }
+            if args.verbose {
+                eprintln!("File created: {}", path.display());
+            }
             Some(File::create(path).await?)
         } else if let Some(ref path) = args.output_overwrite {
             Some(File::options().write(true).open(path).await?)
@@ -1214,31 +1234,31 @@ async fn run_once(
 
     // Spawn realtime listener if needed
     let mut _realtime_listener_guard = None;
-    let (latest_audio_tx, mut latest_audio_rx) = tokio::sync::watch::channel::<Option<Vec<u8>>>(None);
-	
-	let mut _audio_buffer_task = None;
-	let mut speech_detected_rx = None;
-	
-	if args.realtime_listener.is_some() && stream_realtime && has_secondary {
-    	let source = args.realtime_listener.as_ref().unwrap();
-    	let listener = spawn_realtime_listener(source, args, model.clone())
-        	.await
-        	.context("Failed to spawn realtime listener")?;
-    	
-    	speech_detected_rx = Some(listener.speech_detected_rx.resubscribe());
-    	
-    	// Spawn task to continuously drain chunk_rx and buffer latest
-    	let mut chunk_rx = listener.chunk_rx;
-    	_audio_buffer_task = Some(tokio::spawn(async move {
-        	while let Some(chunk) = chunk_rx.recv().await {
-            	let _ = latest_audio_tx.send(Some(chunk));
-        	}
-    	}));
-    	
-    	// Keep listener alive (shutdown_tx needs to stay alive)
-    	_realtime_listener_guard = Some(listener.shutdown_tx);
-	}
-    	
+    let (latest_audio_tx, latest_audio_rx) = tokio::sync::watch::channel::<Option<Vec<u8>>>(None);
+
+    let mut _audio_buffer_task = None;
+    let mut speech_detected_rx = None;
+
+    if (args.realtime_listener.is_some() && stream_realtime) || has_secondary {
+        let source = args.realtime_listener.as_ref().unwrap();
+        let listener = spawn_realtime_listener(source, args, model.clone())
+            .await
+            .context("Failed to spawn realtime listener")?;
+
+        speech_detected_rx = Some(listener.speech_detected_rx.resubscribe());
+
+        // Spawn task to continuously drain chunk_rx and buffer latest
+        let mut chunk_rx = listener.chunk_rx;
+        _audio_buffer_task = Some(tokio::spawn(async move {
+            while let Some(chunk) = chunk_rx.recv().await {
+                let _ = latest_audio_tx.send(Some(chunk));
+            }
+        }));
+
+        // Keep listener alive (shutdown_tx needs to stay alive)
+        _realtime_listener_guard = Some(listener.shutdown_tx);
+    }
+
     let mut subprocesses: Vec<CommandIO> = Vec::new();
     let mut continuation = false;
     let mut pending_audio_queue: Vec<Vec<u8>> = Vec::new();
@@ -1258,7 +1278,7 @@ async fn run_once(
         } else {
             build_messages(model, args).await?
         };
-        
+
         let has_sec = current_secondary.is_some() && args.secondary_model != "none";
         let mut primary_response = String::new();
         let mut secondary_response = String::new();
@@ -1267,19 +1287,23 @@ async fn run_once(
             vec![ModelSlot::Secondary, ModelSlot::Primary]
         } else {
             let mut order = vec![ModelSlot::Primary];
-            if has_sec { order.push(ModelSlot::Secondary); }
+            if has_sec {
+                order.push(ModelSlot::Secondary);
+            }
             order
         };
 
         for (idx, slot) in run_order.iter().enumerate() {
             let is_first = idx == 0;
             let _is_last = idx == run_order.len() - 1;
-			continuation = is_first;
+            continuation = is_first;
             match slot {
                 ModelSlot::Primary => {
                     if args.verbose {
-                        eprintln!("Running primary model ({})...",
-                            if is_first { "FIRST" } else { "SECOND" });
+                        eprintln!(
+                            "Running primary model ({})...",
+                            if is_first { "FIRST" } else { "SECOND" }
+                        );
                     }
 
                     let mut msgs = current_primary.clone();
@@ -1296,26 +1320,30 @@ async fn run_once(
                     if !secondary_response.is_empty() {
                         msgs = msgs.add_message(
                             TextMessageRole::System,
-                            format!("[Audio collaborator: {}]", secondary_response)
+                            format!("[Audio collaborator: {}]", secondary_response),
                         );
                     }
-                    if !output_buffer.is_empty() && (secondary_response.is_empty() || !output_buffer.contains(&secondary_response)) {
+                    if !output_buffer.is_empty()
+                        && (secondary_response.is_empty()
+                            || !output_buffer.contains(&secondary_response))
+                    {
                         msgs = msgs.add_message(
                             TextMessageRole::System,
-                            format!("[Previous context: {}]", output_buffer)
+                            format!("[Previous context: {}]", output_buffer),
                         );
                     }
 
                     match model.stream_chat_request(msgs).await {
                         Ok(mut stream) => {
+                            let mut last_token: Option<String> = None;
                             'primary_stream: loop {
                                 tokio::select! {
                                     chunk_opt = stream.next() => {
                                         match chunk_opt {
                                             Some(chunk) => {
                                                 let content = extract_content(chunk)?;
-                                                let (out, cmd, _) = cmd_parser.process(&content);
-
+                                                let (out, cmd, leftovers) = cmd_parser.process(&content);
+                                                last_token = Some(leftovers);
                                                 primary_response.push_str(&out);
                                                 if stream_realtime {
                                                     if let Some(ref mut f) = realtime_file {
@@ -1338,37 +1366,46 @@ async fn run_once(
                                                     }
 
                                                     output_buffer = format!("{}{}", output_buffer, primary_response);
+                                                    continue 'restart_loop;
                                                 }
                                             }
                                             None => {
-                                            	if args.verbose { eprintln!("Primary Response Complete"); }
-                                            	drop(stream);
-                                            	break 'primary_stream
+                                                if stream_realtime {
+                                                    if let Some(ref mut f) = realtime_file {
+                                                        if let Some(token) = last_token {
+                                                            let _ = f.write_all(token.as_bytes()).await;
+                                                        }
+                                                        let _ = f.flush().await;
+                                                    }
+                                                }
+                                                if args.verbose { eprintln!("Primary Response Complete"); }
+                                                drop(stream);
+                                                break 'primary_stream
                                             },
                                         }
                                     }
                                     // Speech interrupt (only if secondary exists and we're first)
                                     _ = async {
-    									if is_first && has_sec {
-        									if let Some(ref mut rx) = speech_detected_rx {
-            									rx.recv().await.ok()
-        									} else { None }
-    									} else { None }
-									}, if is_first && has_sec => {
-    									if args.verbose { eprintln!("Audio Interrupt"); }
-    									
-    									
-    									audio_interrupt_pending = true;
-    									output_buffer = format!("{}{}", output_buffer, primary_response);
-    									
-    									if let Some(audio) = latest_audio_rx.borrow().clone() {
-    										pending_audio_queue.push(audio);
-										}
-    									
-    									drop(stream);
-    									continuation = true;
-    									continue 'restart_loop;
-									}
+                                        if is_first && has_sec {
+                                            if let Some(ref mut rx) = speech_detected_rx {
+                                                rx.recv().await.ok()
+                                            } else { None }
+                                        } else { None }
+                                    }, if is_first && has_sec => {
+                                        if args.verbose { eprintln!("Audio Interrupt"); }
+
+
+                                        audio_interrupt_pending = true;
+                                        output_buffer = format!("{}{}", output_buffer, primary_response);
+
+                                        if let Some(audio) = latest_audio_rx.borrow().clone() {
+                                            pending_audio_queue.push(audio);
+                                        }
+
+                                        drop(stream);
+                                        continuation = true;
+                                        continue 'restart_loop;
+                                    }
                                     // File system interrupt
                                     event = async {
                                         if let Some(ref mut rx) = interrupt_rx {
@@ -1377,7 +1414,7 @@ async fn run_once(
                                     } => {
                                         if let Some(Ok(ev)) = event {
                                             if is_interrupt_event(&ev) {
-                                        		if args.verbose { eprintln!("FS Interrupt"); }
+                                                if args.verbose { eprintln!("FS Interrupt"); }
                                                 output_buffer = format!("{}{}", output_buffer, primary_response);
                                                 handle_interrupt(ev, &mut current_file_path, &mut realtime_file, args).await?;
                                                 drop(stream);
@@ -1391,7 +1428,8 @@ async fn run_once(
                         }
                         Err(e) => {
                             if !has_sec {
-                                return Err(e).context("Primary model failed and no secondary model")?;
+                                return Err(e)
+                                    .context("Primary model failed and no secondary model")?;
                             }
                             eprintln!("Primary model error: {:?}", e);
                             primary_response.push_str("[Vision model error]");
@@ -1401,8 +1439,10 @@ async fn run_once(
 
                 ModelSlot::Secondary => {
                     if args.verbose {
-                        eprintln!("Running secondary model ({})...",
-                            if is_first { "FIRST" } else { "SECOND" });
+                        eprintln!(
+                            "Running secondary model ({})...",
+                            if is_first { "FIRST" } else { "SECOND" }
+                        );
                     }
 
                     let mut msgs = current_secondary.clone().unwrap();
@@ -1417,21 +1457,27 @@ async fn run_once(
                     if !primary_response.is_empty() {
                         msgs = msgs.add_message(
                             TextMessageRole::System,
-                            format!("[Vision collaborator: {}]", primary_response)
+                            format!("[Vision collaborator: {}]", primary_response),
                         );
                     }
-                    
-                    for audio in pending_audio_queue.clone() {
-        				msgs = msgs.add_multimodal_message(
-            				TextMessageRole::User,
-            				"",
-            				vec![],
-            				vec![mistralrs::AudioInput::from_bytes(&audio).context("Failed to create AudioInput from bytes")?],
-        				);
-    				}
-    				pending_audio_queue.clear();
 
-                    match model.stream_chat_request_with_model(msgs, Some("secondary")).await {
+                    for audio in pending_audio_queue.clone() {
+                        msgs = msgs.add_multimodal_message(
+                            TextMessageRole::User,
+                            "",
+                            vec![],
+                            vec![
+                                mistralrs::AudioInput::from_bytes(&audio)
+                                    .context("Failed to create AudioInput from bytes")?,
+                            ],
+                        );
+                    }
+                    pending_audio_queue.clear();
+
+                    match model
+                        .stream_chat_request_with_model(msgs, Some("secondary"))
+                        .await
+                    {
                         Ok(mut stream) => {
                             'secondary_stream: loop {
                                 tokio::select! {
@@ -1462,11 +1508,11 @@ async fn run_once(
                                         output_buffer = format!("{}{}{}", output_buffer, primary_response, secondary_response);
                                         if args.verbose { eprintln!("Audio Interrupt"); }
                                         drop(stream);
-                                        
+
                                         if let Some(audio) = latest_audio_rx.borrow().clone() {
-    										pending_audio_queue.push(audio);
-										}
-										
+                                            pending_audio_queue.push(audio);
+                                        }
+
                                         continue 'restart_loop;
                                     }
                                 }
@@ -1486,7 +1532,9 @@ async fn run_once(
 
     // Cleanup: shut down realtime listener
     if let Some(shutdown) = _realtime_listener_guard.take() {
-    	if args.verbose { eprintln!("Closing audio listener"); }
+        if args.verbose {
+            eprintln!("Closing audio listener");
+        }
         let _ = shutdown.send(());
     }
 
@@ -1494,13 +1542,16 @@ async fn run_once(
     drop(subprocesses);
 
     if !stream_realtime {
-
         if let Some(ref path) = new_file_path {
-            if args.verbose { eprintln!("Saving output to: {}", path.display()); }
+            if args.verbose {
+                eprintln!("Saving output to: {}", path.display());
+            }
             fs::write(path, &output_buffer).await?;
         }
         if let Some(ref path) = args.output_overwrite {
-            if args.verbose { eprintln!("Saving output (overwrite): {}", path.display()); }
+            if args.verbose {
+                eprintln!("Saving output (overwrite): {}", path.display());
+            }
             fs::write(path, &output_buffer).await?;
         }
     } else if args.verbose {
@@ -1512,24 +1563,25 @@ async fn run_once(
     Ok(())
 }
 
-
 async fn execute_command(
     cmd: CommandType,
     subprocesses: &mut Vec<CommandIO>,
     tool_context: &mut String,
     daemon_args: &Args,
 ) -> String {
-	if !daemon_args.tools { return "[TOOL USE FAILED: TOOLS DISABLED]".to_string() };
+    if !daemon_args.tools {
+        return "[TOOL USE FAILED: TOOLS DISABLED]".to_string();
+    };
     match cmd {
         CommandType::Exec(command_str) => {
             let parts: Vec<&str> = command_str.split_whitespace().collect();
             if parts.is_empty() {
                 return "[EXEC failed: empty command]\n".to_string();
             }
-            
+
             let program = parts[0];
             let args = &parts[1..];
-            
+
             match spawn_command_io(program, args.iter().map(|s| *s)).await {
                 Ok(cmd_io) => {
                     let idx = subprocesses.len();
@@ -1547,11 +1599,12 @@ async fn execute_command(
                 }
             }
         }
-        
+
         CommandType::Kill(idx) => {
             if idx < subprocesses.len() {
                 // Take ownership to drop/kill
-                let mut cmd_io = std::mem::replace(&mut subprocesses[idx], 
+                let mut cmd_io = std::mem::replace(
+                    &mut subprocesses[idx],
                     // Placeholder - will be removed below
                     CommandIO {
                         stdin_tx: tokio::sync::mpsc::channel(1).0,
@@ -1559,7 +1612,7 @@ async fn execute_command(
                         stderr_rx: tokio::sync::mpsc::channel(1).1,
                         kill_tx: None,
                         exited_rx: None,
-                    }
+                    },
                 );
                 cmd_io.kill();
                 // Remove the placeholder
@@ -1572,15 +1625,15 @@ async fn execute_command(
                 format!("[KILL {}: invalid index]\n", idx)
             }
         }
-        
+
         CommandType::Read(idx) => {
             if idx >= subprocesses.len() {
                 return format!("[READ {}: invalid index]\n", idx);
             }
-            
+
             let cmd_io = &mut subprocesses[idx];
             let mut output = String::new();
-            
+
             // Drain available stdout
             while let Ok(chunk) = cmd_io.stdout_rx.try_recv() {
                 output.push_str(&String::from_utf8_lossy(&chunk));
@@ -1589,7 +1642,7 @@ async fn execute_command(
             while let Ok(chunk) = cmd_io.stderr_rx.try_recv() {
                 output.push_str(&String::from_utf8_lossy(&chunk));
             }
-            
+
             if output.is_empty() {
                 if daemon_args.verbose {
                     eprintln!("[READ {}: (no new output)]", idx);
@@ -1597,7 +1650,10 @@ async fn execute_command(
                 format!("[READ {}: (no new output)]\n", idx)
             } else {
                 // Add to tool_context for inclusion in messages
-                let formatted = format!("=== Command {} Output ===\n{}\n=== End Output ===\n", idx, output);
+                let formatted = format!(
+                    "=== Command {} Output ===\n{}\n=== End Output ===\n",
+                    idx, output
+                );
                 tool_context.push_str(&formatted);
                 if daemon_args.verbose {
                     eprintln!("[READ {}: {} bytes]", idx, output.len());
@@ -1605,12 +1661,12 @@ async fn execute_command(
                 format!("[READ {}: {} bytes captured]\n", idx, output.len())
             }
         }
-        
+
         CommandType::Writ(idx, input) => {
             if idx >= subprocesses.len() {
                 return format!("[WRIT {}: invalid index]\n", idx);
             }
-            
+
             let cmd_io = &subprocesses[idx];
             match cmd_io.stdin_tx.send(input.clone().into_bytes()).await {
                 Ok(_) => {
@@ -1628,9 +1684,9 @@ async fn execute_command(
 }
 
 fn is_interrupt_event(event: &notify::Event) -> bool {
-    matches!(event.kind, 
-        notify::EventKind::Create(_) | 
-        notify::EventKind::Modify(_)
+    matches!(
+        event.kind,
+        notify::EventKind::Create(_) | notify::EventKind::Modify(_)
     )
 }
 
@@ -1644,17 +1700,20 @@ async fn handle_interrupt(
         notify::EventKind::Create(_) => {
             if args.output_new.is_some() {
                 let new_timestamp = chrono::Utc::now().timestamp_millis();
-                let new_path = args.output_new.as_ref().unwrap()
+                let new_path = args
+                    .output_new
+                    .as_ref()
+                    .unwrap()
                     .join(format!("out-{}.txt", new_timestamp));
-                
+
                 if args.verbose {
                     eprintln!("Creating new file: {}", new_path.display());
                 }
-                
+
                 if let Some(parent) = new_path.parent() {
                     let _ = fs::create_dir_all(parent).await;
                 }
-                
+
                 *current_file_path = Some(new_path.clone());
                 *realtime_file = Some(File::create(&new_path).await?);
             } else if args.output_overwrite.is_some() {
@@ -1667,7 +1726,7 @@ async fn handle_interrupt(
             if args.verbose {
                 eprintln!("Wiping current output and restarting...");
             }
-            
+
             if args.stream_realtime {
                 if args.output_new.is_some() {
                     if let Some(ref path) = *current_file_path {
@@ -1685,11 +1744,15 @@ async fn handle_interrupt(
 
 fn extract_content(chunk: mistralrs::Response) -> anyhow::Result<String> {
     use mistralrs::{ChatCompletionChunkResponse, ChunkChoice, Delta, ResponseOk};
-    
+
     match chunk.as_result() {
         Ok(ResponseOk::Chunk(ChatCompletionChunkResponse { choices, .. })) => {
             if let Some(ChunkChoice {
-                delta: Delta { content: Some(text), .. },
+                delta:
+                    Delta {
+                        content: Some(text),
+                        ..
+                    },
                 ..
             }) = choices.first()
             {
@@ -1698,9 +1761,7 @@ fn extract_content(chunk: mistralrs::Response) -> anyhow::Result<String> {
                 Ok(String::new()) // chunk with no content (e.g., finish reason)
             }
         }
-        Ok(other) => {
-            Ok(String::new())
-        }
+        Ok(other) => Ok(format!("{:?}", other)),
         Err(e) => {
             // Convert error to anyhow
             Err(anyhow::anyhow!("{}", e))
@@ -1756,47 +1817,45 @@ async fn cleanup_my_pipe(pid: u32) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let my_pid = std::process::id();
-    
+
     fs::create_dir_all(PIPE_DIR).await?;
     let my_pipe_path = pipe_path(my_pid);
     let _ = fs::remove_file(&my_pipe_path);
     let listener = UnixListener::bind(&my_pipe_path)?;
     let inference_lock = Arc::new(Mutex::new(()));
-    
+
     println!("PID {} listening on {:?}", my_pid, my_pipe_path);
-    
+
     let cleanup_pid = my_pid;
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         cleanup_my_pipe(cleanup_pid).await;
         std::process::exit(0);
     });
-    
+
     let args = Args::parse();
-    
+
     let has_input = has_any_input(&args);
     let has_output = has_any_output(&args);
 
     if !has_input || !has_output {
-    	eprintln!("No input or output specified.");
+        eprintln!("No input or output specified.");
         std::process::exit(0);
     }
-    
+
     // SWITCHED TO BROADCAST CHANNEL
     // This allows multiple consumers (main loop + inference tasks) to receive events.
     let (fs_tx, mut fs_rx) = broadcast::channel(64);
     let tx_clone = fs_tx.clone();
-    let mut watcher = notify::recommended_watcher(
-        move |res: Result<notify::Event, notify::Error>| {
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             let res = res.map_err(Arc::new);
-        	let _ = tx_clone.send(res);
-        }
-    )?;
-    
-    
+            let _ = tx_clone.send(res);
+        })?;
+
     let dirs = collect_viewer_dirs(&args).await?;
     let dir_args = dirs.iter().map(|p| p.to_string_lossy());
-    
+
     for d in args
         .input_final
         .iter()
@@ -1810,22 +1869,21 @@ async fn main() -> Result<()> {
             eprintln!("Watching: {}", d.display());
         }
     }
-    
 
     let mut io = spawn_command_io("psi-viewer", dir_args).await?;
     let mut editor_exit = io.exited_rx.take();
-    
+
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 Some(chunk) = io.stdout_rx.recv() => {
                     print!("{}", String::from_utf8_lossy(&chunk));
                 }
-        
+
                 Some(chunk) = io.stderr_rx.recv() => {
                     eprint!("{}", String::from_utf8_lossy(&chunk));
                 }
-        
+
                 _ = async {
                     if let Some(rx) = &mut editor_exit {
                         let _ = rx.await;
@@ -1834,17 +1892,17 @@ async fn main() -> Result<()> {
                     eprintln!("Editor exited — shutting down daemon.");
                     std::process::exit(0);
                 }
-        
+
                 else => break,
             }
         }
     });
-    
+
     let mut model: Option<Arc<mistralrs::Model>> = None;
-    
+
     loop {
         let upstream = find_oldest_pipe(my_pid).await;
-        
+
         tokio::select! {
             event = fs_rx.recv() => {
                 match event {
@@ -1852,27 +1910,27 @@ async fn main() -> Result<()> {
                         if args.verbose {
                             eprintln!("Change detected: {:?}", event);
                         }
-                        
-                        
+
+
                         // FIX FOR DOUBLE INFERENCE:
                         // If we are the leader (no upstream) and we are currently inferencing,
-                        // we skip sending a new request. The running inference task owns a 
+                        // we skip sending a new request. The running inference task owns a
                         // receiver (fs_tx.subscribe()) and will handle the interrupt internally.
                         let should_skip = upstream.is_none() && inference_lock.try_lock().is_err();
-                        
+
                         if should_skip {
                             if args.verbose {
                                 eprintln!("Inference in progress; event delegated to running task.");
                             }
                             continue;
                         } else { while let Ok(ev) = fs_rx.try_recv() {
-                        	if args.verbose {
-                        		eprintln!("Additional: {:?}", ev);
-                        	}
+                            if args.verbose {
+                                eprintln!("Additional: {:?}", ev);
+                            }
                         }}
 
                         println!("Running inference after filesystem change");
-                        
+
                         if let Some(upstream_pipe) = upstream {
                             let req = InferenceRequest {
                                 args: args.clone(),
@@ -1911,7 +1969,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            
+
             result = listener.accept() => {
                 if let Ok((stream, _)) = result {
                     if model.is_none() {
@@ -1921,26 +1979,26 @@ async fn main() -> Result<()> {
                             eprintln!("Model initialized");
                         }
                     }
-                    
+
                     let m = model.as_ref().unwrap().clone();
                     let lock = inference_lock.clone();
                     // Clone the broadcast sender to pass to the task
                     let interrupt_tx = fs_tx.clone();
-        
+
                     tokio::spawn(async move {
-                        let _guard = lock.lock().await; 
+                        let _guard = lock.lock().await;
                         // Pass the sender to handle_request so it can subscribe
                         handle_request(stream, m, interrupt_tx).await;
                     });
                 }
             }
         }
-        
+
         if !args.watch {
             break;
         }
     }
-    
+
     cleanup_my_pipe(my_pid).await;
     Ok(())
 }
@@ -1956,55 +2014,49 @@ async fn load_model(args: &Args) -> Result<mistralrs::Model> {
     );
     println!("secondary_model={}", args.secondary_model);
 
-    let primary_config = ModelConfig::new(ModelSlot::Primary, args.model.clone());
-    let secondary_config = ModelConfig::new(ModelSlot::Secondary, args.secondary_model.clone());
+    let primary_alias = args.model.clone();
+    let secondary_alias = args.secondary_model.clone();
 
-    let mut builder = mistralrs::MultiModelBuilder::new()
-        .with_default_model(&primary_config.alias());
+    let mut builder = mistralrs::MultiModelBuilder::new().with_default_model(&primary_alias);
 
     // Add primary model
     if args.verbose {
-            eprintln!("Loading Primary Model");
+        eprintln!("Loading Primary Model");
     }
     if let Some(path) = &args.model_path {
         if args.verbose {
             eprintln!("Using local model file for primary: {}", path);
         }
-        let primary_builder = VisionModelBuilder::new(path).with_isq(IsqType::Q4K).with_logging();
-        builder = builder.add_model_with_alias(
-        	&primary_config.alias(),
-        	primary_builder
-    	);
+        let primary_builder = VisionModelBuilder::new(path)
+            .with_auto_isq(IsqBits::Four)
+            .with_logging();
+        builder = builder.add_model_with_alias(&primary_alias, primary_builder);
     } else if !args.gguf.is_empty() {
         println!("Loading primary as GGUF!");
         let primary_builder = GgufModelBuilder::new(&args.model, args.gguf.clone());
-        builder = builder.add_model_with_alias(
-        	&primary_config.alias(),
-        	primary_builder
-    	);
+        builder = builder.add_model_with_alias(&primary_alias, primary_builder);
     } else {
-        let primary_builder = VisionModelBuilder::new(&args.model).with_isq(IsqType::Q4K).with_logging();
-        builder = builder.add_model_with_alias(
-        	&primary_config.alias(),
-        	primary_builder
-    	);
+        let primary_builder = VisionModelBuilder::new(&args.model)
+            .with_auto_isq(IsqBits::Four)
+            .with_logging();
+        builder = builder.add_model_with_alias(&primary_alias, primary_builder);
     };
 
-	if args.verbose {
-            eprintln!("Loading Secondary Model");
+    if args.verbose {
+        eprintln!("Loading Secondary Model");
     }
     // Add secondary model (audio)
-    let secondary_builder = mistralrs::VisionModelBuilder::new(&args.secondary_model).with_isq(IsqType::Q4K).with_logging();
-    builder = builder.add_model_with_alias(
-        &secondary_config.alias(),
-        secondary_builder
-    );
-	if args.verbose {
-            eprintln!("Building Models");
+    let secondary_builder = mistralrs::VisionModelBuilder::new(&args.secondary_model)
+        .with_auto_isq(IsqBits::Four)
+        .with_dtype(mistralrs::ModelDType::F32)
+        .with_logging();
+    builder = builder.add_model_with_alias(&secondary_alias, secondary_builder);
+    if args.verbose {
+        eprintln!("Building Models");
     }
     let model = builder.build().await?;
     if args.verbose {
-            eprintln!("Models Built");
+        eprintln!("Models Built");
     }
     Ok(model)
 }
@@ -2020,9 +2072,9 @@ async fn send_request(pipe: &PathBuf, req: InferenceRequest) -> Result<()> {
 
 // Updated to accept broadcast sender for interrupts
 async fn handle_request(
-    stream: UnixStream, 
-    model: Arc<mistralrs::Model>, 
-    interrupt_tx: broadcast::Sender<Result<notify::Event, Arc<notify::Error>>>
+    stream: UnixStream,
+    model: Arc<mistralrs::Model>,
+    interrupt_tx: broadcast::Sender<Result<notify::Event, Arc<notify::Error>>>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
