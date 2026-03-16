@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use walkdir::WalkDir;
 
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -17,9 +19,9 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel, unbounded_channel};
 use tokio::sync::oneshot;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, watch};
 
 // Add these constants near the top of your file
 const CMD_OPEN_EXEC: &str = "【EXEC ";
@@ -199,6 +201,20 @@ impl CommandParser {
                     None
                 }
             }
+        }
+    }
+
+    /// Flush any characters held in the sliding-window buffer at end-of-stream.
+    /// In pre-active mode the buffer contains up to MAX_OPENER_LEN characters that
+    /// were being held back in case they formed a command opener — return them as
+    /// plain output.  In active mode a command was opened but never closed; discard
+    /// it and return an empty string.
+    fn flush(&mut self) -> String {
+        if self.active {
+            self.reset();
+            String::new()
+        } else {
+            std::mem::take(&mut self.buffer)
         }
     }
 }
@@ -1167,11 +1183,360 @@ async fn detect_speech(
     Ok(content.contains("true"))
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ModelSlot {
     Primary,
     Secondary,
 }
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct InterruptKind: u8 {
+        const FS                          = 0b0001;
+        const AUDIO                       = 0b0010;
+        const PARALLEL_INFERENCE_COMPLETION  = 0b0100;
+        const SYNTHESIS_INFERENCE_INITIATION = 0b1000;
+    }
+}
+
+#[derive(Clone)]
+struct ParallelInferenceParams {
+    messages: VisionMessages,
+    system_addendum: String,
+    interrupted_by: InterruptKind,
+    context_inputs: Vec<ParallelInferenceParams>,
+    streaming: bool,
+    model_slot: ModelSlot,
+}
+
+impl ParallelInferenceParams {
+    fn synthesis_params(
+        messages: VisionMessages,
+        active_modes: Vec<ParallelInferenceParams>,
+        model_slot: ModelSlot,
+    ) -> Self {
+        ParallelInferenceParams {
+            messages,
+            system_addendum: "You are an agent tasked with synthesizing the responses of specialist agents into a single synthesized response, making connections between responses, and respecting prior instructions about response formatting, if any exist. You will receive a set of responses that should be synthesized - try to incorporate all information provided by each response provided to you, discarding statements by specialists that indicate their lack of capability (ie, if a vision-enabled agent indicates it is incapable of processing audio input, ignore that statement for purposes of your synthesis, but incorporate all of the unique information they provide about what they see). The user does not see the responses of the specialists, and they are not persisted in your context, so if you do not incorporate information they provide, that information will be lost.".into(),
+            interrupted_by: InterruptKind::all(),
+            context_inputs: active_modes,
+            streaming: true,
+            model_slot,
+        }
+    }
+
+    fn vision_params(messages: VisionMessages) -> Self {
+        ParallelInferenceParams {
+            messages,
+            system_addendum: "You are a vision-enabled agent tasked with analyzing the visual content of images and videos. You share a historical context with other agents, and your responses are synthesized with theirs, but your task is to use your own unique insights given the visual content only. Your response will be synthesized with other agents' responses, so be concise and to the point.".into(),
+            interrupted_by: InterruptKind::FS | InterruptKind::PARALLEL_INFERENCE_COMPLETION,
+            context_inputs: Vec::new(),
+            streaming: false,
+            model_slot: ModelSlot::Primary,
+        }
+    }
+
+    fn audio_params(messages: VisionMessages) -> Self {
+        ParallelInferenceParams {
+            messages,
+            system_addendum: "You are an audio-enabled agent tasked with analyzing audio content. You share a historical context with other agents, and your responses are synthesized with theirs, but your task is to use your own unique insights given the audio content only. Your response will be synthesized with other agents' responses, so be concise and to the point.".into(),
+            interrupted_by: InterruptKind::AUDIO | InterruptKind::PARALLEL_INFERENCE_COMPLETION,
+            context_inputs: Vec::new(),
+            streaming: false,
+            model_slot: ModelSlot::Secondary,
+        }
+    }
+
+    fn full_pipeline(
+        vision_messages: VisionMessages,
+        audio_messages: VisionMessages,
+        primary: ModelSlot,
+    ) -> Self {
+        let input_context = vec![
+            ParallelInferenceParams::vision_params(vision_messages.clone()),
+            ParallelInferenceParams::audio_params(audio_messages.clone()),
+        ];
+        match primary {
+            ModelSlot::Primary => ParallelInferenceParams::synthesis_params(
+                vision_messages,
+                input_context,
+                ModelSlot::Primary,
+            ),
+            ModelSlot::Secondary => ParallelInferenceParams::synthesis_params(
+                audio_messages,
+                input_context,
+                ModelSlot::Secondary,
+            ),
+        }
+    }
+}
+
+// --- Coroutine infrastructure ---
+
+enum CoroutineResponse {
+    Complete(String),
+    Interrupted(String),
+    Error(anyhow::Error),
+}
+
+/// Runs a single inference coroutine for `params`, streaming tokens to `token_tx` if provided.
+/// Cancels early and returns `Interrupted` when `cancel_rx` becomes true.
+async fn run_inference_coroutine(
+    model: Arc<mistralrs::Model>,
+    params: ParallelInferenceParams,
+    mut cancel_rx: watch::Receiver<bool>,
+    token_tx: Option<UnboundedSender<String>>,
+) -> CoroutineResponse {
+    let stream_result = match params.model_slot {
+        ModelSlot::Primary => model.stream_chat_request(params.messages).await,
+        ModelSlot::Secondary => {
+            model
+                .stream_chat_request_with_model(params.messages, Some("secondary"))
+                .await
+        }
+    };
+
+    let mut stream = match stream_result {
+        Ok(s) => s,
+        Err(e) => return CoroutineResponse::Error(e.into()),
+    };
+
+    let mut buffer = String::new();
+    loop {
+        tokio::select! {
+            chunk_opt = stream.next() => {
+                match chunk_opt {
+                    Some(chunk) => {
+                        match extract_content(chunk) {
+                            Ok(content) if !content.is_empty() => {
+                                if let Some(ref tx) = token_tx {
+                                    let _ = tx.send(content.clone());
+                                }
+                                buffer.push_str(&content);
+                            }
+                            Ok(_) => {}
+                            Err(e) => return CoroutineResponse::Error(e),
+                        }
+                    }
+                    None => return CoroutineResponse::Complete(buffer),
+                }
+            }
+            result = cancel_rx.changed() => {
+                if result.is_ok() && *cancel_rx.borrow() {
+                    return CoroutineResponse::Interrupted(buffer);
+                }
+            }
+        }
+    }
+}
+
+/// Runs all `params_list` entries in parallel via FuturesUnordered.
+/// The first coroutine to complete cancels all others (they return Interrupted).
+/// Errors are retried up to `max_retries` times before being replaced with an error string.
+type CoroutineFut = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = (usize, ParallelInferenceParams, CoroutineResponse)>
+            + Send,
+    >,
+>;
+
+async fn run_parallel_stage(
+    model: &Arc<mistralrs::Model>,
+    params_list: Vec<ParallelInferenceParams>,
+    max_retries: u32,
+) -> Vec<(usize, String)> {
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let mut pool: FuturesUnordered<CoroutineFut> = FuturesUnordered::new();
+    let mut retry_counts: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+
+    let total = params_list.len();
+    for (idx, params) in params_list.into_iter().enumerate() {
+        let model = model.clone();
+        let rx = cancel_rx.clone();
+        pool.push(Box::pin(async move {
+            let resp = run_inference_coroutine(model, params.clone(), rx, None).await;
+            (idx, params, resp)
+        }));
+    }
+
+    let mut results: Vec<Option<String>> = vec![None; total];
+
+    while let Some((idx, params, resp)) = pool.next().await {
+        match resp {
+            CoroutineResponse::Complete(s) => {
+                let _ = cancel_tx.send(true);
+                results[idx] = Some(s);
+            }
+            CoroutineResponse::Interrupted(s) => {
+                results[idx] = Some(s);
+            }
+            CoroutineResponse::Error(e) => {
+                let retries = retry_counts.entry(idx).or_insert(0);
+                if *retries < max_retries {
+                    *retries += 1;
+                    eprintln!("Coroutine {} error (retry {}): {:?}", idx, retries, e);
+                    let model = model.clone();
+                    let rx = cancel_rx.clone();
+                    pool.push(Box::pin(async move {
+                        let resp = run_inference_coroutine(model, params.clone(), rx, None).await;
+                        (idx, params, resp)
+                    }));
+                } else {
+                    eprintln!(
+                        "Coroutine {} failed after {} retries: {:?}",
+                        idx, max_retries, e
+                    );
+                    results[idx] = Some(format!("[Specialist error: {}]", e));
+                }
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| (i, s.unwrap_or_default()))
+        .collect()
+}
+
+/// The outcome of a single call to `run_streaming_loop`.
+enum StreamOutcome {
+    /// Inference finished cleanly; contains the full accumulated response.
+    Complete(String),
+    /// A tool command was detected and executed; contains the response so far
+    /// (including the command output). The caller should append this to
+    /// `output_buffer` and restart inference.
+    CommandExecuted(String),
+    /// Inference was cancelled because a new audio chunk arrived.
+    AudioInterrupted { response: String, audio: Option<Vec<u8>> },
+    /// Inference was cancelled by a filesystem event (or the coroutine returned
+    /// `Interrupted` for another reason). If `event` is `Some`, the caller
+    /// should call `handle_interrupt` before restarting.
+    FsInterrupted { response: String, event: Option<notify::Event> },
+}
+
+/// Drives a single streaming inference to completion (or interruption).
+///
+/// Handles token-by-token streaming, real-time file writes, command parsing /
+/// execution, audio interrupts, and filesystem interrupts — returning a
+/// `StreamOutcome` that tells the caller what happened and what was accumulated.
+async fn run_streaming_loop(
+    model: Arc<mistralrs::Model>,
+    params: ParallelInferenceParams,
+    realtime_file: &mut Option<File>,
+    stream_realtime: bool,
+    speech_detected_rx: &mut Option<broadcast::Receiver<()>>,
+    interrupt_rx: &mut Option<broadcast::Receiver<Result<notify::Event, Arc<notify::Error>>>>,
+    latest_audio_rx: &watch::Receiver<Option<Vec<u8>>>,
+    subprocesses: &mut Vec<CommandIO>,
+    args: &Args,
+) -> Result<StreamOutcome> {
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (token_tx, mut token_rx) = unbounded_channel::<String>();
+    let mut cmd_parser = CommandParser::new();
+    let mut tool_context = String::new();
+    let mut response = String::new();
+    let mut inference_fut = std::pin::pin!(run_inference_coroutine(
+        model,
+        params,
+        cancel_rx,
+        Some(token_tx),
+    ));
+
+    loop {
+        tokio::select! {
+            result = &mut inference_fut => {
+                // Drain any tokens that arrived just before the future completed.
+                while let Ok(tok) = token_rx.try_recv() {
+                    let (out, cmd, _) = cmd_parser.process(&tok);
+                    response.push_str(&out);
+                    if stream_realtime {
+                        if let Some(ref mut f) = *realtime_file {
+                            let _ = f.write_all(out.as_bytes()).await;
+                            let _ = f.flush().await;
+                        }
+                    }
+                    if let Some(cmd) = cmd {
+                        let res = execute_command(cmd, subprocesses, &mut tool_context, args).await;
+                        response.push_str(&res);
+                        if stream_realtime {
+                            if let Some(ref mut f) = *realtime_file {
+                                let _ = f.write_all(res.as_bytes()).await;
+                                let _ = f.flush().await;
+                            }
+                        }
+                        return Ok(StreamOutcome::CommandExecuted(response));
+                    }
+                }
+                // Flush the parser's sliding-window buffer — this is the fix for the
+                // "final token not written" bug that breaks structured-output use cases.
+                let tail = cmd_parser.flush();
+                if !tail.is_empty() {
+                    response.push_str(&tail);
+                    if stream_realtime {
+                        if let Some(ref mut f) = *realtime_file {
+                            let _ = f.write_all(tail.as_bytes()).await;
+                            let _ = f.flush().await;
+                        }
+                    }
+                }
+                return match result {
+                    CoroutineResponse::Complete(_) => Ok(StreamOutcome::Complete(response)),
+                    CoroutineResponse::Interrupted(_) => Ok(StreamOutcome::FsInterrupted { response, event: None }),
+                    CoroutineResponse::Error(e) => Err(e),
+                };
+            }
+            Some(tok) = token_rx.recv() => {
+                let (out, cmd, _) = cmd_parser.process(&tok);
+                response.push_str(&out);
+                if stream_realtime {
+                    if let Some(ref mut f) = *realtime_file {
+                        let _ = f.write_all(out.as_bytes()).await;
+                        let _ = f.flush().await;
+                    }
+                }
+                if let Some(cmd) = cmd {
+                    let res = execute_command(cmd, subprocesses, &mut tool_context, args).await;
+                    response.push_str(&res);
+                    if stream_realtime {
+                        if let Some(ref mut f) = *realtime_file {
+                            let _ = f.write_all(res.as_bytes()).await;
+                            let _ = f.flush().await;
+                        }
+                    }
+                    let _ = cancel_tx.send(true);
+                    return Ok(StreamOutcome::CommandExecuted(response));
+                }
+            }
+            _ = async {
+                if let Some(ref mut rx) = *speech_detected_rx {
+                    rx.recv().await.ok()
+                } else {
+                    std::future::pending::<Option<()>>().await
+                }
+            } => {
+                let _ = cancel_tx.send(true);
+                let audio = latest_audio_rx.borrow().clone();
+                return Ok(StreamOutcome::AudioInterrupted { response, audio });
+            }
+            event = async {
+                if let Some(ref mut rx) = *interrupt_rx {
+                    rx.recv().await.ok()
+                } else {
+                    std::future::pending::<Option<Result<notify::Event, Arc<notify::Error>>>>().await
+                }
+            } => {
+                if let Some(Ok(ev)) = event {
+                    if is_interrupt_event(&ev) {
+                        let _ = cancel_tx.send(true);
+                        return Ok(StreamOutcome::FsInterrupted { response, event: Some(ev) });
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 async fn run_once(
     model: &Arc<mistralrs::Model>,
@@ -1181,9 +1546,6 @@ async fn run_once(
     if args.verbose {
         eprintln!("Building messages..");
     }
-
-    let (primary_messages, secondary_messages) = build_messages(model, args).await?;
-    let has_secondary = secondary_messages.is_some() && args.secondary_model != "none";
 
     let timestamp = chrono::Utc::now().timestamp_millis();
     let new_file_path = args
@@ -1203,7 +1565,6 @@ async fn run_once(
         }
         File::create(overwrite_path).await?;
     }
-
     if let Some(ref path) = new_file_path {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
@@ -1228,312 +1589,252 @@ async fn run_once(
         None
     };
 
-    let mut output_buffer = String::new();
-    let mut restart_count = 0;
-    let mut audio_interrupt_pending = false;
-
     // Spawn realtime listener if needed
     let mut _realtime_listener_guard = None;
-    let (latest_audio_tx, latest_audio_rx) = tokio::sync::watch::channel::<Option<Vec<u8>>>(None);
-
+    let (latest_audio_tx, latest_audio_rx) = watch::channel::<Option<Vec<u8>>>(None);
     let mut _audio_buffer_task = None;
     let mut speech_detected_rx = None;
+
+    let (_primary_messages, secondary_messages) = build_messages(model, args).await?;
+    let has_secondary = secondary_messages.is_some() && args.secondary_model != "none";
 
     if (args.realtime_listener.is_some() && stream_realtime) || has_secondary {
         let source = args.realtime_listener.as_ref().unwrap();
         let listener = spawn_realtime_listener(source, args, model.clone())
             .await
             .context("Failed to spawn realtime listener")?;
-
         speech_detected_rx = Some(listener.speech_detected_rx.resubscribe());
-
-        // Spawn task to continuously drain chunk_rx and buffer latest
         let mut chunk_rx = listener.chunk_rx;
         _audio_buffer_task = Some(tokio::spawn(async move {
             while let Some(chunk) = chunk_rx.recv().await {
                 let _ = latest_audio_tx.send(Some(chunk));
             }
         }));
-
-        // Keep listener alive (shutdown_tx needs to stay alive)
         _realtime_listener_guard = Some(listener.shutdown_tx);
     }
 
-    let mut subprocesses: Vec<CommandIO> = Vec::new();
-    let mut continuation = false;
+    let mut output_buffer = String::new();
+    let mut restart_count = 0;
+    let mut audio_interrupt_pending = false;
     let mut pending_audio_queue: Vec<Vec<u8>> = Vec::new();
+    let mut subprocesses: Vec<CommandIO> = Vec::new();
+
     'restart_loop: loop {
         restart_count += 1;
         if args.verbose && restart_count > 1 {
             eprintln!("Restart iteration {}", restart_count);
         }
 
-        let mut cmd_parser = CommandParser::new();
-        let mut tool_context = String::new();
-
         let audio_first = std::mem::take(&mut audio_interrupt_pending);
 
-        let (current_primary, current_secondary) = if restart_count >= 1 && continuation {
-            (primary_messages.clone(), secondary_messages.clone())
-        } else {
-            build_messages(model, args).await?
-        };
-
+        // Rebuild messages on every restart so new file state is picked up
+        let (current_primary, current_secondary) = build_messages(model, args).await?;
         let has_sec = current_secondary.is_some() && args.secondary_model != "none";
-        let mut primary_response = String::new();
-        let mut secondary_response = String::new();
 
-        let run_order: Vec<ModelSlot> = if audio_first && has_sec {
-            vec![ModelSlot::Secondary, ModelSlot::Primary]
+        // Decide which slot drives the synthesis (audio-first => secondary is primary)
+        let primary_slot = if audio_first && has_sec {
+            ModelSlot::Secondary
         } else {
-            let mut order = vec![ModelSlot::Primary];
-            if has_sec {
-                order.push(ModelSlot::Secondary);
-            }
-            order
+            ModelSlot::Primary
         };
 
-        for (idx, slot) in run_order.iter().enumerate() {
-            let is_first = idx == 0;
-            let _is_last = idx == run_order.len() - 1;
-            continuation = is_first;
-            match slot {
-                ModelSlot::Primary => {
+        // Build the synthesis params (parallel pipeline or single-model)
+        let synth_params = if has_sec {
+            let mut audio_msgs = current_secondary.clone().unwrap();
+            for audio in &pending_audio_queue {
+                audio_msgs = audio_msgs.add_multimodal_message(
+                    TextMessageRole::User,
+                    "",
+                    vec![],
+                    vec![
+                        mistralrs::AudioInput::from_bytes(audio)
+                            .context("Failed to create AudioInput from bytes")?,
+                    ],
+                );
+            }
+            pending_audio_queue.clear();
+            ParallelInferenceParams::full_pipeline(
+                current_primary.clone(),
+                audio_msgs,
+                primary_slot,
+            )
+        } else {
+            ParallelInferenceParams {
+                messages: current_primary.clone(),
+                system_addendum: String::new(),
+                interrupted_by: InterruptKind::all(),
+                context_inputs: Vec::new(),
+                streaming: true,
+                model_slot: ModelSlot::Primary,
+            }
+        };
+
+        // --- Parallel specialist stage ---
+        if !synth_params.context_inputs.is_empty() {
+            if args.verbose {
+                eprintln!(
+                    "Running {} parallel specialists...",
+                    synth_params.context_inputs.len()
+                );
+            }
+            let specialist_results =
+                run_parallel_stage(model, synth_params.context_inputs.clone(), 2).await;
+            if args.verbose {
+                eprintln!("Parallel stage complete, building synthesis messages.");
+            }
+
+            // Inject specialist responses into synthesis messages
+            let mut synth_msgs = synth_params.messages.clone();
+            if !synth_params.system_addendum.is_empty() {
+                synth_msgs = synth_msgs.add_message(
+                    TextMessageRole::System,
+                    synth_params.system_addendum.clone(),
+                );
+            }
+            for (idx, text) in &specialist_results {
+                let label = match synth_params.context_inputs[*idx].model_slot {
+                    ModelSlot::Primary => "VISION SPECIALIST",
+                    ModelSlot::Secondary => "AUDIO SPECIALIST",
+                };
+                synth_msgs = synth_msgs.add_message(
+                    TextMessageRole::System,
+                    format!("[SPECIALIST RESPONSE ({label}): {text}]"),
+                );
+            }
+
+            let streaming_params = ParallelInferenceParams {
+                messages: synth_msgs,
+                system_addendum: String::new(),
+                interrupted_by: InterruptKind::all(),
+                context_inputs: Vec::new(),
+                streaming: true,
+                model_slot: synth_params.model_slot,
+            };
+
+            match run_streaming_loop(
+                model.clone(),
+                streaming_params,
+                &mut realtime_file,
+                stream_realtime,
+                &mut speech_detected_rx,
+                &mut interrupt_rx,
+                &latest_audio_rx,
+                &mut subprocesses,
+                args,
+            )
+            .await
+            .context("Synthesis model failed")?
+            {
+                StreamOutcome::Complete(resp) => {
                     if args.verbose {
-                        eprintln!(
-                            "Running primary model ({})...",
-                            if is_first { "FIRST" } else { "SECOND" }
-                        );
+                        eprintln!("Synthesis complete.");
                     }
-
-                    let mut msgs = current_primary.clone();
-
-                    if has_sec {
-                        let sys_msg = if is_first {
-                            PRIMARY_BEFORE_SECONDARY
-                        } else {
-                            PRIMARY_AFTER_SECONDARY
-                        };
-                        msgs = msgs.add_message(TextMessageRole::System, sys_msg.to_string());
+                    output_buffer.push_str(&resp);
+                    break 'restart_loop;
+                }
+                StreamOutcome::CommandExecuted(resp) => {
+                    output_buffer.push_str(&resp);
+                    continue 'restart_loop;
+                }
+                StreamOutcome::AudioInterrupted { response, audio } => {
+                    if args.verbose {
+                        eprintln!("Audio interrupt during synthesis.");
                     }
-
-                    if !secondary_response.is_empty() {
-                        msgs = msgs.add_message(
-                            TextMessageRole::System,
-                            format!("[Audio collaborator: {}]", secondary_response),
-                        );
-                    }
-                    if !output_buffer.is_empty()
-                        && (secondary_response.is_empty()
-                            || !output_buffer.contains(&secondary_response))
-                    {
-                        msgs = msgs.add_message(
-                            TextMessageRole::System,
-                            format!("[Previous context: {}]", output_buffer),
-                        );
-                    }
-
-                    match model.stream_chat_request(msgs).await {
-                        Ok(mut stream) => {
-                            let mut last_token: Option<String> = None;
-                            'primary_stream: loop {
-                                tokio::select! {
-                                    chunk_opt = stream.next() => {
-                                        match chunk_opt {
-                                            Some(chunk) => {
-                                                let content = extract_content(chunk)?;
-                                                let (out, cmd, leftovers) = cmd_parser.process(&content);
-                                                last_token = Some(leftovers);
-                                                primary_response.push_str(&out);
-                                                if stream_realtime {
-                                                    if let Some(ref mut f) = realtime_file {
-                                                        let _ = f.write_all(out.as_bytes()).await;
-                                                        let _ = f.flush().await;
-                                                    }
-                                                } else {
-                                                    output_buffer.push_str(&out);
-                                                }
-
-                                                if let Some(cmd) = cmd {
-                                                    let result = execute_command(cmd, &mut subprocesses, &mut tool_context, args).await;
-                                                    primary_response.push_str(&result);
-
-                                                    if stream_realtime {
-                                                        if let Some(ref mut f) = realtime_file {
-                                                            let _ = f.write_all(result.as_bytes()).await;
-                                                            let _ = f.flush().await;
-                                                        }
-                                                    }
-
-                                                    output_buffer = format!("{}{}", output_buffer, primary_response);
-                                                    continue 'restart_loop;
-                                                }
-                                            }
-                                            None => {
-                                                if stream_realtime {
-                                                    if let Some(ref mut f) = realtime_file {
-                                                        if let Some(token) = last_token {
-                                                            let _ = f.write_all(token.as_bytes()).await;
-                                                        }
-                                                        let _ = f.flush().await;
-                                                    }
-                                                }
-                                                if args.verbose { eprintln!("Primary Response Complete"); }
-                                                drop(stream);
-                                                break 'primary_stream
-                                            },
-                                        }
-                                    }
-                                    // Speech interrupt (only if secondary exists and we're first)
-                                    _ = async {
-                                        if is_first && has_sec {
-                                            if let Some(ref mut rx) = speech_detected_rx {
-                                                rx.recv().await.ok()
-                                            } else { None }
-                                        } else { None }
-                                    }, if is_first && has_sec => {
-                                        if args.verbose { eprintln!("Audio Interrupt"); }
-
-
-                                        audio_interrupt_pending = true;
-                                        output_buffer = format!("{}{}", output_buffer, primary_response);
-
-                                        if let Some(audio) = latest_audio_rx.borrow().clone() {
-                                            pending_audio_queue.push(audio);
-                                        }
-
-                                        drop(stream);
-                                        continuation = true;
-                                        continue 'restart_loop;
-                                    }
-                                    // File system interrupt
-                                    event = async {
-                                        if let Some(ref mut rx) = interrupt_rx {
-                                            rx.recv().await.ok()
-                                        } else { None }
-                                    } => {
-                                        if let Some(Ok(ev)) = event {
-                                            if is_interrupt_event(&ev) {
-                                                if args.verbose { eprintln!("FS Interrupt"); }
-                                                output_buffer = format!("{}{}", output_buffer, primary_response);
-                                                handle_interrupt(ev, &mut current_file_path, &mut realtime_file, args).await?;
-                                                drop(stream);
-                                                continuation = false;
-                                                continue 'restart_loop;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if !has_sec {
-                                return Err(e)
-                                    .context("Primary model failed and no secondary model")?;
-                            }
-                            eprintln!("Primary model error: {:?}", e);
-                            primary_response.push_str("[Vision model error]");
-                        }
+                    output_buffer.push_str(&response);
+                    audio_interrupt_pending = true;
+                    if let Some(audio) = audio {
+                        pending_audio_queue.push(audio);
                     }
                 }
-
-                ModelSlot::Secondary => {
+                StreamOutcome::FsInterrupted { response, event } => {
                     if args.verbose {
-                        eprintln!(
-                            "Running secondary model ({})...",
-                            if is_first { "FIRST" } else { "SECOND" }
-                        );
+                        eprintln!("FS interrupt during synthesis.");
                     }
-
-                    let mut msgs = current_secondary.clone().unwrap();
-
-                    let sys_msg = if is_first {
-                        SECONDARY_BEFORE_PRIMARY
-                    } else {
-                        SECONDARY_AFTER_PRIMARY
-                    };
-                    msgs = msgs.add_message(TextMessageRole::System, sys_msg.to_string());
-
-                    if !primary_response.is_empty() {
-                        msgs = msgs.add_message(
-                            TextMessageRole::System,
-                            format!("[Vision collaborator: {}]", primary_response),
-                        );
+                    output_buffer.push_str(&response);
+                    if let Some(ev) = event {
+                        handle_interrupt(ev, &mut current_file_path, &mut realtime_file, args)
+                            .await?;
                     }
+                }
+            }
+        } else {
+            // Single-model path: no parallel stage, stream synthesis directly
+            let mut msgs = synth_params.messages.clone();
+            if !synth_params.system_addendum.is_empty() {
+                msgs = msgs.add_message(
+                    TextMessageRole::System,
+                    synth_params.system_addendum.clone(),
+                );
+            }
+            if !output_buffer.is_empty() {
+                msgs = msgs.add_message(
+                    TextMessageRole::System,
+                    format!("[Previous context: {}]", output_buffer),
+                );
+            }
 
-                    for audio in pending_audio_queue.clone() {
-                        msgs = msgs.add_multimodal_message(
-                            TextMessageRole::User,
-                            "",
-                            vec![],
-                            vec![
-                                mistralrs::AudioInput::from_bytes(&audio)
-                                    .context("Failed to create AudioInput from bytes")?,
-                            ],
-                        );
+            let streaming_params = ParallelInferenceParams {
+                messages: msgs,
+                system_addendum: String::new(),
+                interrupted_by: InterruptKind::all(),
+                context_inputs: Vec::new(),
+                streaming: true,
+                model_slot: ModelSlot::Primary,
+            };
+
+            match run_streaming_loop(
+                model.clone(),
+                streaming_params,
+                &mut realtime_file,
+                stream_realtime,
+                &mut speech_detected_rx,
+                &mut interrupt_rx,
+                &latest_audio_rx,
+                &mut subprocesses,
+                args,
+            )
+            .await
+            .context("Primary model failed")?
+            {
+                StreamOutcome::Complete(resp) => {
+                    if args.verbose {
+                        eprintln!("Primary response complete.");
                     }
-                    pending_audio_queue.clear();
-
-                    match model
-                        .stream_chat_request_with_model(msgs, Some("secondary"))
-                        .await
-                    {
-                        Ok(mut stream) => {
-                            'secondary_stream: loop {
-                                tokio::select! {
-                                    chunk_opt = stream.next() => {
-                                        match chunk_opt {
-                                            Some(chunk) => {
-                                                let content = extract_content(chunk)?;
-                                                secondary_response.push_str(&content);
-
-                                                if stream_realtime {
-                                                    if let Some(ref mut f) = realtime_file {
-                                                        let _ = f.write_all(content.as_bytes()).await;
-                                                        let _ = f.flush().await;
-                                                    }
-                                                }
-                                                continue 'secondary_stream;
-                                            }
-                                            None => break 'secondary_stream,
-                                        }
-                                    }
-                                    // Speech interrupt during secondary response
-                                    _ = async {
-                                        if let Some(ref mut rx) = speech_detected_rx {
-                                            rx.recv().await.ok()
-                                        } else { None }
-                                    } => {
-                                        audio_interrupt_pending = true;
-                                        output_buffer = format!("{}{}{}", output_buffer, primary_response, secondary_response);
-                                        if args.verbose { eprintln!("Audio Interrupt"); }
-                                        drop(stream);
-
-                                        if let Some(audio) = latest_audio_rx.borrow().clone() {
-                                            pending_audio_queue.push(audio);
-                                        }
-
-                                        continue 'restart_loop;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Secondary model error: {:?}", e);
-                            secondary_response.push_str("[Audio model error]");
-                        }
+                    output_buffer.push_str(&resp);
+                    break 'restart_loop;
+                }
+                StreamOutcome::CommandExecuted(resp) => {
+                    output_buffer.push_str(&resp);
+                    continue 'restart_loop;
+                }
+                StreamOutcome::AudioInterrupted { response, audio } => {
+                    if args.verbose {
+                        eprintln!("Audio interrupt.");
+                    }
+                    output_buffer.push_str(&response);
+                    audio_interrupt_pending = true;
+                    if let Some(audio) = audio {
+                        pending_audio_queue.push(audio);
+                    }
+                }
+                StreamOutcome::FsInterrupted { response, event } => {
+                    if args.verbose {
+                        eprintln!("FS interrupt.");
+                    }
+                    output_buffer.push_str(&response);
+                    if let Some(ev) = event {
+                        handle_interrupt(ev, &mut current_file_path, &mut realtime_file, args)
+                            .await?;
                     }
                 }
             }
         }
+    } // end 'restart_loop
 
-        break; // natural completion
-    }
-
-    // Cleanup: shut down realtime listener
+    // Cleanup
     if let Some(shutdown) = _realtime_listener_guard.take() {
         if args.verbose {
-            eprintln!("Closing audio listener");
+            eprintln!("Closing audio listener.");
         }
         let _ = shutdown.send(());
     }
