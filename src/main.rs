@@ -1534,7 +1534,7 @@ async fn run_streaming_loop(
                 }
             } => {
                 if let Some(Ok(ev)) = event {
-                    if is_interrupt_event(&ev, &mut last_modify_interrupt, args.sleep_ms) {
+                    if is_interrupt_event(&ev, &mut last_modify_interrupt, &args) {
                         let _ = cancel_tx.send(true);
                         return Ok(StreamOutcome::FsInterrupted { response, event: Some(ev) });
                     }
@@ -1600,14 +1600,16 @@ async fn run_once(
 
     // Use externally-owned audio channels when supplied (leader path).
     // handle_request (worker path) passes None for both.
-    let (mut speech_detected_rx, latest_audio_rx): (Option<broadcast::Receiver<()>>, watch::Receiver<Option<Vec<u8>>>) =
-        match audio_channels {
-            Some((sdr, lar)) => (Some(sdr), lar),
-            None => {
-                let (_, rx) = watch::channel::<Option<Vec<u8>>>(None);
-                (None, rx)
-            }
-        };
+    let (mut speech_detected_rx, latest_audio_rx): (
+        Option<broadcast::Receiver<()>>,
+        watch::Receiver<Option<Vec<u8>>>,
+    ) = match audio_channels {
+        Some((sdr, lar)) => (Some(sdr), lar),
+        None => {
+            let (_, rx) = watch::channel::<Option<Vec<u8>>>(None);
+            (None, rx)
+        }
+    };
 
     let (_primary_messages, secondary_messages) = build_messages(model, args).await?;
     let has_secondary = secondary_messages.is_some() && args.secondary_model != "none";
@@ -1766,10 +1768,7 @@ async fn run_once(
                 );
             }
             if !output_buffer.is_empty() {
-                msgs = msgs.add_message(
-                    TextMessageRole::System,
-                    format!("[Previous context: {}]", output_buffer),
-                );
+                msgs = msgs.add_message(TextMessageRole::Assistant, format!("{}", output_buffer));
             }
 
             let streaming_params = ParallelInferenceParams {
@@ -1984,8 +1983,18 @@ async fn execute_command(
 fn is_interrupt_event(
     event: &notify::Event,
     last_modify: &mut Option<std::time::Instant>,
-    cooldown_ms: u64,
+    args: &Args,
 ) -> bool {
+    let watching: Vec<&PathBuf> = args
+        .input_final
+        .iter()
+        .chain(args.input_cat.iter())
+        .chain(args.system_final.iter())
+        .chain(args.system_cat.iter())
+        .collect();
+    if !event.paths.iter().any(|x| watching.contains(&x)) {
+        return false;
+    }
     match &event.kind {
         notify::EventKind::Create(_) => true,
         notify::EventKind::Access(notify::event::AccessKind::Close(
@@ -1996,7 +2005,7 @@ fn is_interrupt_event(
             let elapsed = last_modify
                 .map(|t| now.duration_since(t).as_millis() as u64)
                 .unwrap_or(u64::MAX);
-            if elapsed >= cooldown_ms {
+            if elapsed >= args.sleep_ms {
                 *last_modify = Some(now);
                 true
             } else {
@@ -2222,7 +2231,10 @@ async fn main() -> Result<()> {
 
     // Persistent realtime listener — lives for the full process lifetime.
     // Spawned lazily on first model load so we have a model handle for detect_speech.
-    let mut persistent_listener: Option<(broadcast::Receiver<()>, watch::Receiver<Option<Vec<u8>>>)> = None;
+    let mut persistent_listener: Option<(
+        broadcast::Receiver<()>,
+        watch::Receiver<Option<Vec<u8>>>,
+    )> = None;
     let mut _listener_guard: Option<oneshot::Sender<()>> = None;
     // Audio chunks queued by the main loop to be handed to the next run_once call.
     let mut queued_audio: Vec<Vec<u8>> = Vec::new();
@@ -2490,7 +2502,14 @@ async fn handle_request(
         if let Ok(req) = serde_json::from_str::<InferenceRequest>(&line) {
             println!("Handling request from PID {}", req.requesting_pid);
             let interrupt_rx = interrupt_tx.subscribe();
-            let _ = run_once(&model, &req.args, Some(interrupt_rx), audio_channels, pending_audio).await;
+            let _ = run_once(
+                &model,
+                &req.args,
+                Some(interrupt_rx),
+                audio_channels,
+                pending_audio,
+            )
+            .await;
         }
     }
 }

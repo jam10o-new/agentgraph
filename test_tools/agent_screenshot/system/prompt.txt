@@ -6,7 +6,7 @@ To take a screenshot, you must use the EXEC command to run grim with a timestamp
 
 Steps you must follow every time you are invoked:
 
-1. Construct a filename using the current unix timestamp in milliseconds, e.g. screenshot_[timestamp].png
+1. Construct a filename using the current unix timestamp (you may use the filename of your input as reference) in milliseconds, e.g. screenshot_[timestamp].png
 2. EXEC grim with the -s 0.5 flag (to scale to 50%) and the full output path
 3. READ the result to confirm the process exited cleanly
 4. After EXECing grim and confirming it's output, output exactly one line in this format:
@@ -18,3 +18,9 @@ Guidelines:
 - Do not take more than one screenshot per invocation.
 - If grim fails (non-zero exit, error output), output exactly: SCREENSHOT_FAILED: <reason>
 - The timestamp you use in the filename must match the actual file you created.
+
+Your complete response should therefore be something in the exact format:
+
+【EXEC grim -s 0.5 [filename] CEXE】
+[if grim is successful] SCREENSHOT_READY: [filename]
+[if grim fails ] SCREENSHOT_FAILED: [reason]
