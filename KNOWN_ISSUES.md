@@ -46,30 +46,54 @@ combined weight footprint exhausts the 24 GB budget under concurrent load.
 ## KI-002 — Vision test: Agent A re-inference loop driven by Agent B
 
 **Test:** `test_vision/`
-**Status:** Open
-**Severity:** Medium — wastes GPU cycles, does not affect correctness
+**Status:** **Fixed** (2026-03-18)
+**Severity:** ~~Medium~~ — Resolved
 
 ### Description
 
-After Agent B produces its first output (stream-realtime mode, `-O
+~~After Agent B produces its first output (stream-realtime mode, `-O
 agent_b/output/`), the `Close(Write)` event on the completed output file
 triggers Agent A to run inference again even though no new screenshot has
 arrived. This repeats on every Agent B completion, creating a sustained
-inference loop between the two agents.
+inference loop between the two agents.~~
+
+The feedback loop between agents has been resolved. Agent B's output files no
+longer trigger spurious re-inference in Agent A.
 
 ### Root cause
 
-Agent A watches `agent_a/input/` for screenshots. Agent B watches
-`agent_a/output/` for Agent A reports. However, Agent B is also watching its
-own system prompt directory (`agent_b/system/`), and the inotify watcher on
-`agent_a/output/` fires a `Close(Write)` event when Agent A's output file is
-finalised.
+The root cause was twofold:
 
-The deeper issue: `is_interrupt_event` now correctly fires on `Create` and
-`Close(Write)`, but Agent B's own completed output file (`agent_b/output/`) is
-in a directory that — via the `psi-viewer` viewer path or an upstream watcher
-subscription — somehow re-enters Agent A's event stream. Needs further
-tracing to identify the exact subscription path responsible.
+1. **Leader election bug**: `find_oldest_pipe` was considering ANY alive process
+   as a potential leader, including newer processes with higher PIDs. This caused
+   non-leader agents to incorrectly forward requests and create circular event flows.
+
+2. **Path matching bug**: `is_interrupt_event` used exact path matching (`contains()`)
+   instead of prefix matching (`starts_with()`), causing all events to pass the filter
+   and trigger spurious inferences.
+
+3. **Missing event filtering in main loop**: The main event loop was triggering
+   inference for ALL filesystem events without checking relevance via
+   `is_interrupt_event`.
+
+### Resolution
+
+Fixed in 2026-03-18 session:
+
+1. **Fixed leader election**: `find_oldest_pipe` now only considers processes with
+   LOWER PIDs (older processes) as leader candidates.
+
+2. **Fixed path matching**: Changed from `contains()` to `starts_with()` to properly
+   check if event paths are children of watched directories.
+
+3. **Added main loop filtering**: Main loop now calls `is_interrupt_event` before
+   triggering inference.
+
+4. **Added Modify event debouncing**: `Create` and `Close(Write)` events now update
+   the debounce timer, preventing subsequent `Modify` events from triggering.
+
+5. **Filtered Modify events during streaming**: Running inference now only interrupts
+   on `Create` and `Close(Write)` events, not `Modify` events.
 
 ### Known non-cause
 
@@ -77,19 +101,83 @@ This is **not** the token-per-write `Modify` storm from KI-003 (which was
 fixed). The events are `Close(Write)` on distinct files, one per inference
 completion.
 
+### Related code
+
+- `fn is_interrupt_event` — `src/main.rs` (lines ~1988-2030)
+- `async fn find_oldest_pipe` — `src/main.rs` (lines ~2135-2155)
+- `async fn main` — watcher subscription loop — `src/main.rs` (lines ~2265-2320)
+
+---
+
+## KI-005 — Tools test: Duplicate vision agent outputs
+
+**Test:** `test_tools/`
+**Status:** Open
+**Severity:** Low — produces extra outputs but pipeline completes correctly
+
+### Description
+
+The vision agent produces 2-3 output files per screenshot instead of 1. The
+leader (screenshot agent) correctly produces 1 output, but the vision agent
+outputs are duplicated.
+
+### Observed behavior
+
+```
+Screenshot outputs: 1
+Vision outputs: 2-3
+Summary outputs: 2-3
+```
+
+### Root cause (suspected)
+
+The vision agent receives the screenshot file creation event and triggers
+inference. Both the `Create` event and the subsequent `Close(Write)` event
+pass `is_interrupt_event` filtering, causing two separate inference requests
+to be sent to the leader. The 250ms debounce window may not be sufficient if
+the file write completes quickly.
+
 ### Preferred resolution path
 
-Investigate which watcher subscription is forwarding `agent_b/output/` events
-upstream to Agent A. Likely fix: tighten `is_interrupt_event` to only accept
-`Create` events on files matching the expected input media types (`.txt`,
-`.png`, `.wav`, etc.), ignoring `Close(Write)` on files that were not in the
-original watched directory set.
+1. Only trigger inference on `Close(Write)` events for file completion, not on
+   `Create` events (which fire before file content is written).
+2. Alternatively, increase the debounce window or implement per-file debounce
+   tracking.
 
 ### Related code
 
 - `fn is_interrupt_event` — `src/main.rs`
-- `async fn handle_interrupt` — `src/main.rs`
-- `async fn main` — watcher subscription loop
+- Main event loop — `src/main.rs`
+
+---
+
+## KI-006 — Audio test: Potential audio parsing failures
+
+**Test:** `test_audio/`
+**Status:** Unknown — needs testing
+**Severity:** High — may block audio pipeline functionality
+
+### Description
+
+The audio test has not been successfully run to completion. Potential issues
+include:
+
+1. CUDA OOM during speech detection (KI-001)
+2. Audio format parsing failures
+3. PipeWire audio capture issues
+
+### Preferred resolution path
+
+1. Run `test_audio/run_test.sh` with verbose logging
+2. Check for `AUDIO_PARSE_FAILED` or speech detection errors in logs
+3. If OOM persists, reduce Voxtral quantization from Q4K to Q2K/Q3K in
+   `load_model` function
+
+### Related code
+
+- `async fn detect_speech` — `src/main.rs`
+- `async fn load_model` — secondary model ISQ configuration
+- `async fn spawn_realtime_listener` — `src/main.rs`
 
 ---
 

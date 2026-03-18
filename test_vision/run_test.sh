@@ -46,12 +46,13 @@ SCREENSHOT_WAIT_SECS=60       # seconds to wait between shot 1 and shot 2 (gives
 # --------------------------------------------------------------------------- #
 
 # ---- Error / success patterns --------------------------------------------- #
+# Note: Patterns are anchored to start of line (^) to avoid matching quoted text
 FAIL_PATTERNS=(
-    "VISION_PARSE_FAILED"
-    "Failed to create AudioInput from bytes"
-    "out of memory"
-    "CUDA_ERROR"
-    "thread '.*' panicked"
+    "^VISION_PARSE_FAILED"
+    "^Failed to create AudioInput from bytes"
+    "^out of memory"
+    "^CUDA_ERROR"
+    "^thread '.*' panicked"
 )
 
 SUCCESS_PATTERNS=(
@@ -110,28 +111,33 @@ rm -f \
 echo "    Output directories cleared."
 
 # ============================================================================
-# Monitor function — tails a log file and checks patterns
-# Writes to $FAIL_FILE / $SUCCESS_FILE; also prints matching lines.
+# Monitor function — watches output directory for new files and checks content
 # ============================================================================
-monitor_log() {
+monitor_output() {
     local label="$1"
-    local logfile="$2"
+    local outdir="$2"
 
-    tail -F "$logfile" 2>/dev/null | while IFS= read -r line; do
-        [[ "${VERBOSE:-0}" == "1" ]] && echo "[$label] $line"
+    # Use inotifywait to watch for new/close_write events
+    inotifywait -m -e close_write --format '%f' "$outdir" 2>/dev/null | while IFS= read -r filename; do
+        filepath="$outdir/$filename"
+        [[ ! -f "$filepath" ]] && continue
+
+        content="$(cat "$filepath" 2>/dev/null)" || continue
+
+        [[ "${VERBOSE:-0}" == "1" ]] && echo "[$label] <<< $filename: $content"
 
         for pat in "${FAIL_PATTERNS[@]}"; do
-            if echo "$line" | grep -qE "$pat"; then
+            if echo "$content" | grep -qE "$pat"; then
                 echo ""
-                echo "!!! FAIL [$label]: pattern '$pat' matched: $line"
+                echo "!!! FAIL [$label]: pattern '$pat' matched in $filename"
                 touch "$FAIL_FILE"
             fi
         done
 
         for pat in "${SUCCESS_PATTERNS[@]}"; do
-            if echo "$line" | grep -qF "$pat"; then
+            if echo "$content" | grep -qF "$pat"; then
                 echo ""
-                echo ">>> SUCCESS [$label]: pattern '$pat' seen <<<"
+                echo ">>> SUCCESS [$label]: pattern '$pat' seen in $filename <<<"
                 touch "$SUCCESS_FILE"
             fi
         done
@@ -175,10 +181,10 @@ AGENT_B_PID=$!
 echo "    Agent B PID: $AGENT_B_PID"
 
 # ============================================================================
-# Start log monitors in background
+# Start output monitors in background
 # ============================================================================
-monitor_log "AGENT_A" "$LOG_A" &
-monitor_log "AGENT_B" "$LOG_B" &
+monitor_output "AGENT_A" "$BASE/agent_a/output" &
+monitor_output "AGENT_B" "$BASE/agent_b/output" &
 
 # ============================================================================
 # Screenshot sequence — takes SCREENSHOT_COUNT shots total.
@@ -227,7 +233,7 @@ while (( ELAPSED < MAX_RUNTIME_SECS )); do
         echo "========================================="
         echo "  TEST RESULT: FAIL"
         echo "========================================="
-        echo "  Check $LOG_A and $LOG_B for details."
+        echo "  Check output files in $BASE/agent_*/output/"
         exit 1
     fi
 
@@ -262,7 +268,7 @@ else
     echo "  Screenshots taken    : $(ls "$BASE/agent_a/input/"*.png 2>/dev/null | wc -l)"
     echo ""
     echo "  Possible causes:"
-    echo "   - Models haven't finished loading yet (check logs/agent_a.log)"
+    echo "   - Models haven't finished loading yet (check output files)"
     echo "   - grim couldn't connect to Wayland (check WAYLAND_DISPLAY)"
     echo "   - Vision inference slower than timeout"
     exit 2

@@ -50,14 +50,15 @@ MAX_RUNTIME_SECS=300
 # --------------------------------------------------------------------------- #
 
 # ---- Error / success patterns --------------------------------------------- #
+# Note: Patterns are anchored to start of line (^) to avoid matching quoted text
 FAIL_PATTERNS=(
-    "SCREENSHOT_FAILED:"
-    "VISION_PARSE_FAILED"
-    "TOOL USE FAILED"
-    "EXEC failed"
-    "out of memory"
-    "CUDA_ERROR"
-    "thread '.*' panicked"
+    "^SCREENSHOT_FAILED:"
+    "^VISION_PARSE_FAILED"
+    "^TOOL USE FAILED"
+    "^EXEC failed"
+    "^out of memory"
+    "^CUDA_ERROR"
+    "^thread '.*' panicked"
 )
 
 SUCCESS_PATTERNS=(
@@ -123,27 +124,33 @@ rm -f \
 echo "    Output directories cleared."
 
 # ============================================================================
-# Monitor function
+# Monitor function — watches output directory for new files and checks content
 # ============================================================================
-monitor_log() {
+monitor_output() {
     local label="$1"
-    local logfile="$2"
+    local outdir="$2"
 
-    tail -F "$logfile" 2>/dev/null | while IFS= read -r line; do
-        [[ "${VERBOSE:-0}" == "1" ]] && echo "[$label] $line"
+    # Use inotifywait to watch for new/close_write events
+    inotifywait -m -e close_write --format '%f' "$outdir" 2>/dev/null | while IFS= read -r filename; do
+        filepath="$outdir/$filename"
+        [[ ! -f "$filepath" ]] && continue
+
+        content="$(cat "$filepath" 2>/dev/null)" || continue
+
+        [[ "${VERBOSE:-0}" == "1" ]] && echo "[$label] <<< $filename: $content"
 
         for pat in "${FAIL_PATTERNS[@]}"; do
-            if echo "$line" | grep -qE "$pat"; then
+            if echo "$content" | grep -qE "$pat"; then
                 echo ""
-                echo "!!! FAIL [$label]: pattern '$pat' matched: $line"
+                echo "!!! FAIL [$label]: pattern '$pat' matched in $filename"
                 touch "$FAIL_FILE"
             fi
         done
 
         for pat in "${SUCCESS_PATTERNS[@]}"; do
-            if echo "$line" | grep -qF "$pat"; then
+            if echo "$content" | grep -qF "$pat"; then
                 echo ""
-                echo ">>> SUCCESS [$label]: '$pat' <<<"
+                echo ">>> SUCCESS [$label]: '$pat' in $filename <<<"
                 touch "$SUCCESS_FILE"
             fi
         done
@@ -212,11 +219,11 @@ AGENT_SUMMARY_PID=$!
 echo "    Agent SUMMARY PID: $AGENT_SUMMARY_PID"
 
 # ============================================================================
-# Start log monitors in background
+# Start output monitors in background
 # ============================================================================
-monitor_log "SCREENSHOT" "$LOG_SCREENSHOT" &
-monitor_log "VISION"     "$LOG_VISION"     &
-monitor_log "SUMMARY"    "$LOG_SUMMARY"    &
+monitor_output "SCREENSHOT" "$BASE/agent_screenshot/output" &
+monitor_output "VISION"     "$BASE/agent_vision/output"     &
+monitor_output "SUMMARY"    "$BASE/agent_summary/output"    &
 
 # ============================================================================
 # Write initial trigger prompt to agent_screenshot/input/
@@ -251,7 +258,7 @@ while (( ELAPSED < MAX_RUNTIME_SECS )); do
         echo "========================================="
         echo "  TEST RESULT: FAIL"
         echo "========================================="
-        echo "  Logs: $BASE/logs/"
+        echo "  Check output files in $BASE/agent_*/output/"
         exit 1
     fi
 
@@ -292,7 +299,7 @@ else
     echo "  summary agent outputs    : $S_OUT"
     echo ""
     echo "  Possible causes:"
-    echo "   - Models haven't finished loading (check logs/agent_screenshot.log)"
+    echo "   - Models haven't finished loading yet (check output files)"
     echo "   - Tool system didn't parse EXEC correctly (check --tools flag)"
     echo "   - grim couldn't connect to Wayland display"
     echo "   - Screenshot written to wrong path (check agent_screenshot output)"

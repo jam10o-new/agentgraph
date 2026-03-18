@@ -3,6 +3,14 @@ name = "agentgraph"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "agentgraph"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentgraph"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

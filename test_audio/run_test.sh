@@ -39,19 +39,20 @@ AUDIO_TRIGGER_WAIT_SECS=120   # how long to wait for a first audio interrupt
 # --------------------------------------------------------------------------- #
 
 # Known error strings we watch for (any of these → test FAIL)
+# Note: Patterns are anchored to start of line (^) to avoid matching quoted text
 AUDIO_FAIL_PATTERNS=(
-    "Speech detection error"
-    "Failed to create AudioInput from bytes"
-    "Speech detection request failed"
-    "Audio stream error"
-    "Failed to build input stream"
-    "Failed to start audio stream"
-    "No default input device found"
-    "No supported 48kHz mono F32 input config"
-    "Failed to check secondary model load state"
-    "Failed to reload secondary model"
-    "Full error from mistralrs"
-    "AUDIO_PARSE_FAILED"   # agent A output — audio model couldn't parse audio
+    "^Speech detection error"
+    "^Failed to create AudioInput from bytes"
+    "^Speech detection request failed"
+    "^Audio stream error"
+    "^Failed to build input stream"
+    "^Failed to start audio stream"
+    "^No default input device found"
+    "^No supported 48kHz mono F32 input config"
+    "^Failed to check secondary model load state"
+    "^Failed to reload secondary model"
+    "^Full error from mistralrs"
+    "^AUDIO_PARSE_FAILED"   # agent A output — audio model couldn't parse audio
 )
 
 # Strings that confirm the pipeline succeeded
@@ -105,23 +106,26 @@ rm -f \
 echo "    Output directories cleared."
 
 # ============================================================================
-# Monitor function — run in background, watches a log file for patterns
+# Monitor function — watches output directory for new files and checks content
 # ============================================================================
-monitor_log() {
+monitor_output() {
     local label="$1"
-    local logfile="$2"
-    shift 2
-    local fail_patterns=("${FAIL_PATTERNS[@]}")   # global from outer scope
-    local success_patterns=("${SUCCESS_PATTERNS[@]}")
+    local outdir="$2"
 
-    tail -F "$logfile" 2>/dev/null | while IFS= read -r line; do
-        [[ "${VERBOSE:-0}" == "1" ]] && echo "[$label] $line"
+    # Use inotifywait to watch for new/close_write events
+    inotifywait -m -e close_write --format '%f' "$outdir" 2>/dev/null | while IFS= read -r filename; do
+        filepath="$outdir/$filename"
+        [[ ! -f "$filepath" ]] && continue
+
+        content="$(cat "$filepath" 2>/dev/null)" || continue
+
+        [[ "${VERBOSE:-0}" == "1" ]] && echo "[$label] <<< $filename: $content"
 
         # Check failure patterns
         for pat in "${AUDIO_FAIL_PATTERNS[@]}"; do
-            if echo "$line" | grep -qF "$pat"; then
+            if echo "$content" | grep -qF "$pat"; then
                 echo ""
-                echo "!!! FAIL: pattern '$pat' detected in [$label] output !!!"
+                echo "!!! FAIL: pattern '$pat' detected in [$label] output ($filename) !!!"
                 touch "$FAIL_FILE"
                 break
             fi
@@ -129,9 +133,9 @@ monitor_log() {
 
         # Check success patterns
         for pat in "${SUCCESS_PATTERNS[@]}"; do
-            if echo "$line" | grep -qF "$pat"; then
+            if echo "$content" | grep -qF "$pat"; then
                 echo ""
-                echo ">>> SUCCESS pattern '$pat' detected in [$label] output <<<"
+                echo ">>> SUCCESS pattern '$pat' detected in [$label] output ($filename) <<<"
                 touch "$SUCCESS_FILE"
             fi
         done
@@ -184,10 +188,8 @@ echo ""
 # ============================================================================
 # Start background monitors
 # ============================================================================
-monitor_log "AGENT_A" "$LOG_A" &
-MONITOR_A_PID=$!
-monitor_log "AGENT_B" "$LOG_B" &
-MONITOR_B_PID=$!
+monitor_output "AGENT_A" "$BASE/agent_a/output" &
+monitor_output "AGENT_B" "$BASE/agent_b/output" &
 
 # ============================================================================
 # Give agent A an initial prompt so it knows to start listening
