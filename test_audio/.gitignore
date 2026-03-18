@@ -1,0 +1,8 @@
+# Runtime artifacts
+logs/
+*.log
+output/*
+input/*
+shared_screenshots/*
+.test_failed
+.test_succeeded
