@@ -8,14 +8,14 @@ use std::time::SystemTime;
 // Command constants
 // ============================================================================
 
-pub const CMD_OPEN_EXEC: &str = "【EXEC ";
-pub const CMD_CLOSE_EXEC: &str = " CEXE】";
-pub const CMD_OPEN_KILL: &str = "【KILL ";
-pub const CMD_CLOSE_KILL: &str = " LLIK】";
-pub const CMD_OPEN_READ: &str = "【READ ";
-pub const CMD_CLOSE_READ: &str = " DAER】";
-pub const CMD_OPEN_WRIT: &str = "【WRIT ";
-pub const CMD_CLOSE_WRIT: &str = " TIRW】";
+pub const CMD_OPEN_EXEC: &str = "EEXEC ";
+pub const CMD_CLOSE_EXEC: &str = " CEXEE";
+pub const CMD_OPEN_KILL: &str = "KKILL ";
+pub const CMD_CLOSE_KILL: &str = " LLIKK";
+pub const CMD_OPEN_READ: &str = "RREAD ";
+pub const CMD_CLOSE_READ: &str = " DAERR";
+pub const CMD_OPEN_WRIT: &str = "WWRIT ";
+pub const CMD_CLOSE_WRIT: &str = " TIRWW";
 
 /// Maximum length of any opener (for pre-active buffer sizing)
 pub const MAX_OPENER_LEN: usize = 6; // "【EXEC " is 6 chars

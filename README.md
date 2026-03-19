@@ -29,14 +29,16 @@ Agents form a directed acyclic graph (DAG) where:
 
 ### Command System
 
-Agents can execute host commands using a structured command syntax:
+Agents can execute host commands using a structured command syntax with reversed-text markers:
 
 ```
-【EXEC command arg1 arg2 CEXE】     → Spawn process (returns index)
-【KILL idx LLIK】                   → Kill process by index
-【READ idx DAER】                   → Read stdout/stderr
-【WRIT idx input text TIRW】        → Write to stdin
+EEXEC command arg1 arg2 CEXEE       → Spawn process (returns index)
+KKILL idx LLIKK                     → Kill process by index
+RREAD idx DAERR                     → Read stdout/stderr
+WWRIT idx input text TIRWW          → Write to stdin
 ```
+
+The reversed-text closing markers (e.g., `CEXEE` = `EXEC` reversed + first letter repeated) are designed to be rare in natural language while remaining comprehensible to models. Commands execute immediately and return results. 
 
 ## Installation
 

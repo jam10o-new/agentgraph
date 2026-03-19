@@ -102,7 +102,7 @@ pub async fn execute_command(
         CommandType::Exec(command_str) => {
             let parts: Vec<&str> = command_str.split_whitespace().collect();
             if parts.is_empty() {
-                return "[EXEC failed: empty command]\n".to_string();
+                return String::new();
             }
 
             let program = parts[0];
@@ -115,13 +115,13 @@ pub async fn execute_command(
                     if daemon_args.verbose {
                         eprintln!("[EXEC {}: spawned '{}']", idx, command_str);
                     }
-                    format!("[EXEC {}: spawned '{}']\n", idx, command_str)
+                    String::new()
                 }
                 Err(e) => {
                     if daemon_args.verbose {
                         eprintln!("[EXEC failed: {}]", e);
                     }
-                    format!("[EXEC failed: {}]\n", e)
+                    String::new()
                 }
             }
         }

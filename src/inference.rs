@@ -202,14 +202,9 @@ pub async fn run_streaming_loop(
                         }
                     }
                     if let Some(cmd) = cmd {
-                        let res = execute_command(cmd, subprocesses, &mut tool_context, args).await;
-                        response.push_str(&res);
-                        if stream_realtime {
-                            if let Some(ref mut f) = *realtime_file {
-                                let _ = f.write_all(res.as_bytes()).await;
-                                let _ = f.flush().await;
-                            }
-                        }
+                        // Execute command but don't inject feedback into response
+                        // This prevents the model from hallucinating command result continuations
+                        let _ = execute_command(cmd, subprocesses, &mut tool_context, args).await;
                         return Ok(StreamOutcome::CommandExecuted(response));
                     }
                 }
@@ -239,15 +234,9 @@ pub async fn run_streaming_loop(
                     }
                 }
                 if let Some(cmd) = cmd {
-                    let res = execute_command(cmd, subprocesses, &mut tool_context, args).await;
-                    response.push_str(&res);
-                    if stream_realtime {
-                        if let Some(ref mut f) = *realtime_file {
-                            let _ = f.write_all(res.as_bytes()).await;
-                            let _ = f.flush().await;
-                        }
-                    }
-                    let _ = cancel_tx.send(true);
+                    // Execute command but don't inject feedback into response
+                    // This prevents the model from hallucinating command result continuations
+                    let _ = execute_command(cmd, subprocesses, &mut tool_context, args).await;
                     return Ok(StreamOutcome::CommandExecuted(response));
                 }
             }
@@ -354,6 +343,7 @@ pub async fn run_once(
     let mut audio_interrupt_pending = !pending_audio.is_empty();
     let mut pending_audio_queue: Vec<Vec<u8>> = pending_audio;
     let mut subprocesses: Vec<crate::types::CommandIO> = Vec::new();
+    let mut pending_system_message: Option<String> = None;
 
     'restart_loop: loop {
         restart_count += 1;
@@ -422,6 +412,11 @@ pub async fn run_once(
                     synth_params.system_addendum.clone(),
                 );
             }
+            // Add pending system message about subprocesses
+            if let Some(ref sys_msg) = pending_system_message {
+                synth_msgs = synth_msgs.add_message(TextMessageRole::System, sys_msg.clone());
+                pending_system_message = None;
+            }
             for (idx, text) in &specialist_results {
                 let label = match synth_params.context_inputs[*idx].model_slot {
                     ModelSlot::Primary => "VISION SPECIALIST",
@@ -460,11 +455,66 @@ pub async fn run_once(
                     if args.verbose {
                         eprintln!("Synthesis complete.");
                     }
+
                     output_buffer.push_str(&resp);
+
+                    // Check for running subprocesses and reprompt if any are still alive
+                    let mut running_indices: Vec<usize> = Vec::new();
+                    for (idx, subp) in subprocesses.iter_mut().enumerate() {
+                        let is_alive = if let Some(ref mut exit_rx) = subp.exited_rx {
+                            matches!(exit_rx.try_recv(), Err(_))
+                        } else {
+                            false
+                        };
+                        if is_alive {
+                            running_indices.push(idx);
+                        }
+                    }
+
+                    if !running_indices.is_empty() {
+                        // Build system message with command syntax reminder
+                        let mut subp_msg =
+                            String::from("[SYSTEM: Active subprocesses. Use these commands:\n");
+                        subp_msg.push_str(&format!(
+                            "  - Read: {}<idx>{}\n",
+                            crate::CMD_OPEN_READ,
+                            crate::CMD_CLOSE_READ
+                        ));
+                        subp_msg.push_str(&format!(
+                            "  - Kill: {}<idx>{}\n",
+                            crate::CMD_OPEN_KILL,
+                            crate::CMD_CLOSE_KILL
+                        ));
+                        subp_msg.push_str(&format!(
+                            "  - Write: {}<idx> text{}\n",
+                            crate::CMD_OPEN_WRIT,
+                            crate::CMD_CLOSE_WRIT
+                        ));
+                        subp_msg.push_str("  Active: ");
+                        for (i, idx) in running_indices.iter().enumerate() {
+                            if i > 0 {
+                                subp_msg.push_str(", ");
+                            }
+                            subp_msg.push_str(&format!("{}", idx));
+                        }
+                        subp_msg.push_str("]\n");
+
+                        pending_system_message = Some(subp_msg);
+
+                        if args.verbose {
+                            eprintln!(
+                                "Subprocesses still running: {:?}, reprompting",
+                                running_indices
+                            );
+                        }
+                        continue 'restart_loop;
+                    }
+
                     break 'restart_loop;
                 }
                 StreamOutcome::CommandExecuted(resp) => {
                     output_buffer.push_str(&resp);
+                    output_buffer.push_str("\n");
                     continue 'restart_loop;
                 }
                 StreamOutcome::AudioInterrupted { response, audio } => {
@@ -495,6 +545,11 @@ pub async fn run_once(
                     TextMessageRole::System,
                     synth_params.system_addendum.clone(),
                 );
+            }
+            // Add pending system message about subprocesses
+            if let Some(ref sys_msg) = pending_system_message {
+                msgs = msgs.add_message(TextMessageRole::System, sys_msg.clone());
+                pending_system_message = None;
             }
             if !output_buffer.is_empty() {
                 msgs = msgs.add_message(TextMessageRole::Assistant, format!("{}", output_buffer));
@@ -528,10 +583,64 @@ pub async fn run_once(
                         eprintln!("Primary response complete.");
                     }
                     output_buffer.push_str(&resp);
+
+                    // Check for running subprocesses and reprompt if any are still alive
+                    let mut running_indices: Vec<usize> = Vec::new();
+                    for (idx, subp) in subprocesses.iter_mut().enumerate() {
+                        let is_alive = if let Some(ref mut exit_rx) = subp.exited_rx {
+                            matches!(exit_rx.try_recv(), Err(_))
+                        } else {
+                            false
+                        };
+                        if is_alive {
+                            running_indices.push(idx);
+                        }
+                    }
+
+                    if !running_indices.is_empty() {
+                        // Build system message with command syntax reminder
+                        let mut subp_msg =
+                            String::from("[SYSTEM: Active subprocesses. Use these commands:\n");
+                        subp_msg.push_str(&format!(
+                            "  - Read: {}<idx>{}\n",
+                            crate::CMD_OPEN_READ,
+                            crate::CMD_CLOSE_READ
+                        ));
+                        subp_msg.push_str(&format!(
+                            "  - Kill: {}<idx>{}\n",
+                            crate::CMD_OPEN_KILL,
+                            crate::CMD_CLOSE_KILL
+                        ));
+                        subp_msg.push_str(&format!(
+                            "  - Write: {}<idx> text{}\n",
+                            crate::CMD_OPEN_WRIT,
+                            crate::CMD_CLOSE_WRIT
+                        ));
+                        subp_msg.push_str("  Active: ");
+                        for (i, idx) in running_indices.iter().enumerate() {
+                            if i > 0 {
+                                subp_msg.push_str(", ");
+                            }
+                            subp_msg.push_str(&format!("{}", idx));
+                        }
+                        subp_msg.push_str("]\n");
+
+                        pending_system_message = Some(subp_msg);
+
+                        if args.verbose {
+                            eprintln!(
+                                "Subprocesses still running: {:?}, reprompting",
+                                running_indices
+                            );
+                        }
+                        continue 'restart_loop;
+                    }
+
                     break 'restart_loop;
                 }
                 StreamOutcome::CommandExecuted(resp) => {
                     output_buffer.push_str(&resp);
+                    output_buffer.push_str("\n");
                     continue 'restart_loop;
                 }
                 StreamOutcome::AudioInterrupted { response, audio } => {

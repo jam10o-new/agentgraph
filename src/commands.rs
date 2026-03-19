@@ -101,9 +101,25 @@ impl CommandParser {
 
                 // Check if closer is already in the remaining content
                 if let Some((cmd_content, remaining)) = self.find_closer(cmd_type) {
+                    let opener_str = match cmd_type {
+                        CmdOpenType::Exec => crate::CMD_OPEN_EXEC,
+                        CmdOpenType::Kill => crate::CMD_OPEN_KILL,
+                        CmdOpenType::Read => crate::CMD_OPEN_READ,
+                        CmdOpenType::Writ => crate::CMD_OPEN_WRIT,
+                    };
+                    let closer_str = match cmd_type {
+                        CmdOpenType::Exec => CMD_CLOSE_EXEC,
+                        CmdOpenType::Kill => CMD_CLOSE_KILL,
+                        CmdOpenType::Read => CMD_CLOSE_READ,
+                        CmdOpenType::Writ => CMD_CLOSE_WRIT,
+                    };
+                    // Include command tokens in output
+                    let cmd_with_tokens = format!("{}{}{}", opener_str, cmd_content, closer_str);
+                    let output = format!("{}{}", before_opener, cmd_with_tokens);
+                    
                     let cmd = self.parse_command_content(cmd_type, &cmd_content);
                     self.reset();
-                    return (before_opener.to_string(), cmd, remaining);
+                    return (output, cmd, remaining);
                 }
 
                 return (before_opener.to_string(), None, String::new());
@@ -134,9 +150,24 @@ impl CommandParser {
         // Check for closer in the accumulated buffer
         if let Some(cmd_type) = self.cmd_type {
             if let Some((cmd_content, remaining)) = self.find_closer(cmd_type) {
+                let opener_str = match cmd_type {
+                    CmdOpenType::Exec => crate::CMD_OPEN_EXEC,
+                    CmdOpenType::Kill => crate::CMD_OPEN_KILL,
+                    CmdOpenType::Read => crate::CMD_OPEN_READ,
+                    CmdOpenType::Writ => crate::CMD_OPEN_WRIT,
+                };
+                let closer_str = match cmd_type {
+                    CmdOpenType::Exec => CMD_CLOSE_EXEC,
+                    CmdOpenType::Kill => CMD_CLOSE_KILL,
+                    CmdOpenType::Read => CMD_CLOSE_READ,
+                    CmdOpenType::Writ => CMD_CLOSE_WRIT,
+                };
+                // Include command tokens in output
+                let cmd_with_tokens = format!("{}{}{}", opener_str, cmd_content, closer_str);
+                
                 let cmd = self.parse_command_content(cmd_type, &cmd_content);
                 self.reset();
-                return (String::new(), cmd, remaining);
+                return (cmd_with_tokens, cmd, remaining);
             }
         }
 
