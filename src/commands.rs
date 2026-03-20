@@ -3,7 +3,10 @@
 //! Parses command markers like `【EXEC ... CEXE】` from model output.
 
 use crate::types::{CmdOpenType, CommandType, MAX_OPENER_LEN};
-use crate::{CMD_CLOSE_EXEC, CMD_CLOSE_KILL, CMD_CLOSE_READ, CMD_CLOSE_WRIT};
+use crate::{
+    CMD_CLOSE_EXEC, CMD_CLOSE_KILL, CMD_CLOSE_READ, CMD_CLOSE_READ_SKILL, CMD_CLOSE_WRIT,
+    CMD_OPEN_EXEC, CMD_OPEN_KILL, CMD_OPEN_READ, CMD_OPEN_READ_SKILL, CMD_OPEN_WRIT,
+};
 
 /// Helper struct to manage command state within the loop
 pub struct CommandParser {
@@ -34,27 +37,33 @@ impl CommandParser {
         let mut earliest: Option<(usize, CmdOpenType, usize)> = None;
 
         if let Some(pos) = combined.find(crate::CMD_OPEN_EXEC) {
-            let after_pos = pos + crate::CMD_OPEN_EXEC.len();
+            let after_pos = pos + CMD_OPEN_EXEC.len();
             if earliest.is_none() || pos < earliest.unwrap().0 {
                 earliest = Some((pos, CmdOpenType::Exec, after_pos));
             }
         }
         if let Some(pos) = combined.find(crate::CMD_OPEN_KILL) {
-            let after_pos = pos + crate::CMD_OPEN_KILL.len();
+            let after_pos = pos + CMD_OPEN_KILL.len();
             if earliest.is_none() || pos < earliest.unwrap().0 {
                 earliest = Some((pos, CmdOpenType::Kill, after_pos));
             }
         }
         if let Some(pos) = combined.find(crate::CMD_OPEN_READ) {
-            let after_pos = pos + crate::CMD_OPEN_READ.len();
+            let after_pos = pos + CMD_OPEN_READ.len();
             if earliest.is_none() || pos < earliest.unwrap().0 {
                 earliest = Some((pos, CmdOpenType::Read, after_pos));
             }
         }
         if let Some(pos) = combined.find(crate::CMD_OPEN_WRIT) {
-            let after_pos = pos + crate::CMD_OPEN_WRIT.len();
+            let after_pos = pos + CMD_OPEN_WRIT.len();
             if earliest.is_none() || pos < earliest.unwrap().0 {
                 earliest = Some((pos, CmdOpenType::Writ, after_pos));
+            }
+        }
+        if let Some(pos) = combined.find(CMD_OPEN_READ_SKILL) {
+            let after_pos = pos + CMD_OPEN_READ_SKILL.len();
+            if earliest.is_none() || pos < earliest.unwrap().0 {
+                earliest = Some((pos, CmdOpenType::ReadSkill, after_pos));
             }
         }
 
@@ -69,6 +78,7 @@ impl CommandParser {
             CmdOpenType::Kill => CMD_CLOSE_KILL,
             CmdOpenType::Read => CMD_CLOSE_READ,
             CmdOpenType::Writ => CMD_CLOSE_WRIT,
+            CmdOpenType::ReadSkill => CMD_CLOSE_READ_SKILL,
         };
 
         self.buffer.find(closer).map(|pos| {
@@ -106,17 +116,19 @@ impl CommandParser {
                         CmdOpenType::Kill => crate::CMD_OPEN_KILL,
                         CmdOpenType::Read => crate::CMD_OPEN_READ,
                         CmdOpenType::Writ => crate::CMD_OPEN_WRIT,
+                        CmdOpenType::ReadSkill => crate::CMD_OPEN_READ_SKILL,
                     };
                     let closer_str = match cmd_type {
                         CmdOpenType::Exec => CMD_CLOSE_EXEC,
                         CmdOpenType::Kill => CMD_CLOSE_KILL,
                         CmdOpenType::Read => CMD_CLOSE_READ,
                         CmdOpenType::Writ => CMD_CLOSE_WRIT,
+                        CmdOpenType::ReadSkill => CMD_CLOSE_READ_SKILL,
                     };
                     // Include command tokens in output
                     let cmd_with_tokens = format!("{}{}{}", opener_str, cmd_content, closer_str);
                     let output = format!("{}{}", before_opener, cmd_with_tokens);
-                    
+
                     let cmd = self.parse_command_content(cmd_type, &cmd_content);
                     self.reset();
                     return (output, cmd, remaining);
@@ -155,16 +167,18 @@ impl CommandParser {
                     CmdOpenType::Kill => crate::CMD_OPEN_KILL,
                     CmdOpenType::Read => crate::CMD_OPEN_READ,
                     CmdOpenType::Writ => crate::CMD_OPEN_WRIT,
+                    CmdOpenType::ReadSkill => crate::CMD_OPEN_READ_SKILL,
                 };
                 let closer_str = match cmd_type {
                     CmdOpenType::Exec => CMD_CLOSE_EXEC,
                     CmdOpenType::Kill => CMD_CLOSE_KILL,
                     CmdOpenType::Read => CMD_CLOSE_READ,
                     CmdOpenType::Writ => CMD_CLOSE_WRIT,
+                    CmdOpenType::ReadSkill => CMD_CLOSE_READ_SKILL,
                 };
                 // Include command tokens in output
                 let cmd_with_tokens = format!("{}{}{}", opener_str, cmd_content, closer_str);
-                
+
                 let cmd = self.parse_command_content(cmd_type, &cmd_content);
                 self.reset();
                 return (cmd_with_tokens, cmd, remaining);
@@ -191,6 +205,7 @@ impl CommandParser {
                     None
                 }
             }
+            CmdOpenType::ReadSkill => Some(CommandType::ReadSkill(content.trim().to_string())),
         }
     }
 

@@ -5,20 +5,12 @@
 //!     [ SUPERVISOR AGENT ]
 //!           |
 //!           +-- EXEC --> [ watcher_a ]  (watch mode, monitors shared_screenshots)
-//!           |              watches: shared_screenshots/
+//!           |              watches: watcher_shared/input
 //!           |              outputs: watcher_a/output/
 //!           |
 //!           +-- EXEC --> [ watcher_b ]  (watch mode, monitors shared_screenshots)
-//!           |              watches: shared_screenshots/
-//!           |              outputs: watcher_b/output/
-//!           |
-//!           +-- EXEC --> [ oneshot_c ]  (oneshot inference, system state analysis)
-//!           |              input: supervisor/input/system_state.txt
-//!           |              outputs: oneshot_c/output/
-//!           |
-//!           +-- EXEC --> [ oneshot_d ]  (oneshot inference, recommendation generation)
-//!                          input: watcher outputs (synthesized)
-//!                          outputs: oneshot_d/output/
+//!                          watches: watcher_shared/input
+//!                          outputs: watcher_b/output/
 //!
 //! Key concept demonstrated:
 //!   - Autonomous subagent spawning via EXEC command system
@@ -33,16 +25,14 @@
 
 mod common;
 
+use agentgraph::{CMD_CLOSE_EXEC, CMD_OPEN_EXEC};
 use anyhow::Result;
-use common::{
-    AgentConfig, TestRunner, TestResult,
-    create_dirs, get_binary_path,
-};
+use common::{AgentConfig, TestResult, TestRunner, create_dirs, get_binary_path};
 use std::fs;
-use agentgraph::{CMD_OPEN_EXEC, CMD_CLOSE_EXEC};
+use std::thread;
+use std::time::Duration;
 
 #[test]
-#[ignore] // Requires significant runtime and model loading
 fn test_subagents_spawning() -> Result<()> {
     let project_root = common::get_project_root()?;
     let base_dir = project_root.join("test_subagents");
@@ -53,29 +43,23 @@ fn test_subagents_spawning() -> Result<()> {
     println!("Binary: {:?}", binary);
 
     // Create directory structure
-    create_dirs(&base_dir, &[
-        "supervisor/system",
-        "supervisor/input",
-        "supervisor/output",
-        "watcher_a/system",
-        "watcher_a/input",
-        "watcher_a/output",
-        "watcher_b/system",
-        "watcher_b/input",
-        "watcher_b/output",
-        "oneshot_c/system",
-        "oneshot_c/input",
-        "oneshot_c/output",
-        "oneshot_d/system",
-        "oneshot_d/input",
-        "oneshot_d/output",
-        "shared_screenshots",
-    ])?;
+    create_dirs(
+        &base_dir,
+        &[
+            "supervisor/system",
+            "supervisor/input",
+            "supervisor/output",
+            "watcher_a/system",
+            "watcher_a/output",
+            "watcher_b/system",
+            "watcher_b/output",
+        ],
+    )?;
 
     // Initialize test runner
     let mut runner = TestRunner::new(&base_dir, &binary)?;
     runner.verbose = std::env::var("VERBOSE").map(|v| v == "1").unwrap_or(false);
-    runner.max_runtime_secs = 300;
+    runner.max_runtime_secs = 400; // Increased for subagents
 
     // Set success/fail patterns
     runner.add_fail_pattern("^EXEC failed");
@@ -83,10 +67,17 @@ fn test_subagents_spawning() -> Result<()> {
     runner.add_fail_pattern("^failed to spawn");
     runner.add_fail_pattern("^out of memory");
     runner.add_fail_pattern("^CUDA_ERROR");
+    runner.add_fail_pattern("[COORDINATION FAILED]");
     runner.add_fail_pattern("^thread '.*' panicked");
 
-    runner.add_success_pattern("[SUBAGENTS_SPAWNED]:");
+    // Custom check: supervisor output file length (detects hallucination vs actual command execution)
+    runner.set_max_output_length_check("supervisor/output", 2000,
+        "Supervisor output exceeds length limit - likely hallucinating instead of executing commands");
+
+    runner.add_success_pattern("[SUBAGENT_SPAWNED]:");
     runner.add_success_pattern("[COORDINATION_SUMMARY]:");
+    runner.add_success_pattern("SILVER");
+    runner.add_success_pattern("BLUE");
 
     // Pre-run cleanup
     runner.pre_run_cleanup(&[
@@ -97,16 +88,11 @@ fn test_subagents_spawning() -> Result<()> {
         "watcher_a/output",
         "watcher_b/input",
         "watcher_b/output",
-        "oneshot_c/input",
-        "oneshot_c/output",
-        "oneshot_d/input",
-        "oneshot_d/output",
-        "shared_screenshots",
         "logs",
     ])?;
 
     // Write hardcoded system prompt for supervisor
-    // Simple prompt - just spawn the 4 subagents
+    let bin_str = binary.to_string_lossy();
     let system_prompt = format!(
         r#"You are a supervisor agent coordinating multiple subagents.
 
@@ -114,30 +100,35 @@ fn test_subagents_spawning() -> Result<()> {
 Spawn processes: {open_exec}command args{close_exec}
 
 ## Your Task
-Spawn these 4 subagents:
+First, spawn these 2 subagents using these exact responses, seperated by a newline:
 
 1. watcher_a (watch mode daemon):
-{open_exec}setsid cargo run --release -- -W --verbose -S /home/jam/agentgraph/test_subagents/watcher_a/system -I /home/jam/agentgraph/test_subagents/watcher_a/input -O /home/jam/agentgraph/test_subagents/watcher_a/output{close_exec}
+{open_exec}setsid -f {bin} -W --no-ui --verbose -S {base}/watcher_a/system -I {base}/watcher_a/input -O {base}/watcher_a/output {close_exec}
 
 2. watcher_b (watch mode daemon):
-{open_exec}setsid cargo run --release -- -W --verbose -S /home/jam/agentgraph/test_subagents/watcher_b/system -I /home/jam/agentgraph/test_subagents/watcher_b/input -O /home/jam/agentgraph/test_subagents/watcher_b/output{close_exec}
+{open_exec}setsid -f {bin} -W --no-ui --verbose -S {base}/watcher_b/system -I {base}/watcher_b/input -O {base}/watcher_b/output {close_exec}
 
-3. oneshot_c (oneshot inference):
-{open_exec}setsid cargo run --release -- --verbose -S /home/jam/agentgraph/test_subagents/oneshot_c/system -I /home/jam/agentgraph/test_subagents/oneshot_c/input -O /home/jam/agentgraph/test_subagents/oneshot_c/output{close_exec}
+Once you have spawned a subagent, respond with "[SUBAGENT_SPAWNED]: <subagent name>".
+If you have not yet seen responses from all of your subagents, respond only "[AWAITING RESPONSE]" or "...".
+If a subagent errors, panics, or fails, respond with only "[COORDINATION FAILED]"
 
-4. oneshot_d (oneshot inference):
-{open_exec}setsid cargo run --release -- --verbose -S /home/jam/agentgraph/test_subagents/oneshot_d/system -I /home/jam/agentgraph/test_subagents/oneshot_d/input -O /home/jam/agentgraph/test_subagents/oneshot_d/output{close_exec}
+One of your subagents will inform you of your final task in their response.
 
-Execute all 4 commands above."#,
+Be brief and do not include any preamble or summary other than what is explicitly necessary.
+"#,
         open_exec = CMD_OPEN_EXEC,
         close_exec = CMD_CLOSE_EXEC,
+        bin = bin_str,
+        base = base_dir.to_string_lossy(),
     );
-    
-    fs::write(base_dir.join("supervisor/system/prompt.txt"), &system_prompt)?;
+
+    fs::write(
+        base_dir.join("supervisor/system/prompt.txt"),
+        &system_prompt,
+    )?;
     println!("    System prompt written to supervisor/system/prompt.txt");
 
     // Supervisor agent - orchestrates subagent spawning
-    // Wire up subagent output directories as additional inputs for filesystem-based IPC
     let supervisor_config = AgentConfig {
         label: "SUPERVISOR".to_string(),
         system_dir: base_dir.join("supervisor/system"),
@@ -148,59 +139,60 @@ Execute all 4 commands above."#,
         verbose: true,
         tools: true, // Required for EXEC command
         stream_realtime: true,
-        model: None,
-        secondary_model: None,
-        realtime_listener: None,
-        audio_chunk_min_secs: None,
-        audio_chunk_max_secs: None,
-        input_from_output: None,
         additional_inputs: vec![
             base_dir.join("watcher_a/output"),
             base_dir.join("watcher_b/output"),
-            base_dir.join("oneshot_c/output"),
-            base_dir.join("oneshot_d/output"),
         ],
+        ..Default::default()
     };
 
     // Spawn supervisor
     runner.spawn_agent(&supervisor_config)?;
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(2));
 
     // Write trigger prompt to supervisor/input/
-    let trigger_content = r#"Spawn your subagents now using the EXEC command. Follow the system instructions."#;
-
+    let trigger_content =
+        r#"Spawn your subagents now using the EXEC command. Follow the system instructions."#;
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let trigger_path = base_dir.join("supervisor/input")
+    let trigger_path = base_dir
+        .join("supervisor/input")
         .join(format!("spawn_trigger_{}.txt", timestamp));
     fs::write(&trigger_path, trigger_content)?;
     println!("    Spawn trigger written: {:?}", trigger_path);
 
-    // Wait for supervisor to spawn subagents (they take ~60s to load models)
-    // Then write trigger files to start their inference
-    println!("    Waiting 90s for subagents to load models...");
-    std::thread::sleep(std::time::Duration::from_secs(90));
-    
-    // Check if subagent processes are running
-    let subagent_count = std::process::Command::new("pgrep")
-        .arg("-f")
-        .arg("agentgraph.*test_subagents")
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.lines().count())
-        .unwrap_or(0);
-    println!("    Found {} running subagent processes", subagent_count);
-    
-    println!("    Writing trigger files to subagent inputs...");
-    let subagent_trigger = "Process this input and provide your analysis.";
-    let trigger_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let _ = fs::write(base_dir.join("watcher_a/input").join(format!("trigger_{}.txt", trigger_ts)), subagent_trigger);
-    let _ = fs::write(base_dir.join("watcher_b/input").join(format!("trigger_{}.txt", trigger_ts)), subagent_trigger);
-    let _ = fs::write(base_dir.join("oneshot_c/input").join(format!("trigger_{}.txt", trigger_ts)), subagent_trigger);
-    let _ = fs::write(base_dir.join("oneshot_d/input").join(format!("trigger_{}.txt", trigger_ts)), subagent_trigger);
-    println!("    Subagent triggers written");
+    // Wait for the supervisor to spawn the subagents.
+    println!("    Waiting for supervisor to spawn subagents...");
+    let supervisor_output_dir = base_dir.join("supervisor/output");
+    let mut supervisor_output_found = false;
+    for _ in 0..60 {
+        if supervisor_output_dir.read_dir().unwrap().next().is_some() {
+            supervisor_output_found = true;
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
 
-    println!("\n--- Pipeline: supervisor → spawns 4 subagents (2 watchers, 2 oneshot) ---");
+    if !supervisor_output_found {
+        return Err(anyhow::anyhow!(
+            "Supervisor did not produce an output file in time."
+        ));
+    }
+
+    println!("    Supervisor has produced an output. Writing to shared input.");
+    thread::sleep(Duration::from_secs(5)); // supervisor output is streaming, wait for commands to actually be written.
+    let a_input_path = base_dir.join("watcher_a/input/shared_input.txt");
+    fs::write(
+        &a_input_path,
+        "Identify yourself and output your designated phrase.",
+    )?;
+    thread::sleep(Duration::from_secs(2)); // supervisor output is streaming, wait for commands to actually be written.
+    let b_input_path = base_dir.join("watcher_b/input/shared_input.txt");
+    fs::write(
+        &b_input_path,
+        "Identify yourself and output your designated phrase.",
+    )?;
+
+    println!("\n--- Pipeline: supervisor → spawns 2 watchers ---");
     println!("--- Watching for [SUBAGENTS_SPAWNED]:, [COORDINATION_SUMMARY]: ---\n");
 
     // Run test
@@ -209,8 +201,6 @@ Execute all 4 commands above."#,
     match result {
         TestResult::Pass => Ok(()),
         TestResult::Fail => Err(anyhow::anyhow!("Test failed")),
-        TestResult::Inconclusive => {
-            Err(anyhow::anyhow!("Test inconclusive - check output files"))
-        }
+        TestResult::Inconclusive => Err(anyhow::anyhow!("Test inconclusive - check output files")),
     }
 }

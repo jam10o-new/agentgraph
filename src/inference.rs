@@ -344,6 +344,7 @@ pub async fn run_once(
     let mut pending_audio_queue: Vec<Vec<u8>> = pending_audio;
     let mut subprocesses: Vec<crate::types::CommandIO> = Vec::new();
     let mut pending_system_message: Option<String> = None;
+    let mut tool_context: String = String::new();
 
     'restart_loop: loop {
         restart_count += 1;
@@ -416,6 +417,13 @@ pub async fn run_once(
             if let Some(ref sys_msg) = pending_system_message {
                 synth_msgs = synth_msgs.add_message(TextMessageRole::System, sys_msg.clone());
                 pending_system_message = None;
+            }
+            // Add tool context from previous command executions
+            if !tool_context.is_empty() {
+                synth_msgs = synth_msgs.add_message(
+                    TextMessageRole::System,
+                    format!("[PREVIOUS COMMAND OUTPUT]:\n{}", tool_context),
+                );
             }
             for (idx, text) in &specialist_results {
                 let label = match synth_params.context_inputs[*idx].model_slot {

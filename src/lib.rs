@@ -13,8 +13,8 @@ pub mod utils;
 
 // Re-export commonly used types
 pub use commands::CommandParser;
-pub use types::{CMD_CLOSE_EXEC, CMD_CLOSE_KILL, CMD_CLOSE_READ, CMD_CLOSE_WRIT};
-pub use types::{CMD_OPEN_EXEC, CMD_OPEN_KILL, CMD_OPEN_READ, CMD_OPEN_WRIT};
+pub use types::{CMD_CLOSE_EXEC, CMD_CLOSE_KILL, CMD_CLOSE_READ, CMD_CLOSE_READ_SKILL, CMD_CLOSE_WRIT};
+pub use types::{CMD_OPEN_EXEC, CMD_OPEN_KILL, CMD_OPEN_READ, CMD_OPEN_READ_SKILL, CMD_OPEN_WRIT};
 pub use types::{
     CmdOpenType, CommandIO, CommandType, ContentType, FileMessage, FileMetadata, InferenceRequest,
     InterruptKind, MessageContent, ModelSlot, ParallelInferenceParams, RealtimeListener,
@@ -41,6 +41,9 @@ pub struct Args {
     /// Enable tool use and system prompt addendum for tools.
     #[arg(short, long)]
     pub tools: bool,
+
+    #[arg(long)]
+    pub no_ui: bool,
 
     /// Realtime output
     /// recommended for final agent -> human nodes

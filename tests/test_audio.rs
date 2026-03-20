@@ -29,7 +29,6 @@ use common::{AgentConfig, TestResult, TestRunner, create_dirs, get_binary_path};
 use std::fs;
 
 #[test]
-#[ignore] // Requires PipeWire audio backend and ambient audio
 fn test_audio_pipeline() -> Result<()> {
     let project_root = common::get_project_root()?;
     let base_dir = project_root.join("test_audio");
@@ -98,6 +97,7 @@ fn test_audio_pipeline() -> Result<()> {
         audio_chunk_max_secs: Some(8.0),
         input_from_output: None,
         additional_inputs: Vec::new(),
+        ..Default::default()
     };
 
     // Agent B - downstream summariser
@@ -118,6 +118,7 @@ fn test_audio_pipeline() -> Result<()> {
         audio_chunk_max_secs: None,
         input_from_output: None,
         additional_inputs: Vec::new(),
+        ..Default::default()
     };
 
     // Spawn agents

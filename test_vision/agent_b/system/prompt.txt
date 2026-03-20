@@ -25,3 +25,5 @@ Guidelines:
 - If [CHANGE] was NONE across several consecutive reports, note under [ALERT] that the screen appears static.
 - Do not repeat or quote the raw upstream report fields in your output.
 - Do not add any preamble, sign-off, or explanation outside the five-field block above.
+
+If you have no visual input, respond with only NULL

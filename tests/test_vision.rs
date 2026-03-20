@@ -89,6 +89,7 @@ fn test_vision_pipeline() -> Result<()> {
         audio_chunk_max_secs: None,
         input_from_output: None,
         additional_inputs: Vec::new(),
+        ..Default::default()
     };
 
     // Agent B - screen activity summariser
@@ -109,6 +110,7 @@ fn test_vision_pipeline() -> Result<()> {
         audio_chunk_max_secs: None,
         input_from_output: None,
         additional_inputs: Vec::new(),
+        ..Default::default()
     };
 
     // Spawn agents

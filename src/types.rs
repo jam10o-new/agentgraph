@@ -16,6 +16,8 @@ pub const CMD_OPEN_READ: &str = "RREAD ";
 pub const CMD_CLOSE_READ: &str = " DAERR";
 pub const CMD_OPEN_WRIT: &str = "WWRIT ";
 pub const CMD_CLOSE_WRIT: &str = " TIRWW";
+pub const CMD_OPEN_READ_SKILL: &str = "RRDS ";
+pub const CMD_CLOSE_READ_SKILL: &str = " SDRR";
 
 /// Maximum length of any opener (for pre-active buffer sizing)
 pub const MAX_OPENER_LEN: usize = 6; // "【EXEC " is 6 chars
@@ -37,6 +39,7 @@ pub enum CommandType {
     Kill(usize),         // index
     Read(usize),         // index
     Writ(usize, String), // index and input
+    ReadSkill(String),   // skill name/path
 }
 
 /// Command opener type for state machine parsing
@@ -46,6 +49,7 @@ pub enum CmdOpenType {
     Kill,
     Read,
     Writ,
+    ReadSkill,
 }
 
 // ============================================================================

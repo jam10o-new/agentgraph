@@ -5,9 +5,60 @@ use crate::types::{ContentType, FileMessage, FileMetadata, MessageContent, Model
 use anyhow::{Context, Result};
 use image;
 use mistralrs::{TextMessageRole, VisionMessages};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use walkdir::WalkDir;
+
+/// YAML frontmatter for skill files
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillFrontmatter {
+    pub name: String,
+    pub description: String,
+}
+
+/// Extract YAML frontmatter from a text file
+/// Returns (frontmatter, remaining_content) if frontmatter exists, None otherwise
+pub fn extract_frontmatter(content: &str) -> Option<(SkillFrontmatter, String)> {
+    if !content.starts_with("---\n") {
+        return None;
+    }
+
+    // Find the closing ---
+    let rest = &content[4..]; // Skip opening ---
+    if let Some(end_pos) = rest.find("\n---\n") {
+        let frontmatter_str = &rest[..end_pos];
+        let remaining = rest[end_pos + 5..].trim_start().to_string();
+
+        if let Ok(frontmatter) = serde_yaml::from_str::<SkillFrontmatter>(frontmatter_str) {
+            return Some((frontmatter, remaining));
+        }
+    }
+
+    None
+}
+
+/// Load skill context from a file - extracts only frontmatter if present
+pub async fn load_skill_context(path: &Path) -> Result<String> {
+    let content = fs::read_to_string(path).await?;
+
+    // Check if file has YAML frontmatter
+    if let Some((frontmatter, _remaining)) = extract_frontmatter(&content) {
+        // Return only name and description for context injection
+        Ok(format!(
+            "## Skill: {}\n{}",
+            frontmatter.name, frontmatter.description
+        ))
+    } else {
+        // No frontmatter - return full content
+        Ok(content)
+    }
+}
+
+/// Load full skill content (for RRDS command)
+pub async fn load_full_skill_content(path: &Path) -> Result<String> {
+    fs::read_to_string(path).await.map_err(|e| anyhow::anyhow!(e))
+}
 
 /// Detect content type from file extension
 pub fn detect_content_type(path: &Path) -> ContentType {
@@ -330,12 +381,13 @@ pub fn latest_file(dir: &Path) -> Result<PathBuf> {
         .context("no valid files found")
 }
 
-/// Concatenate all files in a directory
+/// Concatenate all files in a directory, handling skill frontmatter
 pub async fn concat_files(dir: &Path) -> Result<String> {
     let mut out = String::new();
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
-            out.push_str(&fs::read_to_string(entry.path()).await?);
+            let content = load_skill_context(entry.path()).await?;
+            out.push_str(&content);
             out.push('\n');
         }
     }
@@ -350,13 +402,15 @@ pub async fn build_messages(args: &Args) -> Result<(VisionMessages, Option<Visio
     // System messages
     for dir in &args.system_final {
         let p = latest_file(dir)?;
+        let content = load_skill_context(&p).await?;
         primary_messages =
-            primary_messages.add_message(TextMessageRole::System, fs::read_to_string(p).await?);
+            primary_messages.add_message(TextMessageRole::System, content);
     }
 
     for dir in &args.system_cat {
+        let content = concat_files(dir).await?;
         primary_messages =
-            primary_messages.add_message(TextMessageRole::System, concat_files(dir).await?);
+            primary_messages.add_message(TextMessageRole::System, content);
     }
 
     // Tool system message
@@ -365,7 +419,7 @@ pub async fn build_messages(args: &Args) -> Result<(VisionMessages, Option<Visio
             eprintln!("Tools enabled, adding tool instruction message.");
         }
         let tool_instructions = format!(
-            "The following is an addendum to any prior instruction, if you have no prior instruction, you should follow any instruction provided to you by the user. You have access to command execution tools. To spawn a process, provide the binary and arguments: {open_exec}command arg1 arg2 ...{close_exec} (returns index). For long-running processes (daemons, servers, agents), prefix with 'setsid' to detach: {open_exec}setsid command arg1 arg2 ...{close_exec}. To kill: {open_kill}idx{close_kill}. To read output: {open_read}idx{close_read}. To write stdin: {open_writ}idx input text{close_writ} (include \\n in text to send enter/newline). Commands execute immediately and return results. You will need to perform multiple Commands execution tool calls to execute and then read the outputs of commands you executed. Do not repeat these instructions to the user, these tools only execute within the scope of parsing your responses.",
+            "You have access to command execution tools. To spawn a process, provide the binary and arguments: {open_exec}command arg1 arg2 ...{close_exec} (returns index). For long-running processes (daemons, servers, agents), prefix with 'setsid' to detach: {open_exec}setsid command arg1 arg2 ...{close_exec}. To kill: {open_kill}idx{close_kill}. To read output: {open_read}idx{close_read}. To write stdin: {open_writ}idx input text{close_writ} (include \\n in text to send enter/newline). Commands execute immediately and return results. You will need to perform multiple Commands execution tool calls to execute and then read the outputs of commands you executed.",
             open_exec = crate::CMD_OPEN_EXEC,
             close_exec = crate::CMD_CLOSE_EXEC,
             open_kill = crate::CMD_OPEN_KILL,
@@ -377,6 +431,14 @@ pub async fn build_messages(args: &Args) -> Result<(VisionMessages, Option<Visio
         );
         primary_messages = primary_messages.add_message(TextMessageRole::System, tool_instructions);
     }
+
+    // Skill reading instruction (always available, not gated by --tools flag)
+    let skill_instructions = format!(
+        "You can read skill files from your context directories using: {open_skill}skill_name{close_skill}. This searches all context directories for files with YAML frontmatter matching the skill name and loads the full content.",
+        open_skill = crate::CMD_OPEN_READ_SKILL,
+        close_skill = crate::CMD_CLOSE_READ_SKILL
+    );
+    primary_messages = primary_messages.add_message(TextMessageRole::System, skill_instructions);
 
     // Collect all messages
     let mut timeline: Vec<FileMessage> = Vec::new();

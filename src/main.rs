@@ -71,33 +71,35 @@ async fn main() -> Result<()> {
     }
 
     // Spawn psi-viewer process
-    let mut io = spawn_command_io("psi-viewer", dir_args).await?;
-    let mut editor_exit = io.exited_rx.take();
+    if !args.no_ui {
+        let mut io = spawn_command_io("psi-viewer", dir_args).await?;
+        let mut editor_exit = io.exited_rx.take();
 
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                Some(chunk) = io.stdout_rx.recv() => {
-                    print!("{}", String::from_utf8_lossy(&chunk));
-                }
-
-                Some(chunk) = io.stderr_rx.recv() => {
-                    eprint!("{}", String::from_utf8_lossy(&chunk));
-                }
-
-                _ = async {
-                    if let Some(rx) = &mut editor_exit {
-                        let _ = rx.await;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(chunk) = io.stdout_rx.recv() => {
+                        print!("{}", String::from_utf8_lossy(&chunk));
                     }
-                }, if editor_exit.is_some() => {
-                    eprintln!("Editor exited — shutting down daemon.");
-                    std::process::exit(0);
-                }
 
-                else => break,
+                    Some(chunk) = io.stderr_rx.recv() => {
+                        eprint!("{}", String::from_utf8_lossy(&chunk));
+                    }
+
+                    _ = async {
+                        if let Some(rx) = &mut editor_exit {
+                            let _ = rx.await;
+                        }
+                    }, if editor_exit.is_some() => {
+                        eprintln!("Editor exited — shutting down daemon.");
+                        std::process::exit(0);
+                    }
+
+                    else => break,
+                }
             }
-        }
-    });
+        });
+    }
 
     let mut model: Option<Arc<mistralrs::Model>> = None;
 
@@ -109,9 +111,22 @@ async fn main() -> Result<()> {
     let mut _listener_guard: Option<oneshot::Sender<()>> = None;
     let mut queued_audio: Vec<Vec<u8>> = Vec::new();
     let mut last_modify_interrupt: Option<std::time::Instant> = None;
+    let mut upstream = find_oldest_pipe(my_pid).await;
+
+    if let Some(upstream_pipe) = upstream {
+        if !args.watch {
+            let req = agentgraph::InferenceRequest {
+                args: args.clone(),
+                requesting_pid: my_pid,
+            };
+            if let Err(e) = send_request(&upstream_pipe, req).await {
+                eprintln!("Failed to reach leader: {}", e);
+            }
+        }
+    }
 
     loop {
-        let upstream = find_oldest_pipe(my_pid).await;
+        upstream = find_oldest_pipe(my_pid).await;
 
         tokio::select! {
             event = fs_rx.recv() => {

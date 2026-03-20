@@ -98,6 +98,7 @@ fn test_tools_pipeline() -> Result<()> {
         audio_chunk_max_secs: None,
         input_from_output: None,
         additional_inputs: Vec::new(),
+        ..Default::default()
     };
 
     // Agent VISION - vision describer
@@ -118,6 +119,7 @@ fn test_tools_pipeline() -> Result<()> {
         audio_chunk_max_secs: None,
         input_from_output: None,
         additional_inputs: Vec::new(),
+        ..Default::default()
     };
 
     // Agent SUMMARY - stream-realtime summariser
@@ -138,6 +140,7 @@ fn test_tools_pipeline() -> Result<()> {
         audio_chunk_max_secs: None,
         input_from_output: None,
         additional_inputs: Vec::new(),
+        ..Default::default()
     };
 
     // Spawn agents

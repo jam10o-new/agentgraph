@@ -3,8 +3,10 @@
 //! Executes commands parsed from model output (EXEC, KILL, READ, WRIT).
 
 use crate::Args;
+use crate::messages::{extract_frontmatter, load_full_skill_content};
 use crate::types::{CommandIO, CommandType};
 use anyhow::Result;
+use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc::{Sender, channel};
@@ -95,9 +97,16 @@ pub async fn execute_command(
     tool_context: &mut String,
     daemon_args: &Args,
 ) -> String {
+    // ReadSkill command is always available (not gated by --tools flag)
+    if let CommandType::ReadSkill(skill_name) = cmd {
+        return execute_read_skill(skill_name, tool_context, daemon_args).await;
+    }
+
+    // All other commands require --tools flag
     if !daemon_args.tools {
         return "[TOOL USE FAILED: TOOLS DISABLED]".to_string();
     }
+
     match cmd {
         CommandType::Exec(command_str) => {
             let parts: Vec<&str> = command_str.split_whitespace().collect();
@@ -194,5 +203,87 @@ pub async fn execute_command(
                 }
             }
         }
+
+        CommandType::ReadSkill(_) => unreachable!("ReadSkill handled before tools check"),
     }
+}
+
+/// Execute ReadSkill command - search context directories for skill by frontmatter name
+async fn execute_read_skill(
+    skill_name: String,
+    tool_context: &mut String,
+    daemon_args: &Args,
+) -> String {
+    // Search for skill by scanning frontmatter in ALL context directories
+    // This includes system, input, and assistant directories
+    let search_dirs: Vec<&PathBuf> = daemon_args
+        .system_cat
+        .iter()
+        .chain(daemon_args.system_final.iter())
+        .chain(daemon_args.input_cat.iter())
+        .chain(daemon_args.input_final.iter())
+        .chain(daemon_args.assistant_cat.iter())
+        .chain(daemon_args.assistant_final.iter())
+        .collect();
+
+    for dir in search_dirs {
+        if !dir.exists() {
+            continue;
+        }
+
+        // Walk all files in the directory
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+
+                // Read file content and check for matching frontmatter
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    // Quick check: does file start with YAML frontmatter?
+                    if let Some((frontmatter, _)) = extract_frontmatter(&content) {
+                        // Check if skill name matches
+                        if frontmatter.name == skill_name {
+                            // Load full content and return
+                            match load_full_skill_content(&path).await {
+                                Ok(full_content) => {
+                                    let formatted = format!(
+                                        "=== Skill: {} ===\n{}\n=== End Skill ===\n",
+                                        skill_name, full_content
+                                    );
+                                    tool_context.push_str(&formatted);
+                                    if daemon_args.verbose {
+                                        eprintln!(
+                                            "[RRDS {}: loaded from {}]",
+                                            skill_name,
+                                            path.display()
+                                        );
+                                    }
+                                    return format!(
+                                        "[RRDS {}: {} bytes loaded]\n",
+                                        skill_name,
+                                        full_content.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    if daemon_args.verbose {
+                                        eprintln!(
+                                            "[RRDS {}: read error: {}]",
+                                            skill_name, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    format!(
+        "[RRDS {}: skill not found in any context directory]\n",
+        skill_name
+    )
 }
