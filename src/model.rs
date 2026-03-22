@@ -1,6 +1,7 @@
 //! Model loading for agentgraph.
 
 use crate::Args;
+use crate::types::{MODEL_PRIMARY, MODEL_SECONDARY};
 use anyhow::Result;
 use mistralrs::{GgufModelBuilder, IsqBits, VisionModelBuilder};
 
@@ -16,10 +17,7 @@ pub async fn load_model(args: &Args) -> Result<mistralrs::Model> {
     );
     println!("secondary_model={}", args.secondary_model);
 
-    let primary_alias = args.model.clone();
-    let secondary_alias = args.secondary_model.clone();
-
-    let mut builder = mistralrs::MultiModelBuilder::new().with_default_model(&primary_alias);
+    let mut builder = mistralrs::MultiModelBuilder::new().with_default_model(MODEL_PRIMARY);
 
     // Add primary model
     if args.verbose {
@@ -32,16 +30,16 @@ pub async fn load_model(args: &Args) -> Result<mistralrs::Model> {
         let primary_builder = VisionModelBuilder::new(path)
             .with_auto_isq(IsqBits::Four)
             .with_logging();
-        builder = builder.add_model_with_alias(&primary_alias, primary_builder);
+        builder = builder.add_model_with_alias(MODEL_PRIMARY, primary_builder);
     } else if !args.gguf.is_empty() {
         println!("Loading primary as GGUF!");
         let primary_builder = GgufModelBuilder::new(&args.model, args.gguf.clone());
-        builder = builder.add_model_with_alias(&primary_alias, primary_builder);
+        builder = builder.add_model_with_alias(MODEL_PRIMARY, primary_builder);
     } else {
         let primary_builder = VisionModelBuilder::new(&args.model)
             .with_auto_isq(IsqBits::Four)
             .with_logging();
-        builder = builder.add_model_with_alias(&primary_alias, primary_builder);
+        builder = builder.add_model_with_alias(MODEL_PRIMARY, primary_builder);
     }
 
     // Only load secondary (audio) model when needed
@@ -53,7 +51,7 @@ pub async fn load_model(args: &Args) -> Result<mistralrs::Model> {
             .with_auto_isq(IsqBits::Four)
             .with_dtype(mistralrs::ModelDType::F32)
             .with_logging();
-        builder = builder.add_model_with_alias(&secondary_alias, secondary_builder);
+        builder = builder.add_model_with_alias(MODEL_SECONDARY, secondary_builder);
     } else if args.verbose {
         eprintln!("Skipping secondary model (not needed).");
     }

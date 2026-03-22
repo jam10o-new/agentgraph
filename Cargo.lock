@@ -39,8 +39,10 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "walkdir",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3181,7 +3183,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.7.1-alpha.1"
-source = "git+https://github.com/jam10o-new/mistral.rs?rev=03c355da98256260903ee62a0d7dc399e2765253#03c355da98256260903ee62a0d7dc399e2765253"
+source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3208,7 +3210,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.7.1-alpha.1"
-source = "git+https://github.com/jam10o-new/mistral.rs?rev=03c355da98256260903ee62a0d7dc399e2765253#03c355da98256260903ee62a0d7dc399e2765253"
+source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
 dependencies = [
  "anyhow",
  "apodize",
@@ -3219,7 +3221,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.7.1-alpha.1"
-source = "git+https://github.com/jam10o-new/mistral.rs?rev=03c355da98256260903ee62a0d7dc399e2765253#03c355da98256260903ee62a0d7dc399e2765253"
+source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
 dependencies = [
  "ahash",
  "akin",
@@ -3314,7 +3316,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.7.1-alpha.1"
-source = "git+https://github.com/jam10o-new/mistral.rs?rev=03c355da98256260903ee62a0d7dc399e2765253#03c355da98256260903ee62a0d7dc399e2765253"
+source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -3325,7 +3327,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.7.1-alpha.1"
-source = "git+https://github.com/jam10o-new/mistral.rs?rev=03c355da98256260903ee62a0d7dc399e2765253#03c355da98256260903ee62a0d7dc399e2765253"
+source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3345,7 +3347,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.7.1-alpha.1"
-source = "git+https://github.com/jam10o-new/mistral.rs?rev=03c355da98256260903ee62a0d7dc399e2765253#03c355da98256260903ee62a0d7dc399e2765253"
+source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3358,7 +3360,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.7.1-alpha.1"
-source = "git+https://github.com/jam10o-new/mistral.rs?rev=03c355da98256260903ee62a0d7dc399e2765253#03c355da98256260903ee62a0d7dc399e2765253"
+source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -3384,7 +3386,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.7.1-alpha.1"
-source = "git+https://github.com/jam10o-new/mistral.rs?rev=03c355da98256260903ee62a0d7dc399e2765253#03c355da98256260903ee62a0d7dc399e2765253"
+source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
 dependencies = [
  "candle-core",
  "image",
@@ -5693,6 +5695,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df7f62577c25e07834649fc3b39fafdc597c0a3527dc1c60129201ccfcbaa50c"
 
 [[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.2",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "tendril"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7301,6 +7316,12 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "y4m"

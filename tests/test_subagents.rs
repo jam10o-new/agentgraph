@@ -103,10 +103,10 @@ Spawn processes: {open_exec}command args{close_exec}
 First, spawn these 2 subagents using these exact responses, seperated by a newline:
 
 1. watcher_a (watch mode daemon):
-{open_exec}setsid -f {bin} -W --no-ui --verbose -S {base}/watcher_a/system -I {base}/watcher_a/input -O {base}/watcher_a/output {close_exec}
+{open_exec}bash -c "setsid {bin} -W --verbose -S {base}/watcher_a/system -I {base}/watcher_a/input -O {base}/watcher_a/output &"{close_exec}
 
 2. watcher_b (watch mode daemon):
-{open_exec}setsid -f {bin} -W --no-ui --verbose -S {base}/watcher_b/system -I {base}/watcher_b/input -O {base}/watcher_b/output {close_exec}
+{open_exec}bash -c "setsid {bin} -W --verbose -S {base}/watcher_b/system -I {base}/watcher_b/input -O {base}/watcher_b/output &"{close_exec}
 
 Once you have spawned a subagent, respond with "[SUBAGENT_SPAWNED]: <subagent name>".
 If you have not yet seen responses from all of your subagents, respond only "[AWAITING RESPONSE]" or "...".

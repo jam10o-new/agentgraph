@@ -7,12 +7,13 @@ use crate::command_exec::execute_command;
 use crate::commands::CommandParser;
 use crate::messages::build_messages;
 use crate::types::{
-    CoroutineResponse, InterruptKind, ModelSlot, ParallelInferenceParams, StreamOutcome,
+    CoroutineResponse, InterruptKind, MODEL_SECONDARY, ModelSlot, ParallelInferenceParams,
+    StreamOutcome,
 };
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use mistralrs::TextMessageRole;
+use mistralrs::{RequestBuilder, SamplingParams, TextMessageRole};
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -52,11 +53,27 @@ async fn run_inference_coroutine(
     mut cancel_rx: watch::Receiver<bool>,
     token_tx: Option<UnboundedSender<String>>,
 ) -> CoroutineResponse {
+    let sampling_params = SamplingParams {
+        temperature: Some(0.9),        // Lowered from 1.5 for coherence
+        top_k: Some(40),               // Standard "diverse but safe" pool
+        top_p: Some(0.9),              // Typical "nucleus" sampling threshold
+        min_p: Some(0.05),             // Filters out total noise
+        repetition_penalty: Some(1.1), // Subtle; prevents loops without breaking code
+        frequency_penalty: Some(0.02), // Tiny additive penalty to discourage overuse
+        presence_penalty: Some(0.02),  // Tiny additive penalty to encourage new topics
+        n_choices: 1,
+        ..SamplingParams::deterministic()
+    };
+
     let stream_result = match params.model_slot {
-        ModelSlot::Primary => model.stream_chat_request(params.messages).await,
+        ModelSlot::Primary => {
+            let respondable: RequestBuilder = params.messages.into();
+            model.stream_chat_request(respondable.set_sampling(sampling_params)).await
+        }
         ModelSlot::Secondary => {
+            let respondable: RequestBuilder = params.messages.into();
             model
-                .stream_chat_request_with_model(params.messages, Some("secondary"))
+                .stream_chat_request_with_model(respondable.set_sampling(sampling_params), Some(MODEL_SECONDARY))
                 .await
         }
     };
@@ -344,7 +361,7 @@ pub async fn run_once(
     let mut pending_audio_queue: Vec<Vec<u8>> = pending_audio;
     let mut subprocesses: Vec<crate::types::CommandIO> = Vec::new();
     let mut pending_system_message: Option<String> = None;
-    let mut tool_context: String = String::new();
+    let tool_context: String = String::new();
 
     'restart_loop: loop {
         restart_count += 1;

@@ -18,7 +18,7 @@ notify = "6"
 base64 = "0.22"
 walkdir = "2"
 image = "0.25"
-mistralrs = { version = "0.7.1-alpha.1", features = ["cuda", "cudnn"], git = "https://github.com/jam10o-new/mistral.rs", rev = "03c355da98256260903ee62a0d7dc399e2765253" }
+mistralrs = { version = "0.7.1-alpha.1", features = ["cuda", "cudnn"], git = "https://github.com/EricLBuehler/mistral.rs" }
 humantime = "2.3.0"
 serde = "1"
 serde_json = "1"
@@ -31,6 +31,8 @@ flume = "0.12.0"
 bytemuck = "1.25.0"
 bitflags = "2.11.0"
 serde_yaml = "0.9.34"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+tempfile = "3"
 
 [dev-dependencies]
 chrono = { version = "0.4.44", features = ["serde"] }

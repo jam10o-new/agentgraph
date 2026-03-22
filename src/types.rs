@@ -62,6 +62,11 @@ pub enum ModelSlot {
     Secondary,
 }
 
+/// Model alias for primary (vision) model
+pub const MODEL_PRIMARY: &str = "primary";
+/// Model alias for secondary (audio) model
+pub const MODEL_SECONDARY: &str = "secondary";
+
 // ============================================================================
 // Interrupt types
 // ============================================================================

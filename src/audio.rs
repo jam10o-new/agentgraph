@@ -3,7 +3,7 @@
 //! Real-time audio capture, speech detection, and chunking.
 
 use crate::Args;
-use crate::types::RealtimeListener;
+use crate::types::{MODEL_SECONDARY, RealtimeListener};
 use anyhow::{Context, Result};
 use mistralrs::{TextMessageRole, VisionMessages};
 use rand::RngExt;
@@ -63,7 +63,6 @@ pub async fn spawn_realtime_listener(
     let max_duration = Duration::from_secs_f32(args.audio_chunk_max_secs);
 
     let model_clone = model.clone();
-    let model_id = args.secondary_model.clone();
 
     tokio::spawn(async move {
         let (audio_tx, audio_rx) = flume::bounded::<Vec<u8>>(128);
@@ -149,11 +148,10 @@ pub async fn spawn_realtime_listener(
                                     let speech_detected_tx = speech_detected_tx.clone();
                                     let chunk = accumulated_buffer.clone();
                                     let tx_clone = chunk_tx.clone();
-                                    let model_id = model_id.clone();
                                     tokio::spawn(async move {
                                         let mut wav = create_wav_header(chunk.len()).to_vec();
                                         wav.append(&mut chunk.clone());
-                                        match detect_speech(&wav, &model_clone, &model_id).await {
+                                        match detect_speech(&wav, &model_clone, MODEL_SECONDARY).await {
                                             Ok(true) => {
                                                 let _ = speech_detected_tx.send(());
                                                 let _ = tx_clone.send(wav.to_vec()).await;

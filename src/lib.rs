@@ -3,6 +3,7 @@
 pub mod audio;
 pub mod command_exec;
 pub mod commands;
+pub mod context;
 pub mod events;
 pub mod inference;
 pub mod ipc;
@@ -57,7 +58,7 @@ pub struct Args {
     pub gguf: Vec<String>,
 
     /// Model name (HF repo) - PRIMARY slot (vision model)
-    #[arg(short = 'm', long, default_value = "Qwen/Qwen3-VL-8B-Instruct")]
+    #[arg(short = 'm', long, default_value = "Qwen/Qwen3.5-9B")]
     pub model: String,
 
     /// Secondary model name (HF repo) - SECONDARY slot (audio model, default: Voxtral)
