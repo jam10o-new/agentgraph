@@ -65,22 +65,40 @@ async fn run_inference_coroutine(
         ..SamplingParams::deterministic()
     };
 
+    eprintln!(
+        "run_inference_coroutine: Calling stream_chat_request for slot {:?}",
+        params.model_slot
+    );
     let stream_result = match params.model_slot {
         ModelSlot::Primary => {
             let respondable: RequestBuilder = params.messages.into();
-            model.stream_chat_request(respondable.set_sampling(sampling_params)).await
+            eprintln!("run_inference_coroutine: Primary model request created");
+            model
+                .stream_chat_request(respondable.set_sampling(sampling_params))
+                .await
         }
         ModelSlot::Secondary => {
             let respondable: RequestBuilder = params.messages.into();
+            eprintln!("run_inference_coroutine: Secondary model request created");
             model
-                .stream_chat_request_with_model(respondable.set_sampling(sampling_params), Some(MODEL_SECONDARY))
+                .stream_chat_request_with_model(
+                    respondable.set_sampling(sampling_params),
+                    Some(MODEL_SECONDARY),
+                )
                 .await
         }
     };
 
+    eprintln!("run_inference_coroutine: stream_chat_request returned");
     let mut stream = match stream_result {
-        Ok(s) => s,
-        Err(e) => return CoroutineResponse::Error(e.into()),
+        Ok(s) => {
+            eprintln!("run_inference_coroutine: Stream created successfully");
+            s
+        }
+        Err(e) => {
+            eprintln!("run_inference_coroutine: Stream creation failed: {:?}", e);
+            return CoroutineResponse::Error(e.into());
+        }
     };
 
     let mut buffer = String::new();
@@ -199,6 +217,9 @@ pub async fn run_streaming_loop(
     let mut tool_context = String::new();
     let mut response = String::new();
     let mut last_modify_interrupt: Option<std::time::Instant> = None;
+    if args.verbose {
+        eprintln!("run_streaming_loop: Starting inference coroutine...");
+    }
     let mut inference_fut = std::pin::pin!(run_inference_coroutine(
         model,
         params,
@@ -209,6 +230,13 @@ pub async fn run_streaming_loop(
     loop {
         tokio::select! {
             result = &mut inference_fut => {
+                if args.verbose {
+                    match &result {
+                        CoroutineResponse::Complete(_) => eprintln!("run_streaming_loop: inference_fut finished with Complete"),
+                        CoroutineResponse::Interrupted(_) => eprintln!("run_streaming_loop: inference_fut finished with Interrupted"),
+                        CoroutineResponse::Error(e) => eprintln!("run_streaming_loop: inference_fut finished with Error: {:?}", e),
+                    }
+                }
                 while let Ok(tok) = token_rx.try_recv() {
                     let (out, cmd, _) = cmd_parser.process(&tok);
                     response.push_str(&out);
@@ -242,6 +270,9 @@ pub async fn run_streaming_loop(
                 };
             }
             Some(tok) = token_rx.recv() => {
+                if args.verbose {
+                    eprintln!("run_streaming_loop: Received token: {:?}", tok);
+                }
                 let (out, cmd, _) = cmd_parser.process(&tok);
                 response.push_str(&out);
                 if stream_realtime {
@@ -410,6 +441,14 @@ pub async fn run_once(
             }
         };
 
+        if args.verbose {
+            eprintln!(
+                "Checking context inputs (count: {}), has_sec: {}",
+                synth_params.context_inputs.len(),
+                has_sec
+            );
+        }
+
         if !synth_params.context_inputs.is_empty() {
             if args.verbose {
                 eprintln!(
@@ -426,19 +465,19 @@ pub async fn run_once(
             let mut synth_msgs = synth_params.messages.clone();
             if !synth_params.system_addendum.is_empty() {
                 synth_msgs = synth_msgs.add_message(
-                    TextMessageRole::System,
+                    TextMessageRole::Tool,
                     synth_params.system_addendum.clone(),
                 );
             }
             // Add pending system message about subprocesses
             if let Some(ref sys_msg) = pending_system_message {
-                synth_msgs = synth_msgs.add_message(TextMessageRole::System, sys_msg.clone());
+                synth_msgs = synth_msgs.add_message(TextMessageRole::Tool, sys_msg.clone());
                 pending_system_message = None;
             }
             // Add tool context from previous command executions
             if !tool_context.is_empty() {
                 synth_msgs = synth_msgs.add_message(
-                    TextMessageRole::System,
+                    TextMessageRole::Tool,
                     format!("[PREVIOUS COMMAND OUTPUT]:\n{}", tool_context),
                 );
             }
@@ -448,7 +487,7 @@ pub async fn run_once(
                     ModelSlot::Secondary => "AUDIO SPECIALIST",
                 };
                 synth_msgs = synth_msgs.add_message(
-                    TextMessageRole::System,
+                    TextMessageRole::Tool,
                     format!("[SPECIALIST RESPONSE ({label}): {text}]"),
                 );
             }
@@ -564,16 +603,19 @@ pub async fn run_once(
                 }
             }
         } else {
+            if args.verbose {
+                eprintln!("No context inputs, running direct streaming inference.");
+            }
             let mut msgs = synth_params.messages.clone();
             if !synth_params.system_addendum.is_empty() {
                 msgs = msgs.add_message(
-                    TextMessageRole::System,
+                    TextMessageRole::Tool,
                     synth_params.system_addendum.clone(),
                 );
             }
             // Add pending system message about subprocesses
             if let Some(ref sys_msg) = pending_system_message {
-                msgs = msgs.add_message(TextMessageRole::System, sys_msg.clone());
+                msgs = msgs.add_message(TextMessageRole::Tool, sys_msg.clone());
                 pending_system_message = None;
             }
             if !output_buffer.is_empty() {
@@ -589,6 +631,9 @@ pub async fn run_once(
                 model_slot: ModelSlot::Primary,
             };
 
+            if args.verbose {
+                eprintln!("Calling run_streaming_loop...");
+            }
             match run_streaming_loop(
                 model.clone(),
                 streaming_params,

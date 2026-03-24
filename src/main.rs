@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
                                 requesting_pid: my_pid,
                             };
                             if let Err(e) = send_request(&upstream_pipe, req).await {
-                                eprintln!("Failed to reach leader: {}", e);
+                                eprintln!("Failed to reach leader {:?}: {}", upstream_pipe, e);
                             }
                         } else {
                             // Leader path

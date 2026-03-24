@@ -36,8 +36,7 @@ pub fn is_interrupt_event(
         notify::EventKind::Access(notify::event::AccessKind::Close(
             notify::event::AccessMode::Write | notify::event::AccessMode::Any,
         ))
-        | notify::EventKind::Modify(_)
-        | notify::EventKind::Create(_) => {
+        | notify::EventKind::Modify(_) => {
             let now = std::time::Instant::now();
             let elapsed = last_modify
                 .map(|t| now.duration_since(t).as_millis() as u64)
@@ -48,6 +47,11 @@ pub fn is_interrupt_event(
             } else {
                 false
             }
+        }
+        notify::EventKind::Create(_) => {
+            let now = std::time::Instant::now();
+            *last_modify = Some(now);
+            true
         }
         _ => false,
     }

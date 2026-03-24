@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Configuration for a test agent process
@@ -125,6 +124,7 @@ impl RunningAgent {
             cmd.arg("-O").arg(&config.output_dir);
         }
 
+        cmd.arg("--no-ui");
         // Additional arguments
         for arg in &config.additional_args {
             cmd.arg(arg);

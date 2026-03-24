@@ -58,7 +58,9 @@ pub async fn load_skill_context(path: &Path) -> Result<String> {
 
 /// Load full skill content (for RRDS command)
 pub async fn load_full_skill_content(path: &Path) -> Result<String> {
-    fs::read_to_string(path).await.map_err(|e| anyhow::anyhow!(e))
+    fs::read_to_string(path)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Detect content type from file extension
@@ -297,13 +299,13 @@ pub async fn collect_viewer_dirs(args: &Args) -> Result<Vec<PathBuf>> {
 }
 
 /// Load messages from a directory with context management
-/// 
+///
 /// This function applies context management to reduce context size for long conversations.
 /// It uses three strategies based on turn age:
 /// 1. **Full**: Load entire content (recent turns)
 /// 2. **MicroSummary**: Load cached micro-summary (old turns, no relevance to current)
 /// 3. **Compress**: Run relevance extraction against the baseline turn (old turns, potentially relevant)
-/// 
+///
 /// Note: For the Compress strategy, the relevance extraction is NOT cached because relevance
 /// depends on the current baseline turn, which changes each turn.
 pub async fn load_dir_messages_with_context(
@@ -346,11 +348,7 @@ pub async fn load_dir_messages_with_context(
         // Determine load strategy based on turn age
         let message_turn = message_turn_offset + idx;
         let has_summary = context_manager.has_summary(path);
-        let strategy = context_manager.determine_load_strategy(
-            message_turn,
-            role,
-            has_summary,
-        );
+        let strategy = context_manager.determine_load_strategy(message_turn, role, has_summary);
 
         // For Full strategy or non-text content, load full content
         let content = if strategy == LoadStrategy::Full {
@@ -366,7 +364,9 @@ pub async fn load_dir_messages_with_context(
                     let bytes = fs::read(path).await?;
                     MessageContent::Audio(bytes)
                 }
-                ContentType::Video => MessageContent::Text(format!("[Video file: {}]", path.display())),
+                ContentType::Video => {
+                    MessageContent::Text(format!("[Video file: {}]", path.display()))
+                }
             }
         } else {
             // For MicroSummary or Compress, we need to get relevance-aware content
@@ -389,7 +389,9 @@ pub async fn load_dir_messages_with_context(
                         let bytes = fs::read(path).await?;
                         MessageContent::Audio(bytes)
                     }
-                    ContentType::Video => MessageContent::Text(format!("[Video file: {}]", path.display())),
+                    ContentType::Video => {
+                        MessageContent::Text(format!("[Video file: {}]", path.display()))
+                    }
                 }
             }
         };
@@ -517,14 +519,12 @@ pub async fn build_messages(args: &Args) -> Result<(VisionMessages, Option<Visio
     for dir in &args.system_final {
         let p = latest_file(dir)?;
         let content = load_skill_context(&p).await?;
-        primary_messages =
-            primary_messages.add_message(TextMessageRole::System, content);
+        primary_messages = primary_messages.add_message(TextMessageRole::System, content);
     }
 
     for dir in &args.system_cat {
         let content = concat_files(dir).await?;
-        primary_messages =
-            primary_messages.add_message(TextMessageRole::System, content);
+        primary_messages = primary_messages.add_message(TextMessageRole::System, content);
     }
 
     // Tool system message
@@ -543,7 +543,7 @@ pub async fn build_messages(args: &Args) -> Result<(VisionMessages, Option<Visio
             open_writ = crate::CMD_OPEN_WRIT,
             close_writ = crate::CMD_CLOSE_WRIT
         );
-        primary_messages = primary_messages.add_message(TextMessageRole::System, tool_instructions);
+        primary_messages = primary_messages.add_message(TextMessageRole::Tool, tool_instructions);
     }
 
     // Skill reading instruction (always available, not gated by --tools flag)
@@ -552,7 +552,7 @@ pub async fn build_messages(args: &Args) -> Result<(VisionMessages, Option<Visio
         open_skill = crate::CMD_OPEN_READ_SKILL,
         close_skill = crate::CMD_CLOSE_READ_SKILL
     );
-    primary_messages = primary_messages.add_message(TextMessageRole::System, skill_instructions);
+    primary_messages = primary_messages.add_message(TextMessageRole::Tool, skill_instructions);
 
     // Collect all messages
     let mut timeline: Vec<FileMessage> = Vec::new();
@@ -663,14 +663,12 @@ pub async fn build_messages_with_context(
     for dir in &args.system_final {
         let p = latest_file(dir)?;
         let content = load_skill_context(&p).await?;
-        primary_messages =
-            primary_messages.add_message(TextMessageRole::System, content);
+        primary_messages = primary_messages.add_message(TextMessageRole::System, content);
     }
 
     for dir in &args.system_cat {
         let content = concat_files(dir).await?;
-        primary_messages =
-            primary_messages.add_message(TextMessageRole::System, content);
+        primary_messages = primary_messages.add_message(TextMessageRole::System, content);
     }
 
     // Tool system message
@@ -717,7 +715,10 @@ pub async fn build_messages_with_context(
     for (paths, role, concat) in sources {
         for dir in paths {
             if args.verbose {
-                eprintln!("adding messages from: {} (with context management)", dir.display());
+                eprintln!(
+                    "adding messages from: {} (with context management)",
+                    dir.display()
+                );
             }
             let msgs = load_dir_messages_with_context(
                 dir,
@@ -763,7 +764,10 @@ pub async fn build_messages_with_context(
     timeline.sort_by_key(|msg| msg.metadata.created);
 
     if args.verbose {
-        eprintln!("Building {} messages with context management.", timeline.len());
+        eprintln!(
+            "Building {} messages with context management.",
+            timeline.len()
+        );
     }
 
     // Route messages to appropriate model slots
