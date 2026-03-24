@@ -298,22 +298,13 @@ pub async fn collect_viewer_dirs(args: &Args) -> Result<Vec<PathBuf>> {
     Ok(dirs.into_iter().collect())
 }
 
-/// Load messages from a directory with context management
-///
-/// This function applies context management to reduce context size for long conversations.
-/// It uses three strategies based on turn age:
-/// 1. **Full**: Load entire content (recent turns)
-/// 2. **MicroSummary**: Load cached micro-summary (old turns, no relevance to current)
-/// 3. **Compress**: Run relevance extraction against the baseline turn (old turns, potentially relevant)
-///
-/// Note: For the Compress strategy, the relevance extraction is NOT cached because relevance
-/// depends on the current baseline turn, which changes each turn.
-pub async fn load_dir_messages_with_context(
+/// Load messages from a directory, optionally applying context management
+pub async fn load_dir_messages(
     dir: &Path,
     role: &str,
     concat: bool,
     latest_n: usize,
-    context_manager: &ContextManager,
+    context_manager: Option<&ContextManager>,
     message_turn_offset: usize,
 ) -> Result<Vec<FileMessage>> {
     let mut entries: Vec<_> = WalkDir::new(dir)
@@ -345,38 +336,14 @@ pub async fn load_dir_messages_with_context(
     for (idx, (created, modified, path)) in entries.iter().enumerate() {
         let content_type = detect_content_type(path);
 
-        // Determine load strategy based on turn age
-        let message_turn = message_turn_offset + idx;
-        let has_summary = context_manager.has_summary(path);
-        let strategy = context_manager.determine_load_strategy(message_turn, role, has_summary);
+        let content = if let Some(mgr) = context_manager {
+            // Determine load strategy based on turn age
+            let message_turn = message_turn_offset + idx;
+            let has_summary = mgr.has_summary(path);
+            let strategy = mgr.determine_load_strategy(message_turn, role, has_summary);
 
-        // For Full strategy or non-text content, load full content
-        let content = if strategy == LoadStrategy::Full {
-            match content_type {
-                ContentType::Text => MessageContent::Text(fs::read_to_string(path).await?),
-                ContentType::Image => {
-                    let bytes = fs::read(path).await?;
-                    let img = image::load_from_memory(&bytes)
-                        .with_context(|| format!("Failed to load image: {}", path.display()))?;
-                    MessageContent::Image(img)
-                }
-                ContentType::Audio => {
-                    let bytes = fs::read(path).await?;
-                    MessageContent::Audio(bytes)
-                }
-                ContentType::Video => {
-                    MessageContent::Text(format!("[Video file: {}]", path.display()))
-                }
-            }
-        } else {
-            // For MicroSummary or Compress, we need to get relevance-aware content
-            // This will be handled by the caller who has access to the baseline turn
-            // For now, load cached micro-summary if available
-            if let Some(summary) = context_manager.load_summary(path) {
-                MessageContent::Text(summary.as_context_string())
-            } else {
-                // No cached summary - load full content and let caller decide
-                // The caller will run relevance extraction if needed
+            // For Full strategy or non-text content, load full content
+            if strategy == LoadStrategy::Full {
                 match content_type {
                     ContentType::Text => MessageContent::Text(fs::read_to_string(path).await?),
                     ContentType::Image => {
@@ -393,6 +360,45 @@ pub async fn load_dir_messages_with_context(
                         MessageContent::Text(format!("[Video file: {}]", path.display()))
                     }
                 }
+            } else {
+                // For MicroSummary or Compress, we need to get relevance-aware content
+                if let Some(summary) = mgr.load_summary(path) {
+                    MessageContent::Text(summary.as_context_string())
+                } else {
+                    // No cached summary - load full content
+                    match content_type {
+                        ContentType::Text => MessageContent::Text(fs::read_to_string(path).await?),
+                        ContentType::Image => {
+                            let bytes = fs::read(path).await?;
+                            let img = image::load_from_memory(&bytes)
+                                .with_context(|| format!("Failed to load image: {}", path.display()))?;
+                            MessageContent::Image(img)
+                        }
+                        ContentType::Audio => {
+                            let bytes = fs::read(path).await?;
+                            MessageContent::Audio(bytes)
+                        }
+                        ContentType::Video => {
+                            MessageContent::Text(format!("[Video file: {}]", path.display()))
+                        }
+                    }
+                }
+            }
+        } else {
+            // Standard loading without context manager
+            match content_type {
+                ContentType::Text => MessageContent::Text(fs::read_to_string(path).await?),
+                ContentType::Image => {
+                    let bytes = fs::read(path).await?;
+                    let img = image::load_from_memory(&bytes)
+                        .with_context(|| format!("Failed to load image: {}", path.display()))?;
+                    MessageContent::Image(img)
+                }
+                ContentType::Audio => {
+                    let bytes = fs::read(path).await?;
+                    MessageContent::Audio(bytes)
+                }
+                ContentType::Video => MessageContent::Text(format!("[Video file: {}]", path.display())),
             }
         };
 
@@ -403,72 +409,6 @@ pub async fn load_dir_messages_with_context(
                 path: path.clone(),
                 created: *created,
                 modified: *modified,
-            },
-            content_type,
-        });
-    }
-
-    Ok(messages)
-}
-
-/// Load messages from a directory
-pub async fn load_dir_messages(
-    dir: &Path,
-    role: &str,
-    concat: bool,
-    latest_n: usize,
-) -> Result<Vec<FileMessage>> {
-    let mut entries: Vec<_> = WalkDir::new(dir)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| {
-            let meta = e.metadata().ok()?;
-            let created = meta.created().ok()?;
-            let modified = meta.modified().ok()?;
-            Some((created, modified, e.path().to_path_buf()))
-        })
-        .collect();
-
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    entries.sort_by_key(|(created, _, _)| *created);
-    entries.reverse();
-
-    if !concat {
-        entries.truncate(latest_n);
-    }
-
-    let mut messages = Vec::new();
-
-    for (created, modified, path) in entries {
-        let content_type = detect_content_type(&path);
-
-        let content = match content_type {
-            ContentType::Image => {
-                let bytes = fs::read(&path).await?;
-                let img = image::load_from_memory(&bytes)
-                    .with_context(|| format!("Failed to load image: {}", path.display()))?;
-                MessageContent::Image(img)
-            }
-            ContentType::Audio => {
-                let bytes = fs::read(&path).await?;
-                MessageContent::Audio(bytes)
-            }
-            ContentType::Video => MessageContent::Text(format!("[Video file: {}]", path.display())),
-            ContentType::Text => MessageContent::Text(fs::read_to_string(&path).await?),
-        };
-
-        messages.push(FileMessage {
-            role: role.to_string(),
-            content,
-            metadata: FileMetadata {
-                path,
-                created,
-                modified,
             },
             content_type,
         });
@@ -511,11 +451,14 @@ pub async fn concat_files(dir: &Path) -> Result<String> {
 }
 
 /// Build messages from all input sources
-pub async fn build_messages(args: &Args) -> Result<(VisionMessages, Option<VisionMessages>)> {
+pub async fn build_messages(
+    args: &Args,
+    context_manager: Option<&ContextManager>,
+) -> Result<(VisionMessages, Option<VisionMessages>)> {
     let mut primary_messages = VisionMessages::new();
     let mut secondary_messages: Option<VisionMessages> = None;
 
-    // System messages
+    // System messages (never summarized)
     for dir in &args.system_final {
         let p = latest_file(dir)?;
         let content = load_skill_context(&p).await?;
@@ -565,162 +508,22 @@ pub async fn build_messages(args: &Args) -> Result<(VisionMessages, Option<Visio
         (&args.assistant_cat, "assistant", true),
     ];
 
-    for (paths, role, concat) in sources {
-        for dir in paths {
-            if args.verbose {
-                eprintln!("adding messages from: {}", dir.display());
-            }
-            let msgs = load_dir_messages(dir, role, concat, args.latest_n).await?;
-
-            for msg in msgs {
-                if msg.content_type == ContentType::Video {
-                    if let MessageContent::Text(path_str) = &msg.content {
-                        let path = PathBuf::from(
-                            path_str
-                                .trim_start_matches("[Video file: ")
-                                .trim_end_matches(']'),
-                        );
-                        let metadata = msg.metadata.clone();
-                        if let Ok(tuple) = process_video_to_messages(&path, &metadata).await {
-                            video_tasks.push(tuple);
-                        }
-                    }
-                } else {
-                    timeline.push(msg);
-                }
-            }
-        }
-    }
-
-    // Process videos in parallel
-    if !video_tasks.is_empty() {
-        for result in video_tasks {
-            let (frames, audio) = result;
-            timeline.extend(frames);
-            timeline.extend(audio);
-        }
-    }
-
-    timeline.sort_by_key(|msg| msg.metadata.created);
-
-    if args.verbose {
-        eprintln!("Building {} messages.", timeline.len());
-    }
-
-    // Route messages to appropriate model slots
-    let mut maybe_switchable = (false, false);
-    for msg in timeline {
-        if let Some((text, images, _)) = msg.format_for_model(ModelSlot::Primary) {
-            if let Some(images) = images {
-                primary_messages =
-                    primary_messages.add_image_message(to_mistral_role(&msg.role), text, images);
-                maybe_switchable = (true, maybe_switchable.1 || false);
-            } else {
-                primary_messages = primary_messages.add_message(to_mistral_role(&msg.role), text);
-            }
-        }
-
-        if let Some((text, _, audio)) = msg.format_for_model(ModelSlot::Secondary) {
-            if let Some(audio) = audio {
-                let sec_msgs = secondary_messages.get_or_insert_with(VisionMessages::new);
-                *sec_msgs = sec_msgs.clone().add_multimodal_message(
-                    to_mistral_role(&msg.role),
-                    &text,
-                    vec![],
-                    audio,
-                );
-                maybe_switchable = (maybe_switchable.0 || false, true);
-            } else {
-                let sec_msgs = secondary_messages.get_or_insert_with(VisionMessages::new);
-                *sec_msgs = sec_msgs
-                    .clone()
-                    .add_message(to_mistral_role(&msg.role), text);
-            }
-        }
-    }
-
-    if args.verbose {
-        eprintln!("Messages built.");
-    }
-
-    match maybe_switchable {
-        (true, true) => Ok((primary_messages, secondary_messages)),
-        (false, true) => Ok((primary_messages, secondary_messages)),
-        (true, false) => Ok((primary_messages, None)),
-        (false, false) => Ok((primary_messages, None)),
-    }
-}
-
-/// Build messages from all input sources with context management
-pub async fn build_messages_with_context(
-    args: &Args,
-    context_manager: &ContextManager,
-) -> Result<(VisionMessages, Option<VisionMessages>)> {
-    let mut primary_messages = VisionMessages::new();
-    let mut secondary_messages: Option<VisionMessages> = None;
-
-    // System messages (never summarized)
-    for dir in &args.system_final {
-        let p = latest_file(dir)?;
-        let content = load_skill_context(&p).await?;
-        primary_messages = primary_messages.add_message(TextMessageRole::System, content);
-    }
-
-    for dir in &args.system_cat {
-        let content = concat_files(dir).await?;
-        primary_messages = primary_messages.add_message(TextMessageRole::System, content);
-    }
-
-    // Tool system message
-    if args.tools {
-        if args.verbose {
-            eprintln!("Tools enabled, adding tool instruction message.");
-        }
-        let tool_instructions = format!(
-            "You have access to command execution tools. To spawn a process, provide the binary and arguments: {open_exec}command arg1 arg2 ...{close_exec} (returns index). For long-running processes (daemons, servers, agents), prefix with 'setsid' to detach: {open_exec}setsid command arg1 arg2 ...{close_exec}. To kill: {open_kill}idx{close_kill}. To read output: {open_read}idx{close_read}. To write stdin: {open_writ}idx input text{close_writ} (include \\n in text to send enter/newline). Commands execute immediately and return results. You will need to perform multiple Commands execution tool calls to execute and then read the outputs of commands you executed.",
-            open_exec = crate::CMD_OPEN_EXEC,
-            close_exec = crate::CMD_CLOSE_EXEC,
-            open_kill = crate::CMD_OPEN_KILL,
-            close_kill = crate::CMD_CLOSE_KILL,
-            open_read = crate::CMD_OPEN_READ,
-            close_read = crate::CMD_CLOSE_READ,
-            open_writ = crate::CMD_OPEN_WRIT,
-            close_writ = crate::CMD_CLOSE_WRIT
-        );
-        primary_messages = primary_messages.add_message(TextMessageRole::System, tool_instructions);
-    }
-
-    // Skill reading instruction (always available, not gated by --tools flag)
-    let skill_instructions = format!(
-        "You can read skill files from your context directories using: {open_skill}skill_name{close_skill}. This searches all context directories for files with YAML frontmatter matching the skill name and loads the full content.",
-        open_skill = crate::CMD_OPEN_READ_SKILL,
-        close_skill = crate::CMD_CLOSE_READ_SKILL
-    );
-    primary_messages = primary_messages.add_message(TextMessageRole::System, skill_instructions);
-
-    // Collect all messages with context management
-    let mut timeline: Vec<FileMessage> = Vec::new();
-    let mut video_tasks = Vec::new();
-
-    let sources = [
-        (&args.input_final, "user", false),
-        (&args.input_cat, "user", true),
-        (&args.assistant_final, "assistant", false),
-        (&args.assistant_cat, "assistant", true),
-    ];
-
-    // Track turn offset for each source
+    // Track turn offset for each source if using context manager
     let mut turn_offset = 0;
 
     for (paths, role, concat) in sources {
         for dir in paths {
             if args.verbose {
-                eprintln!(
-                    "adding messages from: {} (with context management)",
-                    dir.display()
-                );
+                if context_manager.is_some() {
+                    eprintln!(
+                        "adding messages from: {} (with context management)",
+                        dir.display()
+                    );
+                } else {
+                    eprintln!("adding messages from: {}", dir.display());
+                }
             }
-            let msgs = load_dir_messages_with_context(
+            let msgs = load_dir_messages(
                 dir,
                 role,
                 concat,
@@ -764,10 +567,14 @@ pub async fn build_messages_with_context(
     timeline.sort_by_key(|msg| msg.metadata.created);
 
     if args.verbose {
-        eprintln!(
-            "Building {} messages with context management.",
-            timeline.len()
-        );
+        if context_manager.is_some() {
+            eprintln!(
+                "Building {} messages with context management.",
+                timeline.len()
+            );
+        } else {
+            eprintln!("Building {} messages.", timeline.len());
+        }
     }
 
     // Route messages to appropriate model slots
@@ -803,7 +610,11 @@ pub async fn build_messages_with_context(
     }
 
     if args.verbose {
-        eprintln!("Messages built with context management.");
+        if context_manager.is_some() {
+            eprintln!("Messages built with context management.");
+        } else {
+            eprintln!("Messages built.");
+        }
     }
 
     match maybe_switchable {

@@ -132,10 +132,6 @@ async fn main() -> Result<()> {
             event = fs_rx.recv() => {
                 match event {
                     Ok(Ok(event)) => {
-                        if args.verbose {
-                            eprintln!("Change detected: {:?}", event);
-                        }
-
                         // Filter filesystem events
                         let is_interrupt = agentgraph::events::is_interrupt_event(
                             &event,
@@ -144,9 +140,6 @@ async fn main() -> Result<()> {
                         );
 
                         if !is_interrupt {
-                            if args.verbose {
-                                eprintln!("Ignoring non-interrupt event: {:?}", event);
-                            }
                             continue;
                         }
 
@@ -161,11 +154,7 @@ async fn main() -> Result<()> {
                         }
 
                         // Drain pending events
-                        while let Ok(ev) = fs_rx.try_recv() {
-                            if args.verbose {
-                                eprintln!("Additional: {:?}", ev);
-                            }
-                        }
+                        while let Ok(_) = fs_rx.try_recv() {}
 
                         println!("Running inference after filesystem change");
 

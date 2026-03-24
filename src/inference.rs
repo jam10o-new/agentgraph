@@ -402,7 +402,7 @@ pub async fn run_once(
 
         let audio_first = std::mem::take(&mut audio_interrupt_pending);
 
-        let (current_primary, current_secondary) = build_messages(args).await?;
+        let (current_primary, current_secondary) = build_messages(args, None).await?;
         let has_sec = current_secondary.is_some() && args.secondary_model != "none";
 
         let primary_slot = if audio_first && has_sec {
