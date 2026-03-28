@@ -48,6 +48,8 @@ pub struct CompressionRequest {
     pub baseline_turn: String,
     /// A single historical turn to check for relevance (turn_number, content)
     pub historical_turn: (usize, String),
+    /// Optional image content for vision-based compression
+    pub image: Option<image::DynamicImage>,
     /// Which model slot to use (Primary for text/vision, Secondary for audio)
     pub model_slot: ModelSlot,
 }
@@ -72,13 +74,21 @@ impl CompressionAgent {
 
     /// Run compression on a historical turn given the baseline
     pub async fn compress(&self, request: CompressionRequest) -> Result<CompressionResponse> {
+        eprintln!("CompressionAgent: Starting compression for turn {}", request.historical_turn.0);
         // Build the user prompt
         let user_prompt = self.build_compression_prompt(&request);
 
         // Build messages for the compression request
-        let messages = VisionMessages::new()
-            .add_message(TextMessageRole::System, COMPRESSION_SYSTEM_PROMPT.to_string())
-            .add_message(TextMessageRole::User, user_prompt);
+        let messages = if let Some(img) = request.image {
+            eprintln!("CompressionAgent: Request includes an image");
+            VisionMessages::new()
+                .add_message(TextMessageRole::System, COMPRESSION_SYSTEM_PROMPT.to_string())
+                .add_image_message(TextMessageRole::User, user_prompt, vec![img])
+        } else {
+            VisionMessages::new()
+                .add_message(TextMessageRole::System, COMPRESSION_SYSTEM_PROMPT.to_string())
+                .add_message(TextMessageRole::User, user_prompt)
+        };
 
         // Set up sampling parameters for deterministic output
         let sampling_params = SamplingParams {
@@ -91,14 +101,22 @@ impl CompressionAgent {
 
         // Run the compression request
         let respondable: RequestBuilder = messages.into();
+        eprintln!("CompressionAgent: Sending chat request...");
         let result = self
             .model
             .send_chat_request(respondable.set_sampling(sampling_params))
             .await
             .context("Compression agent inference failed")?;
 
+        eprintln!("CompressionAgent: Received response, parsing...");
         // Parse the response
-        self.parse_compression_response(&result)
+        let parsed = self.parse_compression_response(&result);
+        if parsed.is_ok() {
+            eprintln!("CompressionAgent: Successfully parsed response");
+        } else {
+            eprintln!("CompressionAgent: Failed to parse response: {:?}", parsed.as_ref().err());
+        }
+        parsed
     }
 
     /// Build the prompt for compression
@@ -228,6 +246,7 @@ mod tests {
         let request = CompressionRequest {
             baseline_turn: "User: Hello\nAssistant: Hi there!".to_string(),
             historical_turn: (1, "User: What is Rust?\nAssistant: Rust is a programming language.".to_string()),
+            image: None,
             model_slot: ModelSlot::Primary,
         };
 

@@ -1,7 +1,7 @@
 //! Message building and file handling for agentgraph.
 
 use crate::Args;
-use crate::context::{ContextManager, LoadStrategy};
+use crate::context::{CompressionAgent, ContextManager, LoadStrategy};
 use crate::types::{ContentType, FileMessage, FileMetadata, MessageContent, ModelSlot};
 use anyhow::{Context, Result};
 use image;
@@ -305,6 +305,7 @@ pub async fn load_dir_messages(
     concat: bool,
     latest_n: usize,
     context_manager: Option<&ContextManager>,
+    compression_agent: Option<&CompressionAgent>,
     message_turn_offset: usize,
 ) -> Result<Vec<FileMessage>> {
     let mut entries: Vec<_> = WalkDir::new(dir)
@@ -360,8 +361,102 @@ pub async fn load_dir_messages(
                         MessageContent::Text(format!("[Video file: {}]", path.display()))
                     }
                 }
+            } else if strategy == LoadStrategy::Compress {
+                if let Some(mgr) = context_manager {
+                    if let Some(summary) = mgr.load_summary(path) {
+                        MessageContent::Text(summary.as_context_string())
+                    } else if let Some(agent) = compression_agent {
+                        // Perform compression on the fly
+                        let bytes = fs::read(path).await?;
+                        let mut image_content = None;
+                        
+                        let content_str = match content_type {
+                            ContentType::Text => String::from_utf8_lossy(&bytes).into_owned(),
+                            ContentType::Image => {
+                                let img = image::load_from_memory(&bytes)
+                                    .with_context(|| format!("Failed to load image for compression: {}", path.display()))?;
+                                image_content = Some(img);
+                                "[IMAGE CONTENT]".to_string()
+                            }
+                            ContentType::Audio => "[AUDIO CONTENT]".to_string(),
+                            ContentType::Video => "[VIDEO CONTENT]".to_string(),
+                        };
+
+                        let request = crate::context::CompressionRequest {
+                            baseline_turn: "Summarize this historical context.".to_string(),
+                            historical_turn: (message_turn, content_str),
+                            image: image_content,
+                            model_slot: ModelSlot::Primary,
+                        };
+
+                        match agent.compress(request).await {
+                            Ok(resp) => {
+                                use crate::context::RelevanceResult;
+                                let summary_text = match resp.relevance {
+                                    RelevanceResult::Snippets { snippets, relevance_reason } => {
+                                        format!("[RELEVANT HISTORICAL CONTENT - {}]:\n{}", 
+                                            relevance_reason, snippets.join("\n"))
+                                    }
+                                    RelevanceResult::MicroSummary { text } => {
+                                        format!("[HISTORICAL SUMMARY]: {}", text)
+                                    }
+                                };
+                                MessageContent::Text(summary_text)
+                            }
+                            Err(_) => {
+                                // Fallback to full content on error
+                                match content_type {
+                                    ContentType::Text => MessageContent::Text(String::from_utf8_lossy(&bytes).into_owned()),
+                                    ContentType::Image => {
+                                        let img = image::load_from_memory(&bytes)
+                                            .with_context(|| format!("Failed to load image: {}", path.display()))?;
+                                        MessageContent::Image(img)
+                                    }
+                                    ContentType::Audio => MessageContent::Audio(bytes),
+                                    ContentType::Video => MessageContent::Text(format!("[Video file: {}]", path.display()))
+                                }
+                            }
+                        }
+                    } else {
+                        // No agent, fallback to full
+                        match content_type {
+                            ContentType::Text => MessageContent::Text(fs::read_to_string(path).await?),
+                            ContentType::Image => {
+                                let bytes = fs::read(path).await?;
+                                let img = image::load_from_memory(&bytes)
+                                    .with_context(|| format!("Failed to load image: {}", path.display()))?;
+                                MessageContent::Image(img)
+                            }
+                            ContentType::Audio => {
+                                let bytes = fs::read(path).await?;
+                                MessageContent::Audio(bytes)
+                            }
+                            ContentType::Video => {
+                                MessageContent::Text(format!("[Video file: {}]", path.display()))
+                            }
+                        }
+                    }
+                } else {
+                    // Fallback
+                    match content_type {
+                        ContentType::Text => MessageContent::Text(fs::read_to_string(path).await?),
+                        ContentType::Image => {
+                            let bytes = fs::read(path).await?;
+                            let img = image::load_from_memory(&bytes)
+                                .with_context(|| format!("Failed to load image: {}", path.display()))?;
+                            MessageContent::Image(img)
+                        }
+                        ContentType::Audio => {
+                            let bytes = fs::read(path).await?;
+                            MessageContent::Audio(bytes)
+                        }
+                        ContentType::Video => {
+                            MessageContent::Text(format!("[Video file: {}]", path.display()))
+                        }
+                    }
+                }
             } else {
-                // For MicroSummary or Compress, we need to get relevance-aware content
+                // For MicroSummary
                 if let Some(summary) = mgr.load_summary(path) {
                     MessageContent::Text(summary.as_context_string())
                 } else {
@@ -454,6 +549,7 @@ pub async fn concat_files(dir: &Path) -> Result<String> {
 pub async fn build_messages(
     args: &Args,
     context_manager: Option<&ContextManager>,
+    compression_agent: Option<&CompressionAgent>,
 ) -> Result<(VisionMessages, Option<VisionMessages>)> {
     let mut primary_messages = VisionMessages::new();
     let mut secondary_messages: Option<VisionMessages> = None;
@@ -529,6 +625,7 @@ pub async fn build_messages(
                 concat,
                 args.latest_n,
                 context_manager,
+                compression_agent,
                 turn_offset,
             )
             .await?;
@@ -578,10 +675,14 @@ pub async fn build_messages(
     }
 
     // Route messages to appropriate model slots
+    let mut primary_count = 0;
+    let mut primary_image_count = 0;
     let mut maybe_switchable = (false, false);
     for msg in timeline {
         if let Some((text, images, _)) = msg.format_for_model(ModelSlot::Primary) {
+            primary_count += 1;
             if let Some(images) = images {
+                primary_image_count += images.len();
                 primary_messages =
                     primary_messages.add_image_message(to_mistral_role(&msg.role), text, images);
                 maybe_switchable = (true, maybe_switchable.1 || false);
@@ -610,10 +711,12 @@ pub async fn build_messages(
     }
 
     if args.verbose {
+        eprintln!(
+            "Messages built. Primary: {} messages ({} images)",
+            primary_count, primary_image_count
+        );
         if context_manager.is_some() {
             eprintln!("Messages built with context management.");
-        } else {
-            eprintln!("Messages built.");
         }
     }
 

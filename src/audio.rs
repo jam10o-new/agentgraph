@@ -100,11 +100,31 @@ pub async fn spawn_realtime_listener(
             };
 
             let tx = audio_tx.clone();
+            let sample_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let last_log = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            
             let stream = device.build_input_stream(
                 config.into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mut non_zero = 0;
+                    for &s in data {
+                        if s.abs() > 0.00001 {
+                            non_zero += 1;
+                        }
+                    }
+                    let total = sample_count.fetch_add(non_zero, std::sync::atomic::Ordering::SeqCst) + non_zero;
+                    let last = last_log.load(std::sync::atomic::Ordering::SeqCst);
+                    if total > last + 48000 { // Log every ~1 second of audio
+                        eprintln!("Audio callback: Captured {} non-zero samples total", total);
+                        last_log.store(total, std::sync::atomic::Ordering::SeqCst);
+                    }
+
                     let bytes: &[u8] = bytemuck::cast_slice(data);
-                    let _ = tx.try_send(bytes.to_vec());
+                    let vec_bytes = bytes.to_vec();
+                    if let Err(e) = tx.try_send(vec_bytes) {
+                        // This might be noisy, but good for debugging if channel is full or disconnected
+                        // eprintln!("Audio callback: try_send failed: {:?}", e);
+                    }
                 },
                 |err| eprintln!("Audio stream error: {}", err),
                 None,
@@ -122,6 +142,7 @@ pub async fn spawn_realtime_listener(
                 eprintln!("Failed to start audio stream: {}", e);
                 return;
             }
+            eprintln!("Audio callback: stream.play() called successfully");
 
             let _ = shutdown_rx_blocking.recv();
         });
@@ -130,24 +151,32 @@ pub async fn spawn_realtime_listener(
         let mut chunk_start = std::time::Instant::now();
         let mut current_chunk_duration = rand::rng().random_range(min_duration..=max_duration);
         let mut accumulated_buffer = Vec::new();
+        eprintln!("Audio listener: Main loop starting, target duration: {}ms", current_chunk_duration.as_millis());
 
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
+                    eprintln!("Audio listener: Shutdown received");
                     let _ = shutdown_tx_blocking.send(());
                     break;
                 }
                 result = audio_rx.recv_async() => {
                     match result {
                         Ok(bytes) => {
+                            if accumulated_buffer.is_empty() {
+                                // eprintln!("Audio listener: Receiving data from channel");
+                            }
                             accumulated_buffer.extend_from_slice(&bytes);
 
                             if chunk_start.elapsed() >= current_chunk_duration {
+                                eprintln!("Audio listener: Chunk duration reached ({}ms), buffer size: {} bytes", 
+                                    chunk_start.elapsed().as_millis(), accumulated_buffer.len());
                                 if !accumulated_buffer.is_empty() {
                                     let model_clone = model_clone.clone();
                                     let speech_detected_tx = speech_detected_tx.clone();
                                     let chunk = accumulated_buffer.clone();
                                     let tx_clone = chunk_tx.clone();
+                                    eprintln!("Audio listener: Spawning detect_speech task");
                                     tokio::spawn(async move {
                                         let mut wav = create_wav_header(chunk.len()).to_vec();
                                         wav.append(&mut chunk.clone());
@@ -195,18 +224,27 @@ pub async fn detect_speech(
     model: &mistralrs::Model,
     audio_model_id: &str,
 ) -> Result<bool> {
+    eprintln!("detect_speech: Processing chunk of {} bytes", audio_chunk.len());
+    
     if !model
         .is_model_loaded(audio_model_id)
         .context("Failed to check secondary model load state")?
     {
+        eprintln!("detect_speech: Secondary model {} not loaded, reloading...", audio_model_id);
         model
             .reload_model(audio_model_id)
             .await
             .context("Failed to reload secondary model")?;
+        eprintln!("detect_speech: Secondary model reloaded");
     }
 
-    let audio = mistralrs::AudioInput::from_bytes(audio_chunk)
-        .context("Failed to create AudioInput from bytes")?;
+    let audio = match mistralrs::AudioInput::from_bytes(audio_chunk) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("detect_speech: Failed to create AudioInput from bytes: {:?}", e);
+            return Err(anyhow::anyhow!("Failed to create AudioInput: {}", e));
+        }
+    };
 
     let messages = VisionMessages::new().add_multimodal_message(
         TextMessageRole::User,
@@ -215,11 +253,12 @@ pub async fn detect_speech(
         vec![audio],
     );
 
+    eprintln!("detect_speech: Sending request to secondary model...");
     let response = model
         .send_chat_request_with_model(messages, Some(audio_model_id))
         .await
         .map_err(|e| {
-            eprintln!("Full error from mistralrs: {:?}", e);
+            eprintln!("detect_speech: Full error from mistralrs: {:?}", e);
             anyhow::anyhow!("Speech detection request failed: {}", e)
         })?;
 
@@ -230,5 +269,14 @@ pub async fn detect_speech(
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
 
-    Ok(content.contains("true"))
+    eprintln!("detect_speech: Model response: {:?}", content);
+
+    let detected = content.contains("true");
+    if detected {
+        eprintln!("detect_speech: Speech DETECTED");
+    } else {
+        eprintln!("detect_speech: No speech detected");
+    }
+
+    Ok(detected)
 }

@@ -124,6 +124,11 @@ pub struct Args {
     pub output_new: Option<PathBuf>,
 
     /// Each assistant response clears and overwrites this file
-    #[arg(short = 'o')]
+    #[arg(short = 'o', long)]
     pub output_overwrite: Option<PathBuf>,
-}
+
+    /// Enable context compression
+    #[arg(long)]
+    pub compress_context: bool,
+    }
+

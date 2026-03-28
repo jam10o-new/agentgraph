@@ -51,61 +51,8 @@ combined weight footprint exhausts the 24 GB budget under concurrent load.
 
 ### Description
 
-~~After Agent B produces its first output (stream-realtime mode, `-O
-agent_b/output/`), the `Close(Write)` event on the completed output file
-triggers Agent A to run inference again even though no new screenshot has
-arrived. This repeats on every Agent B completion, creating a sustained
-inference loop between the two agents.~~
-
 The feedback loop between agents has been resolved. Agent B's output files no
 longer trigger spurious re-inference in Agent A.
-
-### Root cause
-
-The root cause was twofold:
-
-1. **Leader election bug**: `find_oldest_pipe` was considering ANY alive process
-   as a potential leader, including newer processes with higher PIDs. This caused
-   non-leader agents to incorrectly forward requests and create circular event flows.
-
-2. **Path matching bug**: `is_interrupt_event` used exact path matching (`contains()`)
-   instead of prefix matching (`starts_with()`), causing all events to pass the filter
-   and trigger spurious inferences.
-
-3. **Missing event filtering in main loop**: The main event loop was triggering
-   inference for ALL filesystem events without checking relevance via
-   `is_interrupt_event`.
-
-### Resolution
-
-Fixed in 2026-03-18 session:
-
-1. **Fixed leader election**: `find_oldest_pipe` now only considers processes with
-   LOWER PIDs (older processes) as leader candidates.
-
-2. **Fixed path matching**: Changed from `contains()` to `starts_with()` to properly
-   check if event paths are children of watched directories.
-
-3. **Added main loop filtering**: Main loop now calls `is_interrupt_event` before
-   triggering inference.
-
-4. **Added Modify event debouncing**: `Create` and `Close(Write)` events now update
-   the debounce timer, preventing subsequent `Modify` events from triggering.
-
-5. **Filtered Modify events during streaming**: Running inference now only interrupts
-   on `Create` and `Close(Write)` events, not `Modify` events.
-
-### Known non-cause
-
-This is **not** the token-per-write `Modify` storm from KI-003 (which was
-fixed). The events are `Close(Write)` on distinct files, one per inference
-completion.
-
-### Related code
-
-- `fn is_interrupt_event` — `src/main.rs` (lines ~1988-2030)
-- `async fn find_oldest_pipe` — `src/main.rs` (lines ~2135-2155)
-- `async fn main` — watcher subscription loop — `src/main.rs` (lines ~2265-2320)
 
 ---
 
@@ -121,79 +68,101 @@ The vision agent produces 2-3 output files per screenshot instead of 1. The
 leader (screenshot agent) correctly produces 1 output, but the vision agent
 outputs are duplicated.
 
-### Observed behavior
-
-```
-Screenshot outputs: 1
-Vision outputs: 2-3
-Summary outputs: 2-3
-```
-
 ### Root cause (suspected)
 
 The vision agent receives the screenshot file creation event and triggers
 inference. Both the `Create` event and the subsequent `Close(Write)` event
 pass `is_interrupt_event` filtering, causing two separate inference requests
-to be sent to the leader. The 250ms debounce window may not be sufficient if
-the file write completes quickly.
+to be sent to the leader.
 
 ### Preferred resolution path
 
 1. Only trigger inference on `Close(Write)` events for file completion, not on
-   `Create` events (which fire before file content is written).
-2. Alternatively, increase the debounce window or implement per-file debounce
-   tracking.
-
-### Related code
-
-- `fn is_interrupt_event` — `src/main.rs`
-- Main event loop — `src/main.rs`
+   `Create` events.
 
 ---
 
 ## KI-006 — Audio test: Potential audio parsing failures
 
 **Test:** `test_audio/`
-**Status:** Unknown — needs testing
-**Severity:** High — may block audio pipeline functionality
+**Status:** Open
+**Severity:** High — audio pipeline fails with NO_AUDIO_DETECTED
 
 ### Description
 
-The audio test has not been successfully run to completion. Potential issues
-include:
+The audio test fails even when audio should be present. Agent A outputs
+`[AUDIO_STATUS]: NO_AUDIO_DETECTED`.
 
-1. CUDA OOM during speech detection (KI-001)
-2. Audio format parsing failures
-3. PipeWire audio capture issues
+---
+
+## KI-007 — Vision pipeline: Infinite loop of empty outputs
+
+**Test:** `test_vision/`
+**Status:** **New Regression** (2026-03-28)
+**Severity:** High — blocks vision pipeline
+
+### Description
+
+During the vision test, the model (specifically Qwen3.5-9B) enters an infinite
+loop of emitting empty content chunks. This differs from filesystem-driven
+loops; the inference coroutine itself keeps receiving `Some(chunk)` from the
+stream where `delta.content` is `None` or empty, preventing the stream from
+closing and blocking the agent.
+
+### Root cause
+
+Likely related to how Qwen3.5-9B handles multimodal inputs when its internal
+limits (sequence length or image count) are approached or when the prompt
+formatting (e.g. empty text turns with images) causes the model to stall.
 
 ### Preferred resolution path
 
-1. Run `test_audio/run_test.sh` with verbose logging
-2. Check for `AUDIO_PARSE_FAILED` or speech detection errors in logs
-3. If OOM persists, reduce Voxtral quantization from Q4K to Q2K/Q3K in
-   `load_model` function
+1. Implement a "patience" counter or max-empty-chunks limit in
+   `run_inference_coroutine` to forcefully terminate streams that are not
+   producing tokens.
+2. Investigate if `mistral-rs` device mapping for this model can be tuned to
+   avoid this state.
 
 ### Related code
 
-- `async fn detect_speech` — `src/main.rs`
-- `async fn load_model` — secondary model ISQ configuration
-- `async fn spawn_realtime_listener` — `src/main.rs`
+- `async fn run_inference_coroutine` — `src/inference.rs`
+- `pub fn extract_content` — `src/inference.rs`
+
+---
+
+## KI-008 — Primary model: Image history regression
+
+**Test:** `run_multi_diagnostics.py`
+**Status:** **Open** (2026-03-28)
+**Severity:** High — prevents use of image history with default model
+
+### Description
+
+The default model (Qwen3.5-9B) fails to produce output when multiple images are
+present in the history. Diagnostics show that while Qwen3-VL-8B can handle 2+
+images, Qwen3.5-9B (under current `mistral-rs` loading) defaults to
+`max_num_images: 1`.
+
+### Resolution Attempt
+
+Context compression was implemented to convert older images to text summaries
+using the primary model as a specialist agent. However, this has not yet
+resolved the stall/infinite loop described in KI-007.
+
+### Related code
+
+- `src/messages.rs` — `load_dir_messages` compression logic
+- `src/context/compression.rs` — `CompressionAgent`
+- `src/model.rs` — `load_model` (missing `with_max_num_images` configuration)
 
 ---
 
 ## KI-003 — *(Fixed)* Agent-to-agent `--stream-realtime` feedback storm
 
-**Status:** Fixed in this session
-**Fix:** Removed `--stream-realtime` from agent-to-agent nodes in test scripts;
-changed `is_interrupt_event` to debounce `Modify` events via `sleep_ms`
-cooldown; added `Close(Write)` as the primary clean-completion trigger.
+**Status:** Fixed
 
 ---
 
 ## KI-004 — *(Fixed)* Realtime audio listener tied to single inference lifetime
 
-**Status:** Fixed in this session
-**Fix:** Lifted `spawn_realtime_listener` from inside `run_once` to the `main`
-loop, giving the PipeWire connection process-lifetime. Added a
-speech-detection arm to the main `tokio::select!` that enqueues audio chunks
-and triggers inference independently of filesystem events.
+**Status:** Fixed

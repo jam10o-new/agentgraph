@@ -124,6 +124,7 @@ impl ContextMessage {
         let request = CompressionRequest {
             baseline_turn: baseline_turn.to_string(),
             historical_turn: (self.turn, self.content.clone()),
+            image: None, // ContextMessage content is currently String-only
             model_slot,
         };
 

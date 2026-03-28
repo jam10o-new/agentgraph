@@ -61,7 +61,7 @@ pub async fn load_model(args: &Args) -> Result<mistralrs::Model> {
     }
     let model = builder.build().await?;
     if args.verbose {
-        eprintln!("Models Built");
+        eprintln!("Models Built and Ready");
     }
     Ok(model)
 }

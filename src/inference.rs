@@ -13,7 +13,10 @@ use crate::types::{
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use mistralrs::{RequestBuilder, SamplingParams, TextMessageRole};
+use mistralrs::{
+    ChatCompletionChunkResponse, ChunkChoice, Delta, RequestBuilder,
+    RequestLike, ResponseOk, SamplingParams, TextMessageRole,
+};
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -23,8 +26,6 @@ use tokio::sync::watch;
 
 /// Extract content from mistralrs response chunk
 pub fn extract_content(chunk: mistralrs::Response) -> anyhow::Result<String> {
-    use mistralrs::{ChatCompletionChunkResponse, ChunkChoice, Delta, ResponseOk};
-
     match chunk.as_result() {
         Ok(ResponseOk::Chunk(ChatCompletionChunkResponse { choices, .. })) => {
             if let Some(ChunkChoice {
@@ -41,8 +42,14 @@ pub fn extract_content(chunk: mistralrs::Response) -> anyhow::Result<String> {
                 Ok(String::new())
             }
         }
-        Ok(other) => Ok(format!("{:?}", other)),
-        Err(e) => Err(anyhow::anyhow!("{}", e)),
+        Ok(other) => {
+            eprintln!("extract_content: Received non-chunk response: {:?}", other);
+            Ok(format!("{:?}", other))
+        }
+        Err(e) => {
+            eprintln!("extract_content: Received error: {:?}", e);
+            Err(anyhow::anyhow!("{}", e))
+        }
     }
 }
 
@@ -72,14 +79,20 @@ async fn run_inference_coroutine(
     let stream_result = match params.model_slot {
         ModelSlot::Primary => {
             let respondable: RequestBuilder = params.messages.into();
-            eprintln!("run_inference_coroutine: Primary model request created");
+            eprintln!(
+                "run_inference_coroutine: Primary model request created with {} messages",
+                respondable.messages_ref().len()
+            );
             model
                 .stream_chat_request(respondable.set_sampling(sampling_params))
                 .await
         }
         ModelSlot::Secondary => {
             let respondable: RequestBuilder = params.messages.into();
-            eprintln!("run_inference_coroutine: Secondary model request created");
+            eprintln!(
+                "run_inference_coroutine: Secondary model request created with {} messages",
+                respondable.messages_ref().len()
+            );
             model
                 .stream_chat_request_with_model(
                     respondable.set_sampling(sampling_params),
@@ -88,6 +101,11 @@ async fn run_inference_coroutine(
                 .await
         }
     };
+
+    match &stream_result {
+        Ok(_) => eprintln!("run_inference_coroutine: stream_chat_request returned Ok"),
+        Err(e) => eprintln!("run_inference_coroutine: stream_chat_request returned Err: {:?}", e),
+    }
 
     eprintln!("run_inference_coroutine: stream_chat_request returned");
     let mut stream = match stream_result {
@@ -102,27 +120,49 @@ async fn run_inference_coroutine(
     };
 
     let mut buffer = String::new();
+    let mut empty_chunk_count = 0;
+    const MAX_EMPTY_CHUNKS: usize = 100; // Force terminate if model stalls
+
+    eprintln!("run_inference_coroutine: Entering select! loop");
     loop {
         tokio::select! {
             chunk_opt = stream.next() => {
                 match chunk_opt {
                     Some(chunk) => {
+                        // eprintln!("run_inference_coroutine: Received chunk from stream");
                         match extract_content(chunk) {
                             Ok(content) if !content.is_empty() => {
+                                empty_chunk_count = 0; // Reset patience
+                                if args.verbose {
+                                    eprintln!("run_inference_coroutine: Extracted content ({} chars): {:?}", content.len(), content);
+                                }
                                 if let Some(ref tx) = token_tx {
                                     let _ = tx.send(content.clone());
                                 }
                                 buffer.push_str(&content);
                             }
-                            Ok(_) => {}
-                            Err(e) => return CoroutineResponse::Error(e),
+                            Ok(_) => {
+                                empty_chunk_count += 1;
+                                if empty_chunk_count > MAX_EMPTY_CHUNKS {
+                                    eprintln!("run_inference_coroutine: Model stalled ({} empty chunks), force terminating stream.", empty_chunk_count);
+                                    return CoroutineResponse::Complete(buffer);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("run_inference_coroutine: extract_content error: {:?}", e);
+                                return CoroutineResponse::Error(e);
+                            }
                         }
                     }
-                    None => return CoroutineResponse::Complete(buffer),
+                    None => {
+                        eprintln!("run_inference_coroutine: Stream closed (Complete)");
+                        return CoroutineResponse::Complete(buffer);
+                    }
                 }
             }
             result = cancel_rx.changed() => {
                 if result.is_ok() && *cancel_rx.borrow() {
+                    eprintln!("run_inference_coroutine: Cancelled");
                     return CoroutineResponse::Interrupted(buffer);
                 }
             }
@@ -394,6 +434,20 @@ pub async fn run_once(
     let mut pending_system_message: Option<String> = None;
     let tool_context: String = String::new();
 
+    // Initialize context management if enabled
+    let context_manager = if args.compress_context {
+        let cache_dir = std::env::current_dir()?.join(".agentgraph_cache");
+        Some(crate::context::ContextManager::new(cache_dir))
+    } else {
+        None
+    };
+
+    let compression_agent = if args.compress_context {
+        Some(crate::context::CompressionAgent::new(model.clone()))
+    } else {
+        None
+    };
+
     'restart_loop: loop {
         restart_count += 1;
         if args.verbose && restart_count > 1 {
@@ -402,7 +456,8 @@ pub async fn run_once(
 
         let audio_first = std::mem::take(&mut audio_interrupt_pending);
 
-        let (current_primary, current_secondary) = build_messages(args, None).await?;
+        let (current_primary, current_secondary) =
+            build_messages(args, context_manager.as_ref(), compression_agent.as_ref()).await?;
         let has_sec = current_secondary.is_some() && args.secondary_model != "none";
 
         let primary_slot = if audio_first && has_sec {
