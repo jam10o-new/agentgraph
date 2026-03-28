@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use mistralrs::{
-    ChatCompletionChunkResponse, ChunkChoice, Delta, RequestBuilder,
-    RequestLike, ResponseOk, SamplingParams, TextMessageRole,
+    ChatCompletionChunkResponse, ChunkChoice, Delta, RequestBuilder, RequestLike, ResponseOk,
+    SamplingParams, TextMessageRole,
 };
 use std::sync::Arc;
 use tokio::fs::File;
@@ -104,7 +104,10 @@ async fn run_inference_coroutine(
 
     match &stream_result {
         Ok(_) => eprintln!("run_inference_coroutine: stream_chat_request returned Ok"),
-        Err(e) => eprintln!("run_inference_coroutine: stream_chat_request returned Err: {:?}", e),
+        Err(e) => eprintln!(
+            "run_inference_coroutine: stream_chat_request returned Err: {:?}",
+            e
+        ),
     }
 
     eprintln!("run_inference_coroutine: stream_chat_request returned");
@@ -133,9 +136,6 @@ async fn run_inference_coroutine(
                         match extract_content(chunk) {
                             Ok(content) if !content.is_empty() => {
                                 empty_chunk_count = 0; // Reset patience
-                                if args.verbose {
-                                    eprintln!("run_inference_coroutine: Extracted content ({} chars): {:?}", content.len(), content);
-                                }
                                 if let Some(ref tx) = token_tx {
                                     let _ = tx.send(content.clone());
                                 }
@@ -519,10 +519,8 @@ pub async fn run_once(
 
             let mut synth_msgs = synth_params.messages.clone();
             if !synth_params.system_addendum.is_empty() {
-                synth_msgs = synth_msgs.add_message(
-                    TextMessageRole::Tool,
-                    synth_params.system_addendum.clone(),
-                );
+                synth_msgs = synth_msgs
+                    .add_message(TextMessageRole::Tool, synth_params.system_addendum.clone());
             }
             // Add pending system message about subprocesses
             if let Some(ref sys_msg) = pending_system_message {
@@ -663,10 +661,8 @@ pub async fn run_once(
             }
             let mut msgs = synth_params.messages.clone();
             if !synth_params.system_addendum.is_empty() {
-                msgs = msgs.add_message(
-                    TextMessageRole::Tool,
-                    synth_params.system_addendum.clone(),
-                );
+                msgs =
+                    msgs.add_message(TextMessageRole::Tool, synth_params.system_addendum.clone());
             }
             // Add pending system message about subprocesses
             if let Some(ref sys_msg) = pending_system_message {

@@ -160,47 +160,45 @@ pub async fn spawn_realtime_listener(
                     let _ = shutdown_tx_blocking.send(());
                     break;
                 }
-                result = audio_rx.recv_async() => {
-                    match result {
-                        Ok(bytes) => {
-                            if accumulated_buffer.is_empty() {
-                                // eprintln!("Audio listener: Receiving data from channel");
-                            }
-                            accumulated_buffer.extend_from_slice(&bytes);
-
-                            if chunk_start.elapsed() >= current_chunk_duration {
-                                eprintln!("Audio listener: Chunk duration reached ({}ms), buffer size: {} bytes", 
-                                    chunk_start.elapsed().as_millis(), accumulated_buffer.len());
-                                if !accumulated_buffer.is_empty() {
-                                    let model_clone = model_clone.clone();
-                                    let speech_detected_tx = speech_detected_tx.clone();
-                                    let chunk = accumulated_buffer.clone();
-                                    let tx_clone = chunk_tx.clone();
-                                    eprintln!("Audio listener: Spawning detect_speech task");
-                                    tokio::spawn(async move {
-                                        let mut wav = create_wav_header(chunk.len()).to_vec();
-                                        wav.append(&mut chunk.clone());
-                                        match detect_speech(&wav, &model_clone, MODEL_SECONDARY).await {
-                                            Ok(true) => {
-                                                let _ = speech_detected_tx.send(());
-                                                let _ = tx_clone.send(wav.to_vec()).await;
-                                            }
-                                            Ok(false) => {}
-                                            Err(e) => {
-                                                eprintln!("Speech detection error: {}", e);
-                                            }
-                                        }
-                                    });
-
-                                    accumulated_buffer.clear();
-                                    chunk_start = std::time::Instant::now();
-                                    current_chunk_duration = rand::rng()
-                                        .random_range(min_duration..=max_duration);
-                                }
-                            }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    while let Ok(bytes) = audio_rx.try_recv() {
+                        if accumulated_buffer.is_empty() {
+                            eprintln!("Audio listener: Receiving data from channel");
                         }
-                        Err(flume::RecvError::Disconnected) => {
-                            break;
+                        accumulated_buffer.extend_from_slice(&bytes);
+                    }
+
+                    if chunk_start.elapsed() >= current_chunk_duration {
+                        if !accumulated_buffer.is_empty() {
+                            eprintln!("Audio listener: Chunk duration reached ({}ms), buffer size: {} bytes", 
+                                chunk_start.elapsed().as_millis(), accumulated_buffer.len());
+                            let model_clone = model_clone.clone();
+                            let speech_detected_tx = speech_detected_tx.clone();
+                            let chunk = accumulated_buffer.clone();
+                            let tx_clone = chunk_tx.clone();
+                            eprintln!("Audio listener: Spawning detect_speech task");
+                            tokio::spawn(async move {
+                                let mut wav = create_wav_header(chunk.len()).to_vec();
+                                wav.append(&mut chunk.clone());
+                                match detect_speech(&wav, &model_clone, MODEL_SECONDARY).await {
+                                    Ok(true) => {
+                                        let _ = speech_detected_tx.send(());
+                                        let _ = tx_clone.send(wav.to_vec()).await;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        eprintln!("Speech detection error: {}", e);
+                                    }
+                                }
+                            });
+
+                            accumulated_buffer.clear();
+                            chunk_start = std::time::Instant::now();
+                            current_chunk_duration = rand::rng()
+                                .random_range(min_duration..=max_duration);
+                        } else {
+                            // Reset timer even if empty to avoid immediate fire next time
+                            chunk_start = std::time::Instant::now();
                         }
                     }
                 }
