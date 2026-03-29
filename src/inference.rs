@@ -304,7 +304,18 @@ pub async fn run_streaming_loop(
                     }
                 }
                 return match result {
-                    CoroutineResponse::Complete(_) => Ok(StreamOutcome::Complete(response)),
+                    CoroutineResponse::Complete(_) => {
+                        // USER IDEA: If inference ends and we have a fresh audio chunk waiting, 
+                        // treat it as an interrupt instead of completion.
+                        if let Some(audio) = latest_audio_rx.borrow().clone() {
+                            if args.verbose {
+                                eprintln!("run_streaming_loop: Inference complete but audio pending, treating as interrupt.");
+                            }
+                            Ok(StreamOutcome::AudioInterrupted { response, audio: Some(audio) })
+                        } else {
+                            Ok(StreamOutcome::Complete(response))
+                        }
+                    }
                     CoroutineResponse::Interrupted(_) => Ok(StreamOutcome::FsInterrupted { response, event: None }),
                     CoroutineResponse::Error(e) => Err(e),
                 };
