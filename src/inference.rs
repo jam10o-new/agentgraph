@@ -243,13 +243,14 @@ pub async fn run_streaming_loop(
     params: ParallelInferenceParams,
     realtime_file: &mut Option<File>,
     stream_realtime: bool,
-    speech_detected_rx: &mut Option<broadcast::Receiver<()>>,
+    audio_is_active: Option<Arc<std::sync::atomic::AtomicBool>>,
     interrupt_rx: &mut Option<broadcast::Receiver<Result<notify::Event, Arc<notify::Error>>>>,
     latest_audio_rx: &watch::Receiver<Option<Vec<u8>>>,
     subprocesses: &mut Vec<crate::types::CommandIO>,
     args: &Args,
 ) -> Result<StreamOutcome> {
     use crate::events::is_interrupt_event;
+    use std::sync::atomic::Ordering;
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (token_tx, mut token_rx) = unbounded_channel::<String>();
@@ -287,8 +288,6 @@ pub async fn run_streaming_loop(
                         }
                     }
                     if let Some(cmd) = cmd {
-                        // Execute command but don't inject feedback into response
-                        // This prevents the model from hallucinating command result continuations
                         let _ = execute_command(cmd, subprocesses, &mut tool_context, args).await;
                         return Ok(StreamOutcome::CommandExecuted(response));
                     }
@@ -303,27 +302,35 @@ pub async fn run_streaming_loop(
                         }
                     }
                 }
-                return match result {
-                    CoroutineResponse::Complete(_) => {
-                        // USER IDEA: If inference ends and we have a fresh audio chunk waiting, 
-                        // treat it as an interrupt instead of completion.
-                        if let Some(audio) = latest_audio_rx.borrow().clone() {
+
+                if let CoroutineResponse::Complete(resp) = result {
+                    // completion guard: if audio is still "hot", wait instead of returning.
+                    if let Some(ref active) = audio_is_active {
+                        if active.load(Ordering::SeqCst) {
                             if args.verbose {
-                                eprintln!("run_streaming_loop: Inference complete but audio pending, treating as interrupt.");
+                                eprintln!("run_streaming_loop: Inference finished but audio is active, waiting...");
                             }
-                            Ok(StreamOutcome::AudioInterrupted { response, audio: Some(audio) })
-                        } else {
-                            Ok(StreamOutcome::Complete(response))
+                            continue;
                         }
                     }
-                    CoroutineResponse::Interrupted(_) => Ok(StreamOutcome::FsInterrupted { response, event: None }),
-                    CoroutineResponse::Error(e) => Err(e),
-                };
+
+                    // Final check for a fresh chunk that arrived just as we finished
+                    if let Some(audio) = latest_audio_rx.borrow().clone() {
+                        if args.verbose {
+                            eprintln!("run_streaming_loop: Inference complete but audio pending, treating as interrupt.");
+                        }
+                        return Ok(StreamOutcome::AudioInterrupted { response, audio: Some(audio) });
+                    }
+                    return Ok(StreamOutcome::Complete(resp));
+                }
+                if let CoroutineResponse::Interrupted(_) = result {
+                    return Ok(StreamOutcome::FsInterrupted { response, event: None });
+                }
+                if let CoroutineResponse::Error(e) = result {
+                    return Err(e);
+                }
             }
             Some(tok) = token_rx.recv() => {
-                if args.verbose {
-                    eprintln!("run_streaming_loop: Received token: {:?}", tok);
-                }
                 let (out, cmd, _) = cmd_parser.process(&tok);
                 response.push_str(&out);
                 if stream_realtime {
@@ -333,21 +340,20 @@ pub async fn run_streaming_loop(
                     }
                 }
                 if let Some(cmd) = cmd {
-                    // Execute command but don't inject feedback into response
-                    // This prevents the model from hallucinating command result continuations
                     let _ = execute_command(cmd, subprocesses, &mut tool_context, args).await;
                     return Ok(StreamOutcome::CommandExecuted(response));
                 }
             }
-            _ = async {
-                if let Some(ref mut rx) = *speech_detected_rx {
-                    rx.recv().await.ok()
-                } else {
-                    std::future::pending::<Option<()>>().await
-                }
+            // Watch for new audio chunks as the primary interrupt source
+            _ = {
+                let mut rx = latest_audio_rx.clone();
+                async move { rx.changed().await }
             } => {
                 let _ = cancel_tx.send(true);
                 let audio = latest_audio_rx.borrow().clone();
+                if args.verbose {
+                    eprintln!("run_streaming_loop: Audio chunk detected, interrupting.");
+                }
                 return Ok(StreamOutcome::AudioInterrupted { response, audio });
             }
             event = async {
@@ -358,9 +364,7 @@ pub async fn run_streaming_loop(
                 }
             } => {
                 if let Some(Ok(ev)) = event {
-                    if is_interrupt_event(&ev, &mut last_modify_interrupt, &args)
-                        && !matches!(&ev.kind, notify::EventKind::Modify(_))
-                    {
+                    if is_interrupt_event(&ev, &mut last_modify_interrupt, &args) {
                         let _ = cancel_tx.send(true);
                         return Ok(StreamOutcome::FsInterrupted { response, event: Some(ev) });
                     }
@@ -375,7 +379,8 @@ pub async fn run_once(
     model: &Arc<mistralrs::Model>,
     args: &Args,
     mut interrupt_rx: Option<broadcast::Receiver<Result<notify::Event, Arc<notify::Error>>>>,
-    audio_channels: Option<(broadcast::Receiver<()>, watch::Receiver<Option<Vec<u8>>>)>,
+    audio_channel: Option<watch::Receiver<Option<Vec<u8>>>>,
+    audio_is_active: Option<Arc<std::sync::atomic::AtomicBool>>,
     pending_audio: Vec<Vec<u8>>,
 ) -> Result<()> {
     use crate::events::handle_interrupt;
@@ -426,14 +431,11 @@ pub async fn run_once(
         None
     };
 
-    let (mut speech_detected_rx, latest_audio_rx): (
-        Option<broadcast::Receiver<()>>,
-        watch::Receiver<Option<Vec<u8>>>,
-    ) = match audio_channels {
-        Some((sdr, lar)) => (Some(sdr), lar),
+    let latest_audio_rx: watch::Receiver<Option<Vec<u8>>> = match audio_channel {
+        Some(lar) => lar,
         None => {
             let (_, rx) = watch::channel::<Option<Vec<u8>>>(None);
-            (None, rx)
+            rx
         }
     };
 
@@ -570,7 +572,7 @@ pub async fn run_once(
                 streaming_params,
                 &mut realtime_file,
                 stream_realtime,
-                &mut speech_detected_rx,
+                audio_is_active.clone(),
                 &mut interrupt_rx,
                 &latest_audio_rx,
                 &mut subprocesses,
@@ -701,7 +703,7 @@ pub async fn run_once(
                 streaming_params,
                 &mut realtime_file,
                 stream_realtime,
-                &mut speech_detected_rx,
+                audio_is_active.clone(),
                 &mut interrupt_rx,
                 &latest_audio_rx,
                 &mut subprocesses,

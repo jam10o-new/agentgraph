@@ -6,10 +6,11 @@ use crate::Args;
 use crate::types::{MODEL_SECONDARY, RealtimeListener};
 use anyhow::{Context, Result};
 use mistralrs::{TextMessageRole, VisionMessages};
-use rand::{Rng, RngExt};
+use rand::RngExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 /// Create a basic WAV header for a mono 48kHz F32 audio stream
 fn create_wav_header(data_len: usize) -> [u8; 44] {
@@ -52,13 +53,16 @@ pub async fn spawn_realtime_listener(
 
     let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(32);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let (speech_detected_tx, speech_detected_rx) = broadcast::channel(16);
 
     let min_duration = Duration::from_secs_f32(args.audio_chunk_min_secs);
     let max_duration = Duration::from_secs_f32(args.audio_chunk_max_secs);
 
     let (audio_tx, audio_rx) = flume::unbounded::<Vec<u8>>();
     let (shutdown_tx_blocking, shutdown_rx_blocking) = std::sync::mpsc::channel();
+
+    // is_active is true if we have pending data or are currently processing speech
+    let is_active = Arc::new(AtomicBool::new(false));
+    let is_active_loop = is_active.clone();
 
     // 1. Spawn blocking thread for cpal audio capture
     std::thread::spawn(move || {
@@ -88,7 +92,6 @@ pub async fn spawn_realtime_listener(
                 Some(cfg) => cfg,
                 None => {
                     eprintln!("Audio: No supported 48kHz mono F32 input config");
-                    // Fallback to default
                     match device.default_input_config() {
                         Ok(cfg) => cfg,
                         Err(e) => {
@@ -101,26 +104,10 @@ pub async fn spawn_realtime_listener(
         };
 
         let tx = audio_tx.clone();
-        let sample_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let last_log = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let stream = device.build_input_stream(
             config.into(),
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let mut non_zero = 0;
-                for &s in data {
-                    if s.abs() > 0.00001 {
-                        non_zero += 1;
-                    }
-                }
-                let total = sample_count.fetch_add(non_zero, std::sync::atomic::Ordering::SeqCst)
-                    + non_zero;
-                let last = last_log.load(std::sync::atomic::Ordering::SeqCst);
-                if total > last + 48000 {
-                    eprintln!("Audio callback: Captured {} non-zero samples total", total);
-                    last_log.store(total, std::sync::atomic::Ordering::SeqCst);
-                }
-
                 let bytes: &[u8] = bytemuck::cast_slice(data);
                 let _ = tx.send(bytes.to_vec());
             },
@@ -140,65 +127,57 @@ pub async fn spawn_realtime_listener(
             eprintln!("Audio: Failed to start audio stream: {}", e);
             return;
         }
-        eprintln!("Audio callback: stream.play() success");
 
         let _ = shutdown_rx_blocking.recv();
-        eprintln!("Audio callback: shutting down");
     });
 
-    // 2. Spawn the main processing loop as a separate async task
-    let speech_detected_tx_clone = speech_detected_tx.clone();
+    // 2. Spawn the main processing loop
     tokio::spawn(async move {
         let mut chunk_start = std::time::Instant::now();
         let mut current_chunk_duration = rand::rng().random_range(min_duration..=max_duration);
         let mut accumulated_buffer = Vec::new();
-        let mut last_heartbeat = std::time::Instant::now();
         let mut interval = tokio::time::interval(Duration::from_millis(100));
-
-        eprintln!(
-            "Audio listener: Task starting, duration: {}ms",
-            current_chunk_duration.as_millis()
-        );
 
         let mut shutdown_rx = shutdown_rx;
 
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
-                    eprintln!("Audio listener: Shutdown received");
                     let _ = shutdown_tx_blocking.send(());
                     break;
                 }
                 _ = interval.tick() => {
-                    if last_heartbeat.elapsed() > Duration::from_secs(5) {
-                        eprintln!("Audio listener: Heartbeat (buffer: {} bytes)", accumulated_buffer.len());
-                        last_heartbeat = std::time::Instant::now();
-                    }
-
+                    let mut received = false;
                     while let Ok(bytes) = audio_rx.try_recv() {
                         accumulated_buffer.extend_from_slice(&bytes);
+                        received = true;
+                    }
+
+                    // If we have data in the buffer, the listener is "active"
+                    if !accumulated_buffer.is_empty() {
+                        is_active_loop.store(true, Ordering::SeqCst);
+                    } else if !received {
+                        is_active_loop.store(false, Ordering::SeqCst);
                     }
 
                     if chunk_start.elapsed() >= current_chunk_duration {
                         if !accumulated_buffer.is_empty() {
-                            eprintln!("Audio listener: Chunk complete ({} bytes)", accumulated_buffer.len());
                             let model_clone = model.clone();
-                            let speech_tx = speech_detected_tx_clone.clone();
                             let chunk = std::mem::take(&mut accumulated_buffer);
                             let tx = chunk_tx.clone();
+                            let is_active_task = is_active_loop.clone();
 
                             tokio::spawn(async move {
+                                is_active_task.store(true, Ordering::SeqCst);
                                 let mut wav = create_wav_header(chunk.len()).to_vec();
                                 wav.extend_from_slice(&chunk);
                                 match detect_speech(&wav, &model_clone, MODEL_SECONDARY).await {
                                     Ok(true) => {
-                                        eprintln!("Audio listener: Speech detected!");
-                                        let _ = speech_tx.send(());
                                         let _ = tx.send(wav).await;
                                     }
-                                    Ok(false) => {}
-                                    Err(e) => eprintln!("Speech detection error: {}", e),
+                                    _ => {}
                                 }
+                                // The loop will handle clearing the flag if no more data is arriving
                             });
                         }
                         chunk_start = std::time::Instant::now();
@@ -209,11 +188,11 @@ pub async fn spawn_realtime_listener(
         }
     });
 
-    Ok(RealtimeListener::new(
+    Ok(RealtimeListener {
         chunk_rx,
         shutdown_tx,
-        speech_detected_rx,
-    ))
+        is_active,
+    })
 }
 
 /// Detect speech in audio chunk
@@ -232,13 +211,8 @@ pub async fn detect_speech(
             .context("Failed to reload secondary model")?;
     }
 
-    let audio = match mistralrs::AudioInput::from_bytes(audio_chunk) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("detect_speech: Failed to create AudioInput: {:?}", e);
-            return Err(anyhow::anyhow!("Failed to create AudioInput: {}", e));
-        }
-    };
+    let audio = mistralrs::AudioInput::from_bytes(audio_chunk)
+        .map_err(|e| anyhow::anyhow!("Failed to create AudioInput: {}", e))?;
 
     let messages = VisionMessages::new().add_multimodal_message(
         TextMessageRole::User,
@@ -250,10 +224,7 @@ pub async fn detect_speech(
     let response = model
         .send_chat_request_with_model(messages, Some(audio_model_id))
         .await
-        .map_err(|e| {
-            eprintln!("detect_speech: request failed: {:?}", e);
-            anyhow::anyhow!("Speech detection failed: {}", e)
-        })?;
+        .map_err(|e| anyhow::anyhow!("Speech detection failed: {}", e))?;
 
     let content = response.choices[0]
         .message

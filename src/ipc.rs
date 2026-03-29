@@ -62,11 +62,6 @@ pub async fn handle_request(
     interrupt_tx: tokio::sync::broadcast::Sender<
         Result<notify::Event, std::sync::Arc<notify::Error>>,
     >,
-    audio_channels: Option<(
-        tokio::sync::broadcast::Receiver<()>,
-        tokio::sync::watch::Receiver<Option<Vec<u8>>>,
-    )>,
-    pending_audio: Vec<Vec<u8>>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -78,8 +73,9 @@ pub async fn handle_request(
                 &model,
                 &req.args,
                 Some(interrupt_rx),
-                audio_channels,
-                pending_audio,
+                None,
+                None,
+                vec![],
             )
             .await;
         }

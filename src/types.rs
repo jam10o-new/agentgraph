@@ -288,19 +288,19 @@ impl Drop for CommandIO {
 pub struct RealtimeListener {
     pub chunk_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
-    pub speech_detected_rx: tokio::sync::broadcast::Receiver<()>,
+    pub is_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RealtimeListener {
     pub fn new(
         chunk_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         shutdown_tx: tokio::sync::oneshot::Sender<()>,
-        speech_detected_rx: tokio::sync::broadcast::Receiver<()>,
+        is_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             chunk_rx,
             shutdown_tx,
-            speech_detected_rx,
+            is_active,
         }
     }
 }

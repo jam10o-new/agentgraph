@@ -105,8 +105,8 @@ async fn main() -> Result<()> {
 
     // Persistent realtime listener
     let mut persistent_listener: Option<(
-        broadcast::Receiver<()>,
         watch::Receiver<Option<Vec<u8>>>,
+        Arc<std::sync::atomic::AtomicBool>,
     )> = None;
     let mut _listener_guard: Option<oneshot::Sender<()>> = None;
     let mut queued_audio: Vec<Vec<u8>> = Vec::new();
@@ -181,14 +181,13 @@ async fn main() -> Result<()> {
                                     match spawn_realtime_listener(source, &args, model.as_ref().unwrap().clone()).await {
                                         Ok(rl) => {
                                             let (latest_audio_tx, latest_audio_rx) = watch::channel::<Option<Vec<u8>>>(None);
-                                            let speech_rx = rl.speech_detected_rx.resubscribe();
                                             let mut chunk_rx = rl.chunk_rx;
                                             tokio::spawn(async move {
                                                 while let Some(chunk) = chunk_rx.recv().await {
                                                     let _ = latest_audio_tx.send(Some(chunk));
                                                 }
                                             });
-                                            persistent_listener = Some((speech_rx, latest_audio_rx));
+                                            persistent_listener = Some((latest_audio_rx, rl.is_active));
                                             _listener_guard = Some(rl.shutdown_tx);
                                             if args.verbose {
                                                 eprintln!("Persistent audio listener spawned.");
@@ -203,16 +202,15 @@ async fn main() -> Result<()> {
                             let lock = inference_lock.clone();
                             let m = model.as_ref().unwrap().clone();
                             let interrupt_tx = fs_tx.clone();
-                            let audio_chans = persistent_listener.as_ref().map(|(sdr, lar)| {
-                                (sdr.resubscribe(), lar.clone())
-                            });
+                            let audio_chan = persistent_listener.as_ref().map(|(lar, _)| lar.clone());
+                            let audio_active = persistent_listener.as_ref().map(|(_, act)| act.clone());
                             let audio_queue = std::mem::take(&mut queued_audio);
                             let req_args = args.clone();
 
                             tokio::spawn(async move {
                                 let _guard = lock.lock().await;
                                 let interrupt_rx = interrupt_tx.subscribe();
-                                let _ = run_once(&m, &req_args, Some(interrupt_rx), audio_chans, audio_queue).await;
+                                let _ = run_once(&m, &req_args, Some(interrupt_rx), audio_chan, audio_active, audio_queue).await;
                             });
                         }
                     }
@@ -244,14 +242,13 @@ async fn main() -> Result<()> {
                             match spawn_realtime_listener(source, &args, model.as_ref().unwrap().clone()).await {
                                 Ok(rl) => {
                                     let (latest_audio_tx, latest_audio_rx) = watch::channel::<Option<Vec<u8>>>(None);
-                                    let speech_rx = rl.speech_detected_rx.resubscribe();
                                     let mut chunk_rx = rl.chunk_rx;
                                     tokio::spawn(async move {
                                         while let Some(chunk) = chunk_rx.recv().await {
                                             let _ = latest_audio_tx.send(Some(chunk));
                                         }
                                     });
-                                    persistent_listener = Some((speech_rx, latest_audio_rx));
+                                    persistent_listener = Some((latest_audio_rx, rl.is_active));
                                     _listener_guard = Some(rl.shutdown_tx);
                                     if args.verbose {
                                         eprintln!("Persistent audio listener spawned.");
@@ -265,22 +262,21 @@ async fn main() -> Result<()> {
                     let m = model.as_ref().unwrap().clone();
                     let lock = inference_lock.clone();
                     let interrupt_tx = fs_tx.clone();
-                    let audio_chans = persistent_listener.as_ref().map(|(sdr, lar)| {
-                        (sdr.resubscribe(), lar.clone())
-                    });
+                    let audio_chan = persistent_listener.as_ref().map(|(lar, _)| lar.clone());
+                    let audio_active = persistent_listener.as_ref().map(|(_, act)| act.clone());
                     let audio_queue = std::mem::take(&mut queued_audio);
 
                     tokio::spawn(async move {
                         let _guard = lock.lock().await;
-                        handle_request(stream, m, interrupt_tx, audio_chans, audio_queue).await;
+                        handle_request(stream, m, interrupt_tx).await;
                     });
                 }
             }
 
             // Audio-triggered inference
             _ = async {
-                if let Some((ref mut sdr, _)) = persistent_listener {
-                    sdr.recv().await.ok().map(|_| ())
+                if let Some((ref mut lar, _)) = persistent_listener {
+                    lar.changed().await.ok().map(|_| ())
                 } else {
                     std::future::pending::<Option<()>>().await
                 }
@@ -288,7 +284,7 @@ async fn main() -> Result<()> {
                 if args.verbose {
                     eprintln!("Speech detected — triggering audio-first inference.");
                 }
-                if let Some((_, ref lar)) = persistent_listener {
+                if let Some((ref lar, _)) = persistent_listener {
                     if let Some(chunk) = lar.borrow().clone() {
                         queued_audio.push(chunk);
                     }
