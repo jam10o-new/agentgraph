@@ -124,7 +124,7 @@ async fn run_inference_coroutine(
 
     let mut buffer = String::new();
     let mut empty_chunk_count = 0;
-    const MAX_EMPTY_CHUNKS: usize = 100; // Force terminate if model stalls
+    const MAX_EMPTY_CHUNKS: usize = 500; // Force terminate if model stalls
 
     eprintln!("run_inference_coroutine: Entering select! loop");
     loop {

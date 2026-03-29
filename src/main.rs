@@ -238,6 +238,7 @@ async fn main() -> Result<()> {
                             eprintln!("Model initialized");
                         }
 
+                        // Spawn persistent audio listener
                         if args.realtime_listener.is_some() && persistent_listener.is_none() {
                             let source = args.realtime_listener.as_ref().unwrap();
                             match spawn_realtime_listener(source, &args, model.as_ref().unwrap().clone()).await {
@@ -283,7 +284,7 @@ async fn main() -> Result<()> {
                 } else {
                     std::future::pending::<Option<()>>().await
                 }
-            }, if inference_lock.try_lock().is_ok() => {
+            }, if persistent_listener.is_some() && inference_lock.try_lock().is_ok() => {
                 if args.verbose {
                     eprintln!("Speech detected — triggering audio-first inference.");
                 }

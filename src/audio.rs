@@ -63,95 +63,96 @@ pub async fn spawn_realtime_listener(
     let max_duration = Duration::from_secs_f32(args.audio_chunk_max_secs);
 
     let model_clone = model.clone();
+    let (audio_tx, audio_rx) = flume::unbounded::<Vec<u8>>();
+    let (shutdown_tx_blocking, shutdown_rx_blocking) = std::sync::mpsc::channel();
 
-    tokio::spawn(async move {
-        let (audio_tx, audio_rx) = flume::bounded::<Vec<u8>>(128);
-        let (shutdown_tx_blocking, shutdown_rx_blocking) = std::sync::mpsc::channel();
-
-        // Spawn blocking thread for cpal audio capture
-        let audio_handle = tokio::task::spawn_blocking(move || {
-            let host = cpal::default_host();
-            let device = match host.default_input_device() {
-                Some(dev) => dev,
-                None => {
-                    eprintln!("No default input device found");
-                    return;
-                }
-            };
-
-            let config = {
-                let mut best = None;
-                for cfg in device.supported_input_configs().unwrap() {
-                    if cfg.channels() == 1 && cfg.sample_format() == cpal::SampleFormat::F32 {
-                        let rate = 48000;
-                        if cfg.min_sample_rate() <= rate && rate <= cfg.max_sample_rate() {
-                            best = Some(cfg.with_sample_rate(rate));
-                            break;
-                        }
-                    }
-                }
-                match best {
-                    Some(cfg) => cfg,
-                    None => {
-                        eprintln!("No supported 48kHz mono F32 input config");
-                        return;
-                    }
-                }
-            };
-
-            let tx = audio_tx.clone();
-            let sample_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let last_log = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            
-            let stream = device.build_input_stream(
-                config.into(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mut non_zero = 0;
-                    for &s in data {
-                        if s.abs() > 0.00001 {
-                            non_zero += 1;
-                        }
-                    }
-                    let total = sample_count.fetch_add(non_zero, std::sync::atomic::Ordering::SeqCst) + non_zero;
-                    let last = last_log.load(std::sync::atomic::Ordering::SeqCst);
-                    if total > last + 48000 { // Log every ~1 second of audio
-                        eprintln!("Audio callback: Captured {} non-zero samples total", total);
-                        last_log.store(total, std::sync::atomic::Ordering::SeqCst);
-                    }
-
-                    let bytes: &[u8] = bytemuck::cast_slice(data);
-                    let vec_bytes = bytes.to_vec();
-                    if let Err(e) = tx.try_send(vec_bytes) {
-                        // This might be noisy, but good for debugging if channel is full or disconnected
-                        // eprintln!("Audio callback: try_send failed: {:?}", e);
-                    }
-                },
-                |err| eprintln!("Audio stream error: {}", err),
-                None,
-            );
-
-            let stream = match stream {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Failed to build input stream: {}", e);
-                    return;
-                }
-            };
-
-            if let Err(e) = stream.play() {
-                eprintln!("Failed to start audio stream: {}", e);
+    // Spawn blocking thread for cpal audio capture
+    let _audio_handle = tokio::task::spawn_blocking(move || {
+        let host = cpal::default_host();
+        let device = match host.default_input_device() {
+            Some(dev) => dev,
+            None => {
+                eprintln!("No default input device found");
                 return;
             }
-            eprintln!("Audio callback: stream.play() called successfully");
+        };
 
-            let _ = shutdown_rx_blocking.recv();
-        });
+        let config = {
+            let mut best = None;
+            for cfg in device.supported_input_configs().unwrap() {
+                if cfg.channels() == 1 && cfg.sample_format() == cpal::SampleFormat::F32 {
+                    let rate = 48000;
+                    if cfg.min_sample_rate() <= rate && rate <= cfg.max_sample_rate() {
+                        best = Some(cfg.with_sample_rate(rate));
+                        break;
+                    }
+                }
+            }
+            match best {
+                Some(cfg) => cfg,
+                None => {
+                    eprintln!("No supported 48kHz mono F32 input config");
+                    return;
+                }
+            }
+        };
 
-        // Main async loop: receive audio bytes and perform chunking
+        let tx = audio_tx.clone();
+        let sample_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_log = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        
+        let stream = device.build_input_stream(
+            config.into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let mut non_zero = 0;
+                for &s in data {
+                    if s.abs() > 0.00001 {
+                        non_zero += 1;
+                    }
+                }
+                let total = sample_count.fetch_add(non_zero, std::sync::atomic::Ordering::SeqCst) + non_zero;
+                let last = last_log.load(std::sync::atomic::Ordering::SeqCst);
+                if total > last + 48000 { // Log every ~1 second of audio
+                    eprintln!("Audio callback: Captured {} non-zero samples total", total);
+                    last_log.store(total, std::sync::atomic::Ordering::SeqCst);
+                }
+
+                let bytes: &[u8] = bytemuck::cast_slice(data);
+                let vec_bytes = bytes.to_vec();
+                if let Err(e) = tx.send(vec_bytes) {
+                    eprintln!("Audio callback: send failed: {:?}", e);
+                }
+            },
+            |err| eprintln!("Audio stream error: {}", err),
+            None,
+        );
+
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to build input stream: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = stream.play() {
+            eprintln!("Failed to start audio stream: {}", e);
+            return;
+        }
+        eprintln!("Audio callback: stream.play() called successfully");
+
+        let _ = shutdown_rx_blocking.recv();
+    });
+
+    // Spawn the main processing loop as a separate task
+    tokio::spawn(async move {
         let mut chunk_start = std::time::Instant::now();
         let mut current_chunk_duration = rand::rng().random_range(min_duration..=max_duration);
         let mut accumulated_buffer = Vec::new();
-        eprintln!("Audio listener: Main loop starting, target duration: {}ms", current_chunk_duration.as_millis());
+        eprintln!("Audio listener: Main loop task starting, target duration: {}ms", current_chunk_duration.as_millis());
+
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        let mut last_heartbeat = std::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -160,11 +161,15 @@ pub async fn spawn_realtime_listener(
                     let _ = shutdown_tx_blocking.send(());
                     break;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                _ = interval.tick() => {
+                    if last_heartbeat.elapsed() > Duration::from_secs(5) {
+                        eprintln!("Audio listener: Heartbeat (buffer: {} bytes)", accumulated_buffer.len());
+                        last_heartbeat = std::time::Instant::now();
+                    }
+
+                    let mut received_in_tick = 0;
                     while let Ok(bytes) = audio_rx.try_recv() {
-                        if accumulated_buffer.is_empty() {
-                            eprintln!("Audio listener: Receiving data from channel");
-                        }
+                        received_in_tick += bytes.len();
                         accumulated_buffer.extend_from_slice(&bytes);
                     }
 
@@ -182,6 +187,7 @@ pub async fn spawn_realtime_listener(
                                 wav.append(&mut chunk.clone());
                                 match detect_speech(&wav, &model_clone, MODEL_SECONDARY).await {
                                     Ok(true) => {
+                                        eprintln!("Audio listener: Speech detected in chunk!");
                                         let _ = speech_detected_tx.send(());
                                         let _ = tx_clone.send(wav.to_vec()).await;
                                     }
@@ -197,16 +203,12 @@ pub async fn spawn_realtime_listener(
                             current_chunk_duration = rand::rng()
                                 .random_range(min_duration..=max_duration);
                         } else {
-                            // Reset timer even if empty to avoid immediate fire next time
                             chunk_start = std::time::Instant::now();
                         }
                     }
                 }
             }
         }
-
-        let _ = shutdown_tx_blocking.send(());
-        let _ = audio_handle.await;
     });
 
     Ok(RealtimeListener::new(
