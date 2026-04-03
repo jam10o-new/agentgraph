@@ -36,3 +36,4 @@ tempfile = "3"
 
 [dev-dependencies]
 chrono = { version = "0.4.44", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "macros"] }

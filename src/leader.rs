@@ -1,36 +1,43 @@
-use crate::config::Config;
+use crate::config::{Config, AgentConfig};
 use crate::model_loader::load_models;
 use crate::agent::Agent;
-use anyhow::Result;
+use crate::ipc::Command;
+use crate::utils::find_leader_socket;
+use anyhow::{Result, anyhow};
 use std::sync::Arc;
-use mistralrs::SamplingParams;
+use std::collections::HashMap;
+use mistralrs::{SamplingParams, TextMessageRole};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::UnixListener;
+use tokio::sync::Mutex;
 use std::path::PathBuf;
+
+pub struct AgentEntry {
+    pub handle: tokio::task::JoinHandle<()>,
+    pub volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
+    pub input_path: PathBuf,
+}
 
 pub struct Leader {
     pub config: Config,
     pub model: Arc<mistralrs::Model>,
+    pub agents: Arc<Mutex<HashMap<String, AgentEntry>>>,
+    pub sampling: SamplingParams,
 }
 
 impl Leader {
     pub async fn new(config: Config) -> Result<Self> {
         let model = Arc::new(load_models(&config.models).await?);
-        Ok(Self { config, model })
-    }
-
-    pub async fn run(&self) -> Result<()> {
-        let mut _agent_handles = Vec::new();
-
+        
         let sampling = SamplingParams {
-            temperature: self.config.sampling.temperature,
-            top_p: self.config.sampling.top_p,
-            top_k: self.config.sampling.top_k,
-            min_p: self.config.sampling.min_p,
-            repetition_penalty: self.config.sampling.repetition_penalty,
-            frequency_penalty: self.config.sampling.frequency_penalty,
-            presence_penalty: self.config.sampling.presence_penalty,
-            max_len: self.config.sampling.max_len,
+            temperature: config.sampling.temperature,
+            top_p: config.sampling.top_p,
+            top_k: config.sampling.top_k,
+            min_p: config.sampling.min_p,
+            repetition_penalty: config.sampling.repetition_penalty,
+            frequency_penalty: config.sampling.frequency_penalty,
+            presence_penalty: config.sampling.presence_penalty,
+            max_len: config.sampling.max_len,
             top_n_logprobs: 0,
             stop_toks: None,
             logits_bias: None,
@@ -38,24 +45,58 @@ impl Leader {
             dry_params: None,
         };
 
-        for (name, agent_config) in &self.config.agents {
-            let agent = Agent::new(
-                name.clone(),
-                agent_config.clone(),
-                self.config.clone(),
-                self.model.clone(),
-                sampling.clone(),
-            );
-            
-            let handle = tokio::spawn(async move {
-                if let Err(e) = agent.run_loop().await {
-                    eprintln!("Agent loop error: {:?}", e);
-                }
-            });
-            _agent_handles.push(handle);
+        Ok(Self { 
+            config, 
+            model, 
+            agents: Arc::new(Mutex::new(HashMap::new())),
+            sampling,
+        })
+    }
+
+    pub async fn spawn_agent(&self, name: String, agent_config: AgentConfig) -> Result<()> {
+        let agent = Agent::new(
+            name.clone(),
+            agent_config.clone(),
+            self.config.clone(),
+            self.model.clone(),
+            self.sampling.clone(),
+        );
+        
+        let mut agents = self.agents.lock().await;
+        if let Some(old_entry) = agents.remove(&name) {
+            old_entry.handle.abort();
         }
 
-        // IPC listener for commands (status, reload, etc.)
+        let input_path = PathBuf::from(&agent_config.path).join("input");
+        let volatile_context = agent.volatile_context.clone();
+        
+        let name_for_log = name.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = agent.run_loop().await {
+                eprintln!("Agent {} loop error: {:?}", name_for_log, e);
+            }
+        });
+
+        agents.insert(name, AgentEntry {
+            handle,
+            volatile_context,
+            input_path,
+        });
+        Ok(())
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        // 1. Ensure Leader Uniqueness
+        if let Some(socket) = find_leader_socket().await {
+            return Err(anyhow!("Another leader is already running (socket: {:?})", socket));
+        }
+
+        // 2. Initial agents from config
+        for (name, agent_config) in &self.config.agents {
+            self.spawn_agent(name.clone(), agent_config.clone()).await?;
+        }
+
+        // 3. IPC listener
         let pid = std::process::id();
         let pipe_path = PathBuf::from("/tmp/agentgraph").join(format!("ag-{}.sock", pid));
         tokio::fs::create_dir_all(pipe_path.parent().unwrap()).await?;
@@ -63,19 +104,82 @@ impl Leader {
         let listener = UnixListener::bind(&pipe_path)?;
         println!("Leader PID {} listening on {:?}", pid, pipe_path);
 
+        let agents = self.agents.clone();
         let model = self.model.clone();
+        let global_config = self.config.clone();
+        let sampling = self.sampling.clone();
+
         tokio::spawn(async move {
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
-                    let _model = model.clone();
+                    let agents = agents.clone();
+                    let model = model.clone();
+                    let global_config = global_config.clone();
+                    let sampling = sampling.clone();
+                    
                     tokio::spawn(async move {
-                        let mut buf = [0u8; 1024];
-                        if let Ok(n) = stream.read(&mut buf).await {
-                            if let Ok(cmd) = serde_json::from_slice::<crate::ipc::Command>(&buf[..n]) {
-                                println!("Received IPC command: {:?}", cmd);
-                                // TODO: Actually execute command
-                                // For now just acknowledge
-                                let _ = stream.write_all(b"OK").await;
+                        let mut buf = Vec::new();
+                        if let Ok(_) = stream.read_to_end(&mut buf).await {
+                            if let Ok(cmd) = serde_json::from_slice::<Command>(&buf) {
+                                match cmd {
+                                    Command::SpawnAgent { name, config } => {
+                                        println!("IPC: Spawning agent {}", name);
+                                        let agent = Agent::new(name.clone(), config.clone(), global_config, model, sampling);
+                                        let input_path = PathBuf::from(&config.path).join("input");
+                                        let volatile_context = agent.volatile_context.clone();
+                                        
+                                        let mut agents_map = agents.lock().await;
+                                        if let Some(e) = agents_map.remove(&name) { e.handle.abort(); }
+                                        
+                                        let name_for_log = name.clone();
+                                        let handle = tokio::spawn(async move {
+                                            if let Err(err) = agent.run_loop().await {
+                                                eprintln!("Agent {} loop error: {:?}", name_for_log, err);
+                                            }
+                                        });
+                                        agents_map.insert(name, AgentEntry { handle, volatile_context, input_path });
+                                        let _ = stream.write_all(b"Agent Spawned").await;
+                                    }
+                                    Command::RunAgent(name, message) => {
+                                        let agents_map = agents.lock().await;
+                                        if let Some(entry) = agents_map.get(&name) {
+                                            if let Some(msg) = message {
+                                                entry.volatile_context.lock().await.push((TextMessageRole::User, msg));
+                                            }
+                                            // Trigger by touching a dummy file or just checking if input/ is not empty
+                                            // To keep it simple, we ensure input/ exists and then "notify" would normally pick up a file write.
+                                            // Since notify is watching the directory, creating a temporary file should work.
+                                            let trigger_file = entry.input_path.join(".trigger");
+                                            let _ = tokio::fs::write(&trigger_file, b"").await;
+                                            let _ = tokio::fs::remove_file(&trigger_file).await;
+                                            let _ = stream.write_all(format!("Triggered agent {}", name).as_bytes()).await;
+                                        } else {
+                                            let _ = stream.write_all(format!("Agent {} not found", name).as_bytes()).await;
+                                        }
+                                    }
+                                    Command::StopAgent(name) => {
+                                        let mut agents_map = agents.lock().await;
+                                        if let Some(e) = agents_map.remove(&name) {
+                                            e.handle.abort();
+                                            let _ = stream.write_all(b"Agent Stopped").await;
+                                        } else {
+                                            let _ = stream.write_all(b"Agent Not Found").await;
+                                        }
+                                    }
+                                    Command::Status => {
+                                        let agents_map = agents.lock().await;
+                                        let status = format!("Active Agents: {:?}", agents_map.keys().collect::<Vec<_>>());
+                                        let _ = stream.write_all(status.as_bytes()).await;
+                                    }
+                                    Command::Shutdown => {
+                                        println!("Shutdown requested via IPC");
+                                        let _ = stream.write_all(b"Shutting down...").await;
+                                        std::process::exit(0);
+                                    }
+                                    _ => {
+                                        let _ = stream.write_all(b"Command Received (Unimplemented)").await;
+                                    }
+                                }
                             }
                         }
                     });
@@ -83,10 +187,8 @@ impl Leader {
             }
         });
 
-        // Keep running until Ctrl-C
         tokio::signal::ctrl_c().await?;
         println!("Shutting down...");
-        
         Ok(())
     }
 }

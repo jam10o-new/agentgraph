@@ -8,6 +8,8 @@ pub struct Config {
     pub agents: HashMap<String, AgentConfig>,
     #[serde(default = "default_compression")]
     pub compression: CompressionConfig,
+    #[serde(default)]
+    pub shutdown_on_idle: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
