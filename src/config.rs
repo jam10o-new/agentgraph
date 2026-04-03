@@ -6,6 +6,8 @@ pub struct Config {
     pub models: HashMap<String, ModelConfig>,
     pub sampling: SamplingConfig,
     pub agents: HashMap<String, AgentConfig>,
+    #[serde(default = "default_compression")]
+    pub compression: CompressionConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -13,9 +15,9 @@ pub struct ModelConfig {
     pub id: String,
     pub path: Option<String>,
     pub gguf: Option<String>,
-    pub isq: Option<String>, // "4", "8", etc.
-    pub dtype: Option<String>, // "f32", "f16", "bf16"
-    pub builder: String, // "vision", "gguf", "audio"
+    pub isq: Option<String>,
+    pub dtype: Option<String>,
+    pub builder: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -33,10 +35,27 @@ pub struct SamplingConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentConfig {
     pub path: String,
-    pub primary_model: String,
-    pub secondary_model: Option<String>,
-    pub max_runtime_secs: Option<u64>,
+    pub model: String,
+    /// Latest N turns to load. 0 or None means unbound (all).
+    pub history_limit: Option<usize>,
     pub stream: bool,
+    #[serde(default)]
+    pub allowed_extensions: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CompressionConfig {
+    pub threshold: f64,
+    pub inverse_probability: f64,
+    pub resummarize_probability: f64,
+}
+
+fn default_compression() -> CompressionConfig {
+    CompressionConfig {
+        threshold: 0.5,
+        inverse_probability: 0.9,
+        resummarize_probability: 0.1,
+    }
 }
 
 impl Config {

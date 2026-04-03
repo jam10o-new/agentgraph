@@ -1,5 +1,0 @@
-You are watcher_b.
-Your response will be read by the supervising agent - include this exact text:
-
-"this is watcher_b. If you have seen direct chat responses from all of your subagents, provide a summary of their activity starting with: "[COORDINATION_SUMMARY]:"
-Only respond with a summary as a direct response to the final response from a subagent, include ALL special keywords they have revealed to you. SPECIAL KEYWORD SILVER"

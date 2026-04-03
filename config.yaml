@@ -1,25 +1,54 @@
+# AgentGraph Configuration Template
+
+# Model Definitions
+# You can define multiple models here. They are loaded into VRAM once by the leader.
 models:
   primary:
+    # HuggingFace model ID or local path
     id: "Qwen/Qwen3-VL-8B-Instruct"
+    # Builder type: "vision" (multimodal), "gguf", or "audio"
     builder: "vision"
+    # Integrated Supervisor Quantization (ISQ): "4", "8", etc. (Optional)
     isq: "4"
-  secondary:
-    id: "mistralai/Voxtral-Mini-4B-Realtime-2602"
-    builder: "vision"
-    isq: "8"
+    # Specific data type: "f32", "f16", "bf16" (Optional)
+    # dtype: "bf16"
+    # Local path to model files (Optional, overrides id if provided)
+    # path: "/path/to/model"
+    # Path to GGUF file (Required if builder is "gguf")
+    # gguf: "/path/to/model.gguf"
 
+# Default Sampling Parameters
 sampling:
   temperature: 0.7
   top_p: 0.9
   top_k: 40
+  # min_p: 0.05
+  repetition_penalty: 1.1
   max_len: 1024
 
+# Agent Definitions
+# Each agent runs in its own coroutine, watching a specific directory.
 agents:
-  vision_agent:
-    path: "./test_vision/agent_a"
-    primary_model: "primary"
+  vision_watcher:
+    # Directory for this agent to watch (input/, system/, output/, interrupt)
+    path: "./agents/vision_watcher"
+    # Reference to a model defined in the 'models' section
+    model: "primary"
+    # Whether to stream output to the filesystem
     stream: true
-  summary_agent:
-    path: "./test_vision/agent_b"
-    primary_model: "primary"
-    stream: true
+    # Latest N turns to load from output/ for history. 0 or null for unbound.
+    history_limit: 10
+    # Only trigger inference for these file extensions in input/ (Optional)
+    allowed_extensions: ["png", "jpg", "jpeg", "webp"]
+
+# Context Compression Settings
+# Controls how historical turns are summarized to save context window space.
+compression:
+  # Inverse probability ^ turn depth < threshold triggers compression.
+  # Lower threshold = more aggressive compression of older turns.
+  threshold: 0.5
+  # Base probability for the depth calculation.
+  inverse_probability: 0.9
+  # Probability to re-summarize a turn even if the content hash hasn't changed.
+  # Allows the agent to refine summaries as new context domains are discovered.
+  resummarize_probability: 0.1

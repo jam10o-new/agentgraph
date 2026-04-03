@@ -20,7 +20,7 @@ impl Leader {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let mut agent_handles = Vec::new();
+        let mut _agent_handles = Vec::new();
 
         let sampling = SamplingParams {
             temperature: self.config.sampling.temperature,
@@ -42,6 +42,7 @@ impl Leader {
             let agent = Agent::new(
                 name.clone(),
                 agent_config.clone(),
+                self.config.clone(),
                 self.model.clone(),
                 sampling.clone(),
             );
@@ -51,7 +52,7 @@ impl Leader {
                     eprintln!("Agent loop error: {:?}", e);
                 }
             });
-            agent_handles.push(handle);
+            _agent_handles.push(handle);
         }
 
         // IPC listener for commands (status, reload, etc.)

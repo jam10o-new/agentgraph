@@ -1,7 +1,8 @@
-use crate::config::AgentConfig;
-use anyhow::Result;
+use crate::config::{AgentConfig, Config};
+use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_frontmatter};
+use anyhow::{Result, Context};
 use std::sync::Arc;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch};
 use notify::{Watcher, RecursiveMode, Event};
 use std::path::PathBuf;
 use mistralrs::{Model, RequestBuilder, SamplingParams, MultimodalMessages, TextMessageRole, Response};
@@ -11,19 +12,19 @@ use tokio::io::AsyncWriteExt;
 pub struct Agent {
     pub name: String,
     pub config: AgentConfig,
+    pub global_config: Config,
     pub model: Arc<Model>,
     pub sampling: SamplingParams,
-    pub history: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
 }
 
 impl Agent {
-    pub fn new(name: String, config: AgentConfig, model: Arc<Model>, sampling: SamplingParams) -> Self {
+    pub fn new(name: String, config: AgentConfig, global_config: Config, model: Arc<Model>, sampling: SamplingParams) -> Self {
         Self {
             name,
             config,
+            global_config,
             model,
             sampling,
-            history: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -61,7 +62,6 @@ impl Agent {
                 if let Some(handle) = current_inference.take() {
                     handle.abort();
                 }
-                // Reset interrupt file
                 let _ = fs::remove_file(&interrupt_path).await;
                 let _ = interrupt_tx.send(false);
                 continue;
@@ -70,22 +70,31 @@ impl Agent {
             // Check for input changes
             if event.kind.is_modify() || event.kind.is_create() {
                 if event.paths.iter().any(|p| p.starts_with(&input_path)) {
-                    // Start inference
+                    // Filter extensions
+                    if let Some(path) = event.paths.first() {
+                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                            if !self.config.allowed_extensions.is_empty() && !self.config.allowed_extensions.contains(&ext.to_string()) {
+                                continue;
+                            }
+                        }
+                    }
+
                     if let Some(handle) = current_inference.take() {
                         handle.abort();
                     }
                     
                     let model = self.model.clone();
                     let config = self.config.clone();
+                    let global_config = self.global_config.clone();
                     let sampling = self.sampling.clone();
                     let agent_name = name.clone();
                     let agent_path_clone = agent_path.clone();
                     let interrupt_rx = interrupt_tx.subscribe();
-                    let history = self.history.clone();
+                    let name_for_log = name.clone();
                     
                     current_inference = Some(tokio::spawn(async move {
-                        if let Err(e) = run_inference(agent_name, agent_path_clone, model, config, sampling, interrupt_rx, history).await {
-                            eprintln!("Inference error: {:?}", e);
+                        if let Err(e) = run_inference(agent_name, agent_path_clone, model, config, global_config, sampling, interrupt_rx).await {
+                            eprintln!("Inference error for agent {}: {:?}", name_for_log, e);
                         }
                     }));
                 }
@@ -100,31 +109,107 @@ async fn run_inference(
     path: PathBuf,
     model: Arc<Model>,
     config: AgentConfig,
+    global_config: Config,
     sampling: SamplingParams,
     interrupt_rx: watch::Receiver<bool>,
-    history: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
 ) -> Result<()> {
     println!("Agent {}: Starting inference", name);
     
-    // Read system prompt
-    let system_prompt = fs::read_to_string(path.join("system").join("prompt.txt")).await.unwrap_or_default();
-    
-    // Build messages using MultimodalMessages builder
-    let mut messages = MultimodalMessages::new()
-        .add_message(TextMessageRole::System, system_prompt);
-    
-    // Add history
-    {
-        let h = history.lock().await;
-        for (role, content) in h.iter() {
-            messages = messages.add_message(role.clone(), content);
+    // 1. Load System Prompts & Skills
+    let system_dir = path.join("system");
+    let mut combined_history = Vec::new();
+    if let Ok(mut entries) = fs::read_dir(system_dir).await {
+        let mut files = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.path().is_file() {
+                files.push(entry.path());
+            }
+        }
+        files.sort();
+        for f in files {
+            if let Ok(content) = fs::read_to_string(&f).await {
+                if let Some((name, desc, body)) = extract_frontmatter(&content) {
+                    combined_history.push(HistoryTurn {
+                        role: HistoryTurnRole::Skill(name, desc),
+                        content: body,
+                        turn_index: 0,
+                    });
+                } else {
+                    combined_history.push(HistoryTurn {
+                        role: HistoryTurnRole::System,
+                        content,
+                        turn_index: 0,
+                    });
+                }
+            }
         }
     }
 
-    // Read latest user input
-    let user_input = fs::read_to_string(path.join("input").join("user.txt")).await.unwrap_or_default();
+    // 2. Load History from output directory
+    let output_dir = path.join("output");
+    let mut history = Vec::new();
+    if let Ok(mut entries) = fs::read_dir(&output_dir).await {
+        let mut files = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.path().is_file() && entry.path().extension().map_or(false, |e| e == "txt") {
+                files.push(entry.path());
+            }
+        }
+        files.sort();
+        
+        let limit = config.history_limit.unwrap_or(0);
+        let start = if limit > 0 { files.len().saturating_sub(limit) } else { 0 };
+        
+        for (idx, f) in files.iter().enumerate().skip(start) {
+            if let Ok(content) = fs::read_to_string(f).await {
+                // Heuristic: alternate User/Assistant based on file index
+                let role = if idx % 2 == 0 { HistoryTurnRole::User } else { HistoryTurnRole::Assistant };
+                history.push(HistoryTurn {
+                    role,
+                    content,
+                    turn_index: idx + 1,
+                });
+            }
+        }
+    }
+    combined_history.extend(history);
+
+    // 3. Load Latest User Input
+    let input_dir = path.join("input");
+    let mut input_files = Vec::new();
+    if let Ok(mut entries) = fs::read_dir(input_dir).await {
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.path().is_file() {
+                input_files.push(entry.path());
+            }
+        }
+    }
+    input_files.sort();
+    let latest_input_path = input_files.last().context("No input files found in input/")?;
+    let latest_user_input = fs::read_to_string(latest_input_path).await?;
+
+    // 4. Compression Pass
+    let comp_mgr = CompressionManager::new(
+        path.clone(),
+        global_config.compression.threshold,
+        global_config.compression.inverse_probability,
+        global_config.compression.resummarize_probability,
+    );
     
-    // Scan for images in input/
+    let compressed_context = comp_mgr.get_compressed_context(
+        model.clone(),
+        &combined_history,
+        &latest_user_input,
+        sampling.clone()
+    ).await?;
+
+    // 5. Build Final Request
+    let mut messages = MultimodalMessages::new();
+    for (role, content) in compressed_context {
+        messages = messages.add_message(role, content);
+    }
+    
+    // Add images if present in input directory
     let mut images = Vec::new();
     if let Ok(mut entries) = fs::read_dir(path.join("input")).await {
         while let Some(entry) = entries.next_entry().await? {
@@ -143,23 +228,17 @@ async fn run_inference(
     }
 
     if !images.is_empty() {
-        messages = messages.add_image_message(TextMessageRole::User, &user_input, images);
+        messages = messages.add_image_message(TextMessageRole::User, &latest_user_input, images);
     } else {
-        messages = messages.add_message(TextMessageRole::User, &user_input);
+        messages = messages.add_message(TextMessageRole::User, &latest_user_input);
     }
 
-    let request = RequestBuilder::from(messages).set_sampling(sampling.clone());
-    
-    let mut stream = if let Some(ref secondary) = config.secondary_model {
-         model.stream_chat_request_with_model(request, Some(secondary)).await?
-    } else {
-         model.stream_chat_request(request).await?
-    };
+    let request = RequestBuilder::from(messages).set_sampling(sampling);
+    let mut stream = model.stream_chat_request(request).await?;
 
     let output_file_path = path.join("output").join(format!("out-{}.txt", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis()));
     fs::create_dir_all(output_file_path.parent().unwrap()).await?;
     let mut file = fs::File::create(&output_file_path).await?;
-    let mut full_response = String::new();
 
     while let Some(chunk) = stream.next().await {
         if *interrupt_rx.borrow() {
@@ -173,7 +252,6 @@ async fn run_inference(
                     if let Some(ref content) = choice.delta.content {
                         file.write_all(content.as_bytes()).await?;
                         file.flush().await?;
-                        full_response.push_str(content);
                     }
                 }
             }
@@ -190,21 +268,6 @@ async fn run_inference(
                 break;
             }
             _ => {}
-        }
-    }
-
-    // Update history
-    {
-        let mut h = history.lock().await;
-        h.push((TextMessageRole::User, user_input));
-        h.push((TextMessageRole::Assistant, full_response));
-        
-        // Simple context management: if history too long, summarize
-        if h.len() > 10 {
-            println!("Agent {}: History long ({} turns), summarizing...", name, h.len());
-            let summary: String = crate::context::summarize_history(model.clone(), &h, sampling.clone()).await.unwrap_or_else(|e| format!("Error during summarization: {:?}", e));
-            h.clear();
-            h.push((TextMessageRole::System, format!("Summary of previous conversation: {}", summary)));
         }
     }
 
