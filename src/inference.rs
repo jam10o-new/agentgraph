@@ -268,9 +268,11 @@ pub async fn run_streaming_loop(
         Some(token_tx),
     ));
 
+    let mut finished_response: Option<String> = None;
+
     loop {
         tokio::select! {
-            result = &mut inference_fut => {
+            result = &mut inference_fut, if finished_response.is_none() => {
                 if args.verbose {
                     match &result {
                         CoroutineResponse::Complete(_) => eprintln!("run_streaming_loop: inference_fut finished with Complete"),
@@ -310,6 +312,7 @@ pub async fn run_streaming_loop(
                             if args.verbose {
                                 eprintln!("run_streaming_loop: Inference finished but audio is active, waiting...");
                             }
+                            finished_response = Some(resp);
                             continue;
                         }
                     }
@@ -330,7 +333,20 @@ pub async fn run_streaming_loop(
                     return Err(e);
                 }
             }
-            Some(tok) = token_rx.recv() => {
+            // If we are finished but waiting for audio to clear, poll the active flag
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if finished_response.is_some() => {
+                if let Some(ref active) = audio_is_active {
+                    if !active.load(Ordering::SeqCst) {
+                        if args.verbose {
+                            eprintln!("run_streaming_loop: Audio cleared, returning finished response.");
+                        }
+                        return Ok(StreamOutcome::Complete(finished_response.unwrap()));
+                    }
+                } else {
+                    return Ok(StreamOutcome::Complete(finished_response.unwrap()));
+                }
+            }
+            Some(tok) = token_rx.recv(), if finished_response.is_none() => {
                 let (out, cmd, _) = cmd_parser.process(&tok);
                 response.push_str(&out);
                 if stream_realtime {

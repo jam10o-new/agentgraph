@@ -346,7 +346,7 @@ pub async fn load_dir_messages(
             // For Full strategy or non-text content, load full content
             if strategy == LoadStrategy::Full {
                 match content_type {
-                    ContentType::Text => MessageContent::Text(fs::read_to_string(path).await?),
+                    ContentType::Text => MessageContent::Text(load_skill_context(path).await?),
                     ContentType::Image => {
                         let bytes = fs::read(path).await?;
                         let img = image::load_from_memory(&bytes)
@@ -420,7 +420,7 @@ pub async fn load_dir_messages(
                     } else {
                         // No agent, fallback to full
                         match content_type {
-                            ContentType::Text => MessageContent::Text(fs::read_to_string(path).await?),
+                            ContentType::Text => MessageContent::Text(load_skill_context(path).await?),
                             ContentType::Image => {
                                 let bytes = fs::read(path).await?;
                                 let img = image::load_from_memory(&bytes)
@@ -439,7 +439,7 @@ pub async fn load_dir_messages(
                 } else {
                     // Fallback
                     match content_type {
-                        ContentType::Text => MessageContent::Text(fs::read_to_string(path).await?),
+                        ContentType::Text => MessageContent::Text(load_skill_context(path).await?),
                         ContentType::Image => {
                             let bytes = fs::read(path).await?;
                             let img = image::load_from_memory(&bytes)
@@ -462,7 +462,7 @@ pub async fn load_dir_messages(
                 } else {
                     // No cached summary - load full content
                     match content_type {
-                        ContentType::Text => MessageContent::Text(fs::read_to_string(path).await?),
+                        ContentType::Text => MessageContent::Text(load_skill_context(path).await?),
                         ContentType::Image => {
                             let bytes = fs::read(path).await?;
                             let img = image::load_from_memory(&bytes)
@@ -554,16 +554,38 @@ pub async fn build_messages(
     let mut primary_messages = VisionMessages::new();
     let mut secondary_messages: Option<VisionMessages> = None;
 
-    // System messages (never summarized)
+    // System messages (combined into single message)
+    let mut system_messages = Vec::new();
     for dir in &args.system_final {
-        let p = latest_file(dir)?;
-        let content = load_skill_context(&p).await?;
-        primary_messages = primary_messages.add_message(TextMessageRole::System, content);
+        if let Ok(msgs) = load_dir_messages(dir, "system", false, 1, None, None, 0).await {
+            system_messages.extend(msgs);
+        }
     }
-
     for dir in &args.system_cat {
-        let content = concat_files(dir).await?;
-        primary_messages = primary_messages.add_message(TextMessageRole::System, content);
+        if let Ok(msgs) = load_dir_messages(dir, "system", true, args.latest_n, None, None, 0).await {
+            system_messages.extend(msgs);
+        }
+    }
+    // Re-sort to chronological order (load_dir_messages returns latest first)
+    system_messages.sort_by_key(|m| m.metadata.created);
+
+    let mut system_text = String::new();
+    let mut system_images = Vec::new();
+    let mut system_audio_bytes = Vec::new();
+
+    for msg in system_messages {
+        match msg.content {
+            MessageContent::Text(t) => {
+                system_text.push_str(&t);
+                system_text.push('\n');
+            }
+            MessageContent::Image(img) => {
+                system_images.push(img);
+            }
+            MessageContent::Audio(audio) => {
+                system_audio_bytes.push(audio);
+            }
+        }
     }
 
     // Tool system message
@@ -582,7 +604,9 @@ pub async fn build_messages(
             open_writ = crate::CMD_OPEN_WRIT,
             close_writ = crate::CMD_CLOSE_WRIT
         );
-        primary_messages = primary_messages.add_message(TextMessageRole::Tool, tool_instructions);
+        system_text.push_str("\n## Tool Instructions\n");
+        system_text.push_str(&tool_instructions);
+        system_text.push('\n');
     }
 
     // Skill reading instruction (always available, not gated by --tools flag)
@@ -591,7 +615,76 @@ pub async fn build_messages(
         open_skill = crate::CMD_OPEN_READ_SKILL,
         close_skill = crate::CMD_CLOSE_READ_SKILL
     );
-    primary_messages = primary_messages.add_message(TextMessageRole::Tool, skill_instructions);
+    system_text.push_str("\n## Skill Instructions\n");
+    system_text.push_str(&skill_instructions);
+    system_text.push('\n');
+
+    // Handle multimodal system message
+    if !system_images.is_empty() && !system_audio_bytes.is_empty() {
+        if let Some(agent) = compression_agent {
+            let combined_content = format!(
+                "System prompt with {} images and {} audio clips.\nText: {}",
+                system_images.len(),
+                system_audio_bytes.len(),
+                system_text
+            );
+            let request = crate::context::CompressionRequest {
+                baseline_turn: "Summarize this multimodal system prompt.".to_string(),
+                historical_turn: (0, combined_content),
+                image: system_images.first().cloned(),
+                model_slot: ModelSlot::Primary,
+            };
+            if let Ok(resp) = agent.compress(request).await {
+                use crate::context::RelevanceResult;
+                let summary_text = match resp.relevance {
+                    RelevanceResult::Snippets {
+                        snippets,
+                        relevance_reason,
+                    } => {
+                        format!(
+                            "[SYSTEM SUMMARY - {}]:\n{}",
+                            relevance_reason,
+                            snippets.join("\n")
+                        )
+                    }
+                    RelevanceResult::MicroSummary { text } => {
+                        format!("[SYSTEM SUMMARY]: {}", text)
+                    }
+                };
+                primary_messages =
+                    primary_messages.add_message(TextMessageRole::System, summary_text);
+            } else {
+                primary_messages =
+                    primary_messages.add_message(TextMessageRole::System, system_text.clone());
+            }
+        } else {
+            primary_messages =
+                primary_messages.add_message(TextMessageRole::System, system_text.clone());
+        }
+    } else if !system_images.is_empty() {
+        primary_messages = primary_messages.add_image_message(
+            TextMessageRole::System,
+            system_text.clone(),
+            system_images,
+        );
+    } else if !system_audio_bytes.is_empty() {
+        let mut audio_inputs = Vec::new();
+        for bytes in system_audio_bytes {
+            if let Ok(input) = mistralrs::AudioInput::from_bytes(&bytes) {
+                audio_inputs.push(input);
+            }
+        }
+        let sec_msgs = secondary_messages.get_or_insert_with(VisionMessages::new);
+        *sec_msgs = sec_msgs.clone().add_multimodal_message(
+            TextMessageRole::System,
+            &system_text,
+            vec![],
+            audio_inputs,
+        );
+        primary_messages = primary_messages.add_message(TextMessageRole::System, system_text);
+    } else {
+        primary_messages = primary_messages.add_message(TextMessageRole::System, system_text);
+    }
 
     // Collect all messages
     let mut timeline: Vec<FileMessage> = Vec::new();

@@ -48,7 +48,7 @@ pub async fn load_model(args: &Args) -> Result<mistralrs::Model> {
             eprintln!("Loading Secondary Model");
         }
         let secondary_builder = mistralrs::VisionModelBuilder::new(&args.secondary_model)
-            .with_auto_isq(IsqBits::Four)
+            .with_auto_isq(IsqBits::Eight)
             .with_dtype(mistralrs::ModelDType::F32)
             .with_logging();
         builder = builder.add_model_with_alias(MODEL_SECONDARY, secondary_builder);

@@ -5,17 +5,19 @@
 use crate::Args;
 use crate::types::{MODEL_SECONDARY, RealtimeListener};
 use anyhow::{Context, Result};
-use mistralrs::{TextMessageRole, VisionMessages};
+use mistralrs::{RequestLike, SamplingParams, TextMessageRole, VisionMessages};
 use rand::RngExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::fs;
 use tokio::sync::{mpsc, oneshot};
 
 /// Create a basic WAV header for a mono 48kHz F32 audio stream
 fn create_wav_header(data_len: usize) -> [u8; 44] {
     let mut header = [0u8; 44];
-    const SAMPLE_RATE: u32 = 48000;
+    const SAMPLE_RATE: u32 = 16000;
     const BITS_PER_SAMPLE: u16 = 32;
     const CHANNELS: u16 = 1;
     const BYTES_PER_SECOND: u32 = SAMPLE_RATE * CHANNELS as u32 * (BITS_PER_SAMPLE as u32 / 8);
@@ -80,7 +82,7 @@ pub async fn spawn_realtime_listener(
             if let Ok(configs) = device.supported_input_configs() {
                 for cfg in configs {
                     if cfg.channels() == 1 && cfg.sample_format() == cpal::SampleFormat::F32 {
-                        let rate = 48000;
+                        let rate = 16000;
                         if cfg.min_sample_rate() <= rate && rate <= cfg.max_sample_rate() {
                             best = Some(cfg.with_sample_rate(rate));
                             break;
@@ -91,7 +93,7 @@ pub async fn spawn_realtime_listener(
             match best {
                 Some(cfg) => cfg,
                 None => {
-                    eprintln!("Audio: No supported 48kHz mono F32 input config");
+                    eprintln!("Audio: No supported 24kHz mono F32 input config");
                     match device.default_input_config() {
                         Ok(cfg) => cfg,
                         Err(e) => {
@@ -153,6 +155,7 @@ pub async fn spawn_realtime_listener(
                         received = true;
                     }
 
+
                     // If we have data in the buffer, the listener is "active"
                     if !accumulated_buffer.is_empty() {
                         is_active_loop.store(true, Ordering::SeqCst);
@@ -163,25 +166,30 @@ pub async fn spawn_realtime_listener(
                     if chunk_start.elapsed() >= current_chunk_duration {
                         if !accumulated_buffer.is_empty() {
                             let model_clone = model.clone();
+                            println!("Sending Listener buffer (len = {})", accumulated_buffer.len());
                             let chunk = std::mem::take(&mut accumulated_buffer);
                             let tx = chunk_tx.clone();
                             let is_active_task = is_active_loop.clone();
 
                             tokio::spawn(async move {
-                                is_active_task.store(true, Ordering::SeqCst);
+
                                 let mut wav = create_wav_header(chunk.len()).to_vec();
                                 wav.extend_from_slice(&chunk);
                                 match detect_speech(&wav, &model_clone, MODEL_SECONDARY).await {
                                     Ok(true) => {
                                         let _ = tx.send(wav).await;
+                                        is_active_task.store(false, Ordering::SeqCst);
                                     }
-                                    _ => {}
+                                    Err(e) => {
+                                        println!("detect_speech error: {}",e)
+                                    }
+                                    _ => {println!("No speech in buffer");}
                                 }
-                                // The loop will handle clearing the flag if no more data is arriving
                             });
                         }
                         chunk_start = std::time::Instant::now();
                         current_chunk_duration = rand::rng().random_range(min_duration..=max_duration);
+
                     }
                 }
             }
@@ -211,15 +219,19 @@ pub async fn detect_speech(
             .context("Failed to reload secondary model")?;
     }
 
+    pub async fn save_wav_debug(audio_chunk: &[u8], file_path: &Path) -> std::io::Result<()> {
+        fs::write(file_path, audio_chunk).await
+    }
+
     let audio = mistralrs::AudioInput::from_bytes(audio_chunk)
         .map_err(|e| anyhow::anyhow!("Failed to create AudioInput: {}", e))?;
 
-    let messages = VisionMessages::new().add_multimodal_message(
-        TextMessageRole::User,
-        "Respond with only 'true' if this audio contains intelligible speech, or 'false' if it does not.",
-        vec![],
-        vec![audio],
-    );
+    let messages = VisionMessages::new()
+        /* .add_message(
+            TextMessageRole::System,
+            "Transcribe this audio - if there is no legible speech in it, output only \"false\"",
+        )*/
+        .add_multimodal_message(TextMessageRole::User, "", vec![], vec![audio]);
 
     let response = model
         .send_chat_request_with_model(messages, Some(audio_model_id))
@@ -233,5 +245,6 @@ pub async fn detect_speech(
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
 
+    println!("Speech detector: {}", content);
     Ok(content.contains("true"))
 }

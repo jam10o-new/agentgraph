@@ -262,10 +262,6 @@ async fn main() -> Result<()> {
                     let m = model.as_ref().unwrap().clone();
                     let lock = inference_lock.clone();
                     let interrupt_tx = fs_tx.clone();
-                    let audio_chan = persistent_listener.as_ref().map(|(lar, _)| lar.clone());
-                    let audio_active = persistent_listener.as_ref().map(|(_, act)| act.clone());
-                    let audio_queue = std::mem::take(&mut queued_audio);
-
                     tokio::spawn(async move {
                         let _guard = lock.lock().await;
                         handle_request(stream, m, interrupt_tx).await;
