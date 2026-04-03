@@ -1,0 +1,25 @@
+models:
+  primary:
+    id: "Qwen/Qwen3-VL-8B-Instruct"
+    builder: "vision"
+    isq: "4"
+  secondary:
+    id: "mistralai/Voxtral-Mini-4B-Realtime-2602"
+    builder: "vision"
+    isq: "8"
+
+sampling:
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 40
+  max_len: 1024
+
+agents:
+  vision_agent:
+    path: "./test_vision/agent_a"
+    primary_model: "primary"
+    stream: true
+  summary_agent:
+    path: "./test_vision/agent_b"
+    primary_model: "primary"
+    stream: true

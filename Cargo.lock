@@ -569,13 +569,14 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 
 [[package]]
 name = "candle-core"
-version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bd9895436c1ba5dc1037a19935d084b838db066ff4e15ef7dded020b7c12a4a"
 dependencies = [
  "byteorder",
  "candle-kernels",
  "candle-ug",
- "cudarc 0.19.3",
+ "cudarc 0.19.4",
  "float8",
  "gemm 0.19.0",
  "half",
@@ -588,14 +589,16 @@ dependencies = [
  "rayon",
  "safetensors 0.7.0",
  "thiserror 2.0.18",
+ "tokenizers 0.22.2",
  "yoke 0.8.1",
  "zip",
 ]
 
 [[package]]
 name = "candle-flash-attn"
-version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12512cf8e706744642e9a8579305a6ed1e44a0c636ce20c416cd5c519de19b7d"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -605,16 +608,18 @@ dependencies = [
 
 [[package]]
 name = "candle-kernels"
-version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "742e2ac226b777134436e9e692f44e77c278b8a7abb1554dc10e44dc911b349f"
 dependencies = [
  "cudaforge",
 ]
 
 [[package]]
 name = "candle-nn"
-version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9317a09d6530b758990ed7f625ac69ff43653bc9ee28b0464644ad1169ada87"
 dependencies = [
  "candle-core",
  "half",
@@ -628,8 +633,9 @@ dependencies = [
 
 [[package]]
 name = "candle-ug"
-version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca0fc3167cbc99c8ec1be618cb620aa21dca95038f118c3579a79370e3dc5f77"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -1127,9 +1133,9 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.19.3"
+version = "0.19.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6468cb7fa330840f3ebcd8df51edc0e7bf5c18df524792ce6004c6821851cdf3"
+checksum = "f071cd6a7b5d51607df76aa2d426aaabc7a74bc6bdb885b8afa63a880572ad9b"
 dependencies = [
  "float8",
  "half",
@@ -3193,8 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3220,8 +3225,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-audio"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "apodize",
@@ -3231,8 +3235,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
+version = "0.8.1"
 dependencies = [
  "ahash",
  "akin",
@@ -3309,7 +3312,7 @@ dependencies = [
  "symphonia",
  "sysinfo",
  "thiserror 2.0.18",
- "tokenizers",
+ "tokenizers 0.21.4",
  "tokio",
  "tokio-rayon",
  "tokio-tungstenite",
@@ -3327,8 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-macros"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
+version = "0.8.1"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -3338,8 +3340,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-mcp"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3358,8 +3359,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-paged-attn"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3371,8 +3371,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-quant"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
+version = "0.8.1"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -3397,8 +3396,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-vision"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs#604368e7ae2a36bf5a1581588f812836cc62145f"
+version = "0.8.1"
 dependencies = [
  "candle-core",
  "image",
@@ -3818,6 +3816,28 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "onig"
+version = "6.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "336b9c63443aceef14bea841b899035ae3abe89b7c486aaf4c5bd8aafedac3f0"
+dependencies = [
+ "bitflags 2.11.0",
+ "libc",
+ "once_cell",
+ "onig_sys",
+]
+
+[[package]]
+name = "onig_sys"
+version = "69.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f86c6eef3d6df15f23bcfb6af487cbd2fed4e5581d58d5bf1f5f8b7f6727dc"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
 
 [[package]]
 name = "openai-harmony"
@@ -5903,6 +5923,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokenizers"
+version = "0.22.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b238e22d44a15349529690fb07bd645cf58149a1b1e44d6cb5bd1641ff1a6223"
+dependencies = [
+ "ahash",
+ "aho-corasick",
+ "compact_str",
+ "dary_heap",
+ "derive_builder",
+ "esaxx-rs",
+ "getrandom 0.3.4",
+ "itertools 0.14.0",
+ "log",
+ "macro_rules_attribute",
+ "monostate",
+ "onig",
+ "paste",
+ "rand 0.9.2",
+ "rayon",
+ "rayon-cond",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "spm_precompiled",
+ "thiserror 2.0.18",
+ "unicode-normalization-alignments",
+ "unicode-segmentation",
+ "unicode_categories",
+]
+
+[[package]]
 name = "tokio"
 version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5998,7 +6051,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
- "tokenizers",
+ "tokenizers 0.21.4",
  "toktrie",
 ]
 
