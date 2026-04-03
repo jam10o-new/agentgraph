@@ -1,15 +1,19 @@
 use crate::config::ModelConfig;
 use anyhow::{Result, anyhow};
-use mistralrs::{
-    GgufModelBuilder, IsqBits, ModelDType, MultiModelBuilder, MultimodalModelBuilder,
-};
+use mistralrs::{GgufModelBuilder, IsqBits, ModelDType, MultiModelBuilder, MultimodalModelBuilder};
 
-pub async fn load_models(configs: &std::collections::HashMap<String, ModelConfig>) -> Result<mistralrs::Model> {
+pub async fn load_models(
+    configs: &std::collections::HashMap<String, ModelConfig>,
+) -> Result<mistralrs::Model> {
     let mut builder = MultiModelBuilder::new();
 
     for (alias, config) in configs {
         let isq = match config.isq.as_deref() {
+            Some("2") => Some(IsqBits::Two),
+            Some("3") => Some(IsqBits::Three),
             Some("4") => Some(IsqBits::Four),
+            Some("5") => Some(IsqBits::Five),
+            Some("6") => Some(IsqBits::Six),
             Some("8") => Some(IsqBits::Eight),
             _ => None,
         };
@@ -23,7 +27,11 @@ pub async fn load_models(configs: &std::collections::HashMap<String, ModelConfig
 
         match config.builder.as_str() {
             "vision" => {
-                let model_src = config.path.as_deref().or(Some(&config.id)).ok_or_else(|| anyhow!("Path or ID required for vision model"))?;
+                let model_src = config
+                    .path
+                    .as_deref()
+                    .or(Some(&config.id))
+                    .ok_or_else(|| anyhow!("Path or ID required for vision model"))?;
                 let mut b = MultimodalModelBuilder::new(model_src);
                 if let Some(i) = isq {
                     b = b.with_auto_isq(i);
@@ -31,13 +39,21 @@ pub async fn load_models(configs: &std::collections::HashMap<String, ModelConfig
                 if let Some(d) = dtype {
                     b = b.with_dtype(d);
                 }
+                b = b.with_logging();
                 builder = builder.add_model_with_alias(alias, b);
             }
             "gguf" => {
-                let b = GgufModelBuilder::new(
+                let mut b = GgufModelBuilder::new(
                     &config.id,
-                    vec![config.gguf.as_ref().ok_or_else(|| anyhow!("GGUF file required for gguf model"))?.clone()],
+                    vec![
+                        config
+                            .gguf
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("GGUF file required for gguf model"))?
+                            .clone(),
+                    ],
                 );
+                b = b.with_logging();
                 builder = builder.add_model_with_alias(alias, b);
             }
             _ => return Err(anyhow!("Unknown builder type: {}", config.builder)),

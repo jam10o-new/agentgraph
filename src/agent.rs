@@ -6,7 +6,7 @@ use anyhow::{Result, Context, anyhow};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex};
 use notify::{Watcher, RecursiveMode, Event};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use mistralrs::{
     Model, RequestBuilder, SamplingParams, TextMessageRole, Response,
     Tool, ToolType, Function, ToolChoice,
@@ -14,6 +14,7 @@ use mistralrs::{
 use tokio::fs;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::UnixStream;
+use std::time::SystemTime;
 
 macro_rules! json_schema_obj {
     ($($json:tt)+) => {
@@ -59,52 +60,52 @@ impl Agent {
             }
         })?;
 
-        let agent_path = PathBuf::from(&self.config.path);
-        let input_path = agent_path.join("input");
-        let system_path = agent_path.join("system");
-        let interrupt_path = agent_path.join("interrupt");
-
-        fs::create_dir_all(&input_path).await?;
-        fs::create_dir_all(&system_path).await?;
+        // Watch all input directories
+        for input_path in &self.config.inputs {
+            let p = PathBuf::from(input_path);
+            fs::create_dir_all(&p).await?;
+            watcher.watch(&p, RecursiveMode::NonRecursive)?;
+        }
         
-        watcher.watch(&input_path, RecursiveMode::NonRecursive)?;
-        watcher.watch(&interrupt_path, RecursiveMode::NonRecursive)?;
+        // Ensure output and system directories exist
+        fs::create_dir_all(&self.config.output).await?;
+        for sys_path in &self.config.system {
+            fs::create_dir_all(sys_path).await?;
+        }
 
-        println!("Agent {} watching {}", name, agent_path.display());
+        println!("Agent {} watching inputs: {:?}", name, self.config.inputs);
 
         let mut current_inference: Option<tokio::task::JoinHandle<()>> = None;
         let (interrupt_tx, _) = watch::channel(false);
 
         while let Some(event) = rx.recv().await {
-            if event.paths.iter().any(|p| p.ends_with("interrupt")) {
-                println!("Agent {}: Interrupt detected", name);
-                let _ = interrupt_tx.send(true);
-                if let Some(handle) = current_inference.take() {
-                    handle.abort();
-                }
-                let _ = fs::remove_file(&interrupt_path).await;
-                let _ = interrupt_tx.send(false);
-                continue;
-            }
-
+            // Any new file or modification in inputs is both an interrupt and a trigger
             if event.kind.is_modify() || event.kind.is_create() {
-                if event.paths.iter().any(|p| p.starts_with(&input_path)) {
+                let is_input_event = event.paths.iter().any(|p| {
+                    self.config.inputs.iter().any(|input_dir| p.starts_with(input_dir))
+                });
+
+                if is_input_event {
+                    println!("Agent {}: Trigger/Interrupt from input event", name);
+                    
+                    // Signal interrupt to current inference if any
+                    let _ = interrupt_tx.send(true);
                     if let Some(handle) = current_inference.take() {
                         handle.abort();
                     }
-                    
+                    let _ = interrupt_tx.send(false);
+
                     let model = self.model.clone();
                     let config = self.config.clone();
                     let global_config = self.global_config.clone();
                     let sampling = self.sampling.clone();
                     let agent_name = name.clone();
-                    let agent_path_clone = agent_path.clone();
                     let interrupt_rx = interrupt_tx.subscribe();
                     let volatile_context = self.volatile_context.clone();
                     let log_name = name.clone();
                     
                     current_inference = Some(tokio::spawn(async move {
-                        if let Err(e) = run_inference(agent_name, agent_path_clone, model, config, global_config, sampling, interrupt_rx, volatile_context).await {
+                        if let Err(e) = run_inference(agent_name, model, config, global_config, sampling, interrupt_rx, volatile_context).await {
                             eprintln!("Inference error for agent {}: {:?}", log_name, e);
                         }
                     }));
@@ -115,9 +116,15 @@ impl Agent {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FileEntry {
+    path: PathBuf,
+    created: SystemTime,
+    role: HistoryTurnRole,
+}
+
 async fn run_inference(
     name: String,
-    path: PathBuf,
     model: Arc<Model>,
     config: AgentConfig,
     global_config: Config,
@@ -127,64 +134,115 @@ async fn run_inference(
 ) -> Result<()> {
     println!("Agent {}: Starting inference", name);
     
-    let mut combined_history = Vec::new();
-    let system_dir = path.join("system");
-    if let Ok(mut entries) = fs::read_dir(system_dir).await {
-        let mut files = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.path().is_file() { files.push(entry.path()); }
-        }
-        files.sort();
-        for f in files {
-            if let Ok(content) = fs::read_to_string(&f).await {
-                if let Some((n, d, body)) = extract_frontmatter(&content) {
-                    combined_history.push(HistoryTurn { role: HistoryTurnRole::Skill(n, d), content: body, turn_index: 0 });
-                } else {
-                    combined_history.push(HistoryTurn { role: HistoryTurnRole::System, content, turn_index: 0 });
+    // 1. Collate System Prompts
+    let mut system_content = String::new();
+    for sys_dir in &config.system {
+        if let Ok(mut entries) = fs::read_dir(sys_dir).await {
+            let mut files = Vec::new();
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.path().is_file() { files.push(entry.path()); }
+            }
+            files.sort();
+            for f in files {
+                if let Ok(content) = fs::read_to_string(&f).await {
+                    if !system_content.is_empty() { system_content.push_str("\n\n"); }
+                    system_content.push_str(&content);
                 }
             }
         }
     }
 
-    let output_dir = path.join("output");
-    let mut history = Vec::new();
-    if let Ok(mut entries) = fs::read_dir(&output_dir).await {
-        let mut files = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.path().is_file() && entry.path().extension().map_or(false, |e| e == "txt") {
-                files.push(entry.path());
-            }
+    let mut combined_history = Vec::new();
+    if !system_content.is_empty() {
+        if let Some((n, d, body)) = extract_frontmatter(&system_content) {
+            combined_history.push(HistoryTurn { role: HistoryTurnRole::Skill(n, d), content: body, turn_index: 0 });
+        } else {
+            combined_history.push(HistoryTurn { role: HistoryTurnRole::System, content: system_content, turn_index: 0 });
         }
-        files.sort();
-        let limit = config.history_limit.unwrap_or(0);
-        let start = if limit > 0 { files.len().saturating_sub(limit) } else { 0 };
-        for (idx, f) in files.iter().enumerate().skip(start) {
-            if let Ok(content) = fs::read_to_string(f).await {
-                let role = if idx % 2 == 0 { HistoryTurnRole::User } else { HistoryTurnRole::Assistant };
-                history.push(HistoryTurn { role, content, turn_index: idx + 1 });
+    }
+
+    // 2. Collate User and Assistant History by Creation Time
+    let mut all_files = Vec::new();
+    
+    // Gather Inputs (User)
+    for input_dir in &config.inputs {
+        if let Ok(mut entries) = fs::read_dir(input_dir).await {
+            while let Some(entry) = entries.next_entry().await? {
+                let p = entry.path();
+                if p.is_file() {
+                    let metadata = fs::metadata(&p).await?;
+                    all_files.push(FileEntry {
+                        path: p,
+                        created: metadata.created()?,
+                        role: HistoryTurnRole::User,
+                    });
+                }
             }
         }
     }
-    combined_history.extend(history);
 
-    let input_dir = path.join("input");
-    let mut input_files = Vec::new();
-    if let Ok(mut entries) = fs::read_dir(input_dir).await {
+    // Gather Output (Assistant)
+    if let Ok(mut entries) = fs::read_dir(&config.output).await {
         while let Some(entry) = entries.next_entry().await? {
-            if entry.path().is_file() { input_files.push(entry.path()); }
+            let p = entry.path();
+            if p.is_file() {
+                let metadata = fs::metadata(&p).await?;
+                all_files.push(FileEntry {
+                    path: p,
+                    created: metadata.created()?,
+                    role: HistoryTurnRole::Assistant,
+                });
+            }
         }
     }
-    input_files.sort();
-    let latest_input_path = input_files.last().context("No input files")?;
-    let latest_user_input = fs::read_to_string(latest_input_path).await?;
 
+    // Sort by creation time
+    all_files.sort_by_key(|f| f.created);
+
+    // Apply history limit
+    let limit = config.history_limit.unwrap_or(0);
+    let start_idx = if limit > 0 && all_files.len() > limit {
+        all_files.len() - limit
+    } else {
+        0
+    };
+
+    let mut turn_idx = 1;
+    for entry in all_files.iter().skip(start_idx) {
+        if let Ok(content) = fs::read_to_string(&entry.path).await {
+            combined_history.push(HistoryTurn {
+                role: entry.role.clone(),
+                content,
+                turn_index: turn_idx,
+            });
+            turn_idx += 1;
+        }
+    }
+
+    // The "latest user input" is actually already part of the history if we sorted correctly.
+    // However, CompressionManager usually expects history + latest_input separately.
+    // Let's pop the last User message if it exists to serve as the trigger.
+    let (history, latest_user_input) = if let Some(last_turn) = combined_history.last() {
+        if matches!(last_turn.role, HistoryTurnRole::User) {
+            let latest = last_turn.content.clone();
+            let mut h = combined_history.clone();
+            h.pop();
+            (h, latest)
+        } else {
+            (combined_history.clone(), String::new())
+        }
+    } else {
+        (combined_history.clone(), String::new())
+    };
+
+    // 3. Compression
     let comp_mgr = CompressionManager::new(
-        path.clone(),
+        PathBuf::from(&config.output).parent().unwrap_or_else(|| Path::new(".")).to_path_buf(),
         global_config.compression.threshold,
         global_config.compression.inverse_probability,
         global_config.compression.resummarize_probability,
     );
-    let compressed_context = comp_mgr.get_compressed_context(model.clone(), &combined_history, &latest_user_input, sampling.clone()).await?;
+    let compressed_context = comp_mgr.get_compressed_context(model.clone(), &history, &latest_user_input, sampling.clone()).await?;
 
     let mut messages = RequestBuilder::new();
     for (role, content) in compressed_context { messages = messages.add_message(role, content); }
@@ -194,19 +252,9 @@ async fn run_inference(
         for (role, content) in v_ctx.drain(..) { messages = messages.add_message(role, content); }
     }
 
-    let mut images = Vec::new();
-    if let Ok(mut entries) = fs::read_dir(path.join("input")).await {
-        while let Some(entry) = entries.next_entry().await? {
-            let p = entry.path();
-            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp") {
-                    if let Ok(img) = image::open(&p) { images.push(img); }
-                }
-            }
-        }
-    }
-    if !images.is_empty() { messages = messages.add_image_message(TextMessageRole::User, &latest_user_input, images); }
-    else { messages = messages.add_message(TextMessageRole::User, &latest_user_input); }
+    // Latest user input is already in messages? No, get_compressed_context handles history. 
+    // We still need to add the latest_user_input to the request.
+    messages = messages.add_message(TextMessageRole::User, &latest_user_input);
 
     let tools = vec![
         Tool {
@@ -232,7 +280,9 @@ async fn run_inference(
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
-                        "path": {"type": "string"},
+                        "inputs": {"type": "array", "items": {"type": "string"}},
+                        "output": {"type": "string"},
+                        "system": {"type": "array", "items": {"type": "string"}},
                         "model": {"type": "string"},
                         "history_limit": {"type": "integer", "nullable": true}
                     }
@@ -254,8 +304,8 @@ async fn run_inference(
         }
     ];
 
-    let output_file_path = path.join("output").join(format!("out-{}.txt", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis()));
-    fs::create_dir_all(output_file_path.parent().unwrap()).await?;
+    let timestamp = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+    let output_file_path = PathBuf::from(&config.output).join(format!("out-{}.txt", timestamp));
     let mut file = fs::File::create(&output_file_path).await?;
 
     let mut request = messages.set_sampling(sampling).set_tools(tools).set_tool_choice(ToolChoice::Auto);
@@ -266,7 +316,10 @@ async fn run_inference(
         let mut tool_calls = Vec::new();
 
         while let Some(chunk) = model_stream.next().await {
-            if *interrupt_rx.borrow() { return Ok(()); }
+            if *interrupt_rx.borrow() { 
+                println!("Agent {}: Inference interrupted", name);
+                return Ok(()); 
+            }
             match chunk {
                 Response::Chunk(c) => {
                     if let Some(choice) = c.choices.first() {
@@ -302,7 +355,9 @@ async fn run_inference(
                     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
                     let name = args["name"].as_str().unwrap_or_default().to_string();
                     let config = AgentConfig {
-                        path: args["path"].as_str().unwrap_or_default().to_string(),
+                        inputs: args["inputs"].as_array().unwrap_or(&vec![]).iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect(),
+                        output: args["output"].as_str().unwrap_or_default().to_string(),
+                        system: args["system"].as_array().unwrap_or(&vec![]).iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect(),
                         model: args["model"].as_str().unwrap_or("primary").to_string(),
                         history_limit: args["history_limit"].as_u64().map(|u| u as usize),
                         stream: true,

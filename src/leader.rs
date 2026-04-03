@@ -15,7 +15,7 @@ use std::path::PathBuf;
 pub struct AgentEntry {
     pub handle: tokio::task::JoinHandle<()>,
     pub volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
-    pub input_path: PathBuf,
+    pub trigger_path: PathBuf,
 }
 
 pub struct Leader {
@@ -67,7 +67,8 @@ impl Leader {
             old_entry.handle.abort();
         }
 
-        let input_path = PathBuf::from(&agent_config.path).join("input");
+        // We use the first input directory as the "trigger" path for manual runs
+        let trigger_path = PathBuf::from(agent_config.inputs.first().cloned().unwrap_or_else(|| ".".into()));
         let volatile_context = agent.volatile_context.clone();
         
         let name_for_log = name.clone();
@@ -80,7 +81,7 @@ impl Leader {
         agents.insert(name, AgentEntry {
             handle,
             volatile_context,
-            input_path,
+            trigger_path,
         });
         Ok(())
     }
@@ -125,7 +126,7 @@ impl Leader {
                                     Command::SpawnAgent { name, config } => {
                                         println!("IPC: Spawning agent {}", name);
                                         let agent = Agent::new(name.clone(), config.clone(), global_config, model, sampling);
-                                        let input_path = PathBuf::from(&config.path).join("input");
+                                        let trigger_path = PathBuf::from(config.inputs.first().cloned().unwrap_or_else(|| ".".into()));
                                         let volatile_context = agent.volatile_context.clone();
                                         
                                         let mut agents_map = agents.lock().await;
@@ -137,7 +138,7 @@ impl Leader {
                                                 eprintln!("Agent {} loop error: {:?}", name_for_log, err);
                                             }
                                         });
-                                        agents_map.insert(name, AgentEntry { handle, volatile_context, input_path });
+                                        agents_map.insert(name, AgentEntry { handle, volatile_context, trigger_path });
                                         let _ = stream.write_all(b"Agent Spawned").await;
                                     }
                                     Command::RunAgent(name, message) => {
@@ -146,10 +147,8 @@ impl Leader {
                                             if let Some(msg) = message {
                                                 entry.volatile_context.lock().await.push((TextMessageRole::User, msg));
                                             }
-                                            // Trigger by touching a dummy file or just checking if input/ is not empty
-                                            // To keep it simple, we ensure input/ exists and then "notify" would normally pick up a file write.
-                                            // Since notify is watching the directory, creating a temporary file should work.
-                                            let trigger_file = entry.input_path.join(".trigger");
+                                            // Trigger by touching a dummy file in the first input dir
+                                            let trigger_file = entry.trigger_path.join(format!(".trigger-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()));
                                             let _ = tokio::fs::write(&trigger_file, b"").await;
                                             let _ = tokio::fs::remove_file(&trigger_file).await;
                                             let _ = stream.write_all(format!("Triggered agent {}", name).as_bytes()).await;

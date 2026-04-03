@@ -36,7 +36,9 @@ pub struct SamplingConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentConfig {
-    pub path: String,
+    pub inputs: Vec<String>,
+    pub output: String,
+    pub system: Vec<String>,
     pub model: String,
     /// Latest N turns to load. 0 or None means unbound (all).
     pub history_limit: Option<usize>,

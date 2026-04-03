@@ -1,54 +1,56 @@
 # AgentGraph Configuration Template
 
-# Model Definitions
-# You can define multiple models here. They are loaded into VRAM once by the leader.
+# 1. Model Definitions
 models:
   primary:
-    # HuggingFace model ID or local path
-    id: "Qwen/Qwen3-VL-8B-Instruct"
-    # Builder type: "vision" (multimodal), "gguf", or "audio"
+    id: "gemma-4-E4B"
     builder: "vision"
-    # Integrated Supervisor Quantization (ISQ): "4", "8", etc. (Optional)
+    path: "google/gemma-4-E4B"
     isq: "4"
-    # Specific data type: "f32", "f16", "bf16" (Optional)
-    # dtype: "bf16"
-    # Local path to model files (Optional, overrides id if provided)
-    # path: "/path/to/model"
-    # Path to GGUF file (Required if builder is "gguf")
-    # gguf: "/path/to/model.gguf"
+  vision:
+    id: "qwen3-vl-8b"
+    builder: "vision"
+    path: "Qwen/Qwen3-VL-8B-Instruct"
+    isq: "4"
 
-# Default Sampling Parameters
+# 2. Global Sampling Parameters
 sampling:
   temperature: 0.7
   top_p: 0.9
   top_k: 40
-  # min_p: 0.05
-  repetition_penalty: 1.1
-  max_len: 1024
+  max_len: 2048
 
-# Agent Definitions
-# Each agent runs in its own coroutine, watching a specific directory.
+# 3. Agent Definitions
 agents:
-  vision_watcher:
-    # Directory for this agent to watch (input/, system/, output/, interrupt)
-    path: "./agents/vision_watcher"
-    # Reference to a model defined in the 'models' section
+  researcher:
+    # A list of directories to watch for user input
+    inputs:
+      - "agents/researcher/input"
+    # A single directory to write assistant responses
+    output: "agents/researcher/output"
+    # A list of directories containing system prompts and skills
+    system:
+      - "agents/researcher/system"
     model: "primary"
-    # Whether to stream output to the filesystem
+    history_limit: 20
     stream: true
-    # Latest N turns to load from output/ for history. 0 or null for unbound.
-    history_limit: 10
-    # Only trigger inference for these file extensions in input/ (Optional)
-    allowed_extensions: ["png", "jpg", "jpeg", "webp"]
 
-# Context Compression Settings
-# Controls how historical turns are summarized to save context window space.
+  coder:
+    inputs:
+      - "agents/coder/input"
+      - "agents/researcher/output" # Colony: watches researcher's output
+    output: "agents/coder/output"
+    system:
+      - "agents/coder/system"
+    model: "primary"
+    history_limit: 50
+    stream: true
+
+# 4. Context Compression Settings
 compression:
-  # Inverse probability ^ turn depth < threshold triggers compression.
-  # Lower threshold = more aggressive compression of older turns.
   threshold: 0.5
-  # Base probability for the depth calculation.
   inverse_probability: 0.9
-  # Probability to re-summarize a turn even if the content hash hasn't changed.
-  # Allows the agent to refine summaries as new context domains are discovered.
   resummarize_probability: 0.1
+
+# 5. Global Settings
+shutdown_on_idle: false

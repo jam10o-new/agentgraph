@@ -44,8 +44,15 @@ enum Commands {
     Spawn {
         /// Agent name
         name: String,
-        /// Path for the agent to watch
-        path: String,
+        /// Input directories (comma separated)
+        #[arg(short, long, value_delimiter = ',')]
+        inputs: Vec<String>,
+        /// Output directory
+        #[arg(short, long)]
+        output: String,
+        /// System prompt directories (comma separated)
+        #[arg(short, long, value_delimiter = ',')]
+        system: Vec<String>,
         /// Model alias to use
         #[arg(short, long, default_value = "primary")]
         model: String,
@@ -68,9 +75,11 @@ async fn main() -> Result<()> {
             let leader = Leader::new(config).await?;
             leader.run().await?;
         }
-        Commands::Spawn { name, path, model, limit, stream } => {
+        Commands::Spawn { name, inputs, output, system, model, limit, stream } => {
             let config = AgentConfig {
-                path,
+                inputs,
+                output,
+                system,
                 model,
                 history_limit: limit,
                 stream,
