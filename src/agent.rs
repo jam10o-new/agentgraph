@@ -14,7 +14,7 @@ use mistralrs::{
 use tokio::fs;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::UnixStream;
-use std::time::SystemTime;
+use std::time::{SystemTime, Duration};
 
 macro_rules! json_schema_obj {
     ($($json:tt)+) => {
@@ -80,17 +80,28 @@ impl Agent {
 
         let mut current_inference: Option<tokio::task::JoinHandle<()>> = None;
         let (interrupt_tx, _) = watch::channel(false);
+        let mut debounce_timer = Box::pin(tokio::time::sleep(Duration::MAX));
+        let mut timer_active = false;
+        let debounce_duration = Duration::from_millis(250);
 
-        while let Some(event) = rx.recv().await {
-            // Trigger on any non-removal event within the inputs
-            if !event.kind.is_remove() {
-                let is_input_event = event.paths.iter().any(|p| {
-                    let p_abs = p.canonicalize().unwrap_or_else(|_| p.clone());
-                    canonical_inputs.iter().any(|input_dir| p_abs.starts_with(input_dir))
-                });
+        loop {
+            tokio::select! {
+                Some(event) = rx.recv() => {
+                    if !event.kind.is_remove() {
+                        let is_input_event = event.paths.iter().any(|p| {
+                            let p_abs = p.canonicalize().unwrap_or_else(|_| p.clone());
+                            canonical_inputs.iter().any(|input_dir| p_abs.starts_with(input_dir))
+                        });
 
-                if is_input_event {
-                    println!("Agent {}: Trigger/Interrupt from input event: {:?}", name, event.kind);
+                        if is_input_event {
+                            debounce_timer.as_mut().reset(tokio::time::Instant::now() + debounce_duration);
+                            timer_active = true;
+                        }
+                    }
+                }
+                _ = &mut debounce_timer, if timer_active => {
+                    timer_active = false;
+                    println!("Agent {}: Triggering inference after debounce", name);
                     
                     // Signal interrupt to current inference if any
                     let _ = interrupt_tx.send(true);
@@ -116,7 +127,6 @@ impl Agent {
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -305,7 +315,13 @@ async fn run_inference(
 
     let timestamp = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
     let output_file_path = PathBuf::from(&config.output).join(format!("out-{}.txt", timestamp));
-    let mut file = fs::File::create(&output_file_path).await?;
+    
+    // In streaming mode, create the file early. In non-streaming, wait.
+    let mut file = if config.stream {
+        Some(fs::File::create(&output_file_path).await?)
+    } else {
+        None
+    };
 
     let mut request = messages.set_sampling(sampling).set_tools(tools).set_tool_choice(ToolChoice::Auto);
     
@@ -319,8 +335,13 @@ async fn run_inference(
                 println!("Agent {}: Inference interrupted", name);
                 // Even on interrupt, we write what we have so far
                 if !accumulated_content.is_empty() {
-                    file.write_all(accumulated_content.as_bytes()).await?;
-                    file.flush().await?;
+                    if let Some(ref mut f) = file {
+                        f.write_all(accumulated_content.as_bytes()).await?;
+                        f.flush().await?;
+                    } else {
+                        // For non-streaming, create and write once on interrupt
+                        fs::write(&output_file_path, &accumulated_content).await?;
+                    }
                 }
                 return Ok(()); 
             }
@@ -329,9 +350,9 @@ async fn run_inference(
                     if let Some(choice) = c.choices.first() {
                         if let Some(ref content) = choice.delta.content {
                             accumulated_content.push_str(content);
-                            if config.stream {
-                                file.write_all(content.as_bytes()).await?;
-                                file.flush().await?;
+                            if let Some(ref mut f) = file {
+                                f.write_all(content.as_bytes()).await?;
+                                f.flush().await?;
                             }
                         }
                         if let Some(ref tcs) = choice.delta.tool_calls {
@@ -343,10 +364,9 @@ async fn run_inference(
             }
         }
 
-        // Write full accumulated content at end if not streaming
+        // For non-streaming, create and write full accumulated content at end of turn
         if !config.stream && !accumulated_content.is_empty() {
-            file.write_all(accumulated_content.as_bytes()).await?;
-            file.flush().await?;
+            fs::write(&output_file_path, &accumulated_content).await?;
         }
 
         if tool_calls.is_empty() { break; }

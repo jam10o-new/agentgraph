@@ -11,7 +11,9 @@ use tokio::fs;
 pub struct RootSummary {
     pub title: String,
     pub micro_summary: String,
+    #[serde(default)]
     pub domains: Vec<String>, // List of domain names for which specialized summaries exist
+    #[serde(default)]
     pub included_turn_indices: Vec<usize>,
 }
 
@@ -86,11 +88,6 @@ impl CompressionManager {
             let depth = total_turns - 1 - i;
             
             // Probability formula: older (higher depth) -> higher prob of compression
-            // We want prob to be high for high depth and low for low depth.
-            // Using 1.0 - (inverse_prob ^ depth) 
-            // e.g. inverse_prob=0.9, depth=0 -> 1.0 - 1.0 = 0%
-            // depth=1 -> 1.0 - 0.9 = 10%
-            // depth=10 -> 1.0 - 0.34 = 66%
             let prob = 1.0 - self.inverse_prob.powf(depth as f64);
 
             // Never compress standard system messages, only skills
@@ -164,7 +161,6 @@ impl CompressionManager {
             if root.domains.is_empty() {
                 return Ok(turn_to_mistral(turn));
             }
-            // If domains exist, we'll continue to (4) selection logic
         }
 
         // 3) if only root exists
@@ -275,16 +271,18 @@ impl CompressionManager {
                 let json_str = &content[start_json..=end_json];
                 let mut r: RootSummary = serde_json::from_str(json_str)
                     .map_err(|e| anyhow!("JSON Parse Error: {}, content: {}", e, json_str))?;
+                
+                // Populate non-JSON fields
                 r.included_turn_indices = window_indices;
                 if let Some(er) = existing_root {
                     r.domains = er.domains;
                 }
                 r
             } else {
-                anyhow::bail!("No JSON found in model response")
+                anyhow::bail!("No JSON end found in model response")
             }
         } else {
-            anyhow::bail!("No JSON found in model response")
+            anyhow::bail!("No JSON start found in model response")
         };
 
         Ok(root)
