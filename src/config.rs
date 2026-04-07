@@ -20,6 +20,7 @@ pub struct ModelConfig {
     pub isq: Option<String>,
     pub dtype: Option<String>,
     pub builder: String,
+    pub chat_template: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
