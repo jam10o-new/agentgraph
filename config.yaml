@@ -8,9 +8,9 @@ models:
     path: "google/gemma-4-E4B"
     isq: "4"
   vision:
-    id: "qwen3-vl-8b"
+    id: "qwen35"
     builder: "vision"
-    path: "Qwen/Qwen3-VL-8B-Instruct"
+    path: "Qwen/Qwen3.5-9B"
     isq: "4"
 
 # 2. Global Sampling Parameters
@@ -33,7 +33,9 @@ agents:
       - "agents/researcher/system"
     model: "primary"
     history_limit: 20
-    stream: true
+    # Controls whether output is written to file token-by-token (true) or only at completion (false).
+    # Set to false for agents whose output triggers other agents to prevent "interrupt storms".
+    stream: false
 
   coder:
     inputs:
@@ -47,10 +49,14 @@ agents:
     stream: true
 
 # 4. Context Compression Settings
+# Probabilistic summarization logic: older turns (deeper depth) are more likely to be compressed.
 compression:
+  # Base probability threshold. Turns with (1.0 - inv_prob^depth) > threshold are compressed.
   threshold: 0.5
+  # Recency factor. 0.9 means 10% prob of compression at depth 1, increasing with depth.
   inverse_probability: 0.9
-  resummarize_probability: 0.1
+  # Chance to re-summarize a cached entry to refine it with more context.
+  resummarize_probability: 0.05
 
 # 5. Global Settings
 shutdown_on_idle: false

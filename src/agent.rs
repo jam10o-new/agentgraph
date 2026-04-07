@@ -2,7 +2,7 @@ use crate::config::{AgentConfig, Config};
 use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_frontmatter};
 use crate::ipc::Command;
 use crate::find_leader_socket;
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex};
 use notify::{Watcher, RecursiveMode, Event};
@@ -60,11 +60,14 @@ impl Agent {
             }
         })?;
 
-        // Watch all input directories
+        // Canonicalize and watch all input directories
+        let mut canonical_inputs = Vec::new();
         for input_path in &self.config.inputs {
             let p = PathBuf::from(input_path);
             fs::create_dir_all(&p).await?;
-            watcher.watch(&p, RecursiveMode::NonRecursive)?;
+            let cp = fs::canonicalize(&p).await?;
+            watcher.watch(&cp, RecursiveMode::NonRecursive)?;
+            canonical_inputs.push(cp);
         }
         
         // Ensure output and system directories exist
@@ -73,20 +76,21 @@ impl Agent {
             fs::create_dir_all(sys_path).await?;
         }
 
-        println!("Agent {} watching inputs: {:?}", name, self.config.inputs);
+        println!("Agent {} watching inputs: {:?}", name, canonical_inputs);
 
         let mut current_inference: Option<tokio::task::JoinHandle<()>> = None;
         let (interrupt_tx, _) = watch::channel(false);
 
         while let Some(event) = rx.recv().await {
-            // Any new file or modification in inputs is both an interrupt and a trigger
-            if event.kind.is_modify() || event.kind.is_create() {
+            // Trigger on any non-removal event within the inputs
+            if !event.kind.is_remove() {
                 let is_input_event = event.paths.iter().any(|p| {
-                    self.config.inputs.iter().any(|input_dir| p.starts_with(input_dir))
+                    let p_abs = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    canonical_inputs.iter().any(|input_dir| p_abs.starts_with(input_dir))
                 });
 
                 if is_input_event {
-                    println!("Agent {}: Trigger/Interrupt from input event", name);
+                    println!("Agent {}: Trigger/Interrupt from input event: {:?}", name, event.kind);
                     
                     // Signal interrupt to current inference if any
                     let _ = interrupt_tx.send(true);
@@ -219,9 +223,6 @@ async fn run_inference(
         }
     }
 
-    // The "latest user input" is actually already part of the history if we sorted correctly.
-    // However, CompressionManager usually expects history + latest_input separately.
-    // Let's pop the last User message if it exists to serve as the trigger.
     let (history, latest_user_input) = if let Some(last_turn) = combined_history.last() {
         if matches!(last_turn.role, HistoryTurnRole::User) {
             let latest = last_turn.content.clone();
@@ -252,8 +253,6 @@ async fn run_inference(
         for (role, content) in v_ctx.drain(..) { messages = messages.add_message(role, content); }
     }
 
-    // Latest user input is already in messages? No, get_compressed_context handles history. 
-    // We still need to add the latest_user_input to the request.
     messages = messages.add_message(TextMessageRole::User, &latest_user_input);
 
     let tools = vec![
@@ -318,6 +317,11 @@ async fn run_inference(
         while let Some(chunk) = model_stream.next().await {
             if *interrupt_rx.borrow() { 
                 println!("Agent {}: Inference interrupted", name);
+                // Even on interrupt, we write what we have so far
+                if !accumulated_content.is_empty() {
+                    file.write_all(accumulated_content.as_bytes()).await?;
+                    file.flush().await?;
+                }
                 return Ok(()); 
             }
             match chunk {
@@ -325,8 +329,10 @@ async fn run_inference(
                     if let Some(choice) = c.choices.first() {
                         if let Some(ref content) = choice.delta.content {
                             accumulated_content.push_str(content);
-                            file.write_all(content.as_bytes()).await?;
-                            file.flush().await?;
+                            if config.stream {
+                                file.write_all(content.as_bytes()).await?;
+                                file.flush().await?;
+                            }
                         }
                         if let Some(ref tcs) = choice.delta.tool_calls {
                             tool_calls.extend(tcs.clone());
@@ -335,6 +341,12 @@ async fn run_inference(
                 }
                 _ => {}
             }
+        }
+
+        // Write full accumulated content at end if not streaming
+        if !config.stream && !accumulated_content.is_empty() {
+            file.write_all(accumulated_content.as_bytes()).await?;
+            file.flush().await?;
         }
 
         if tool_calls.is_empty() { break; }
