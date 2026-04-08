@@ -1,5 +1,6 @@
 use image::{ImageBuffer, Rgb};
 use std::fs;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -13,6 +14,18 @@ async fn cleanup_sockets() {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let _ = tokio::fs::remove_file(entry.path()).await;
         }
+    }
+}
+
+struct LeaderGuard {
+    child: tokio::process::Child,
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        println!("LeaderGuard: Killing leader process...");
+        let _ = self.child.start_kill();
+        // Sockets are cleaned up by the next test or manually
     }
 }
 
@@ -56,7 +69,7 @@ models:
   vl:
     id: "qwen3-vl-8b"
     builder: "vision"
-    path: "Qwen/Qwen3.5-9B"
+    path: "Qwen/Qwen3-VL-8B-Instruct"
     isq: "4"
 sampling:
   temperature: 0.1
@@ -91,10 +104,9 @@ agents:
 
     // 2. Start Leader
     println!("Multimodal Test: Starting leader...");
-    let mut leader = Command::new("cargo")
+    let mut child = Command::new("cargo")
         .args([
             "run",
-            "--release",
             "--bin",
             "ag",
             "--",
@@ -107,11 +119,13 @@ agents:
         .spawn()
         .expect("Failed to spawn leader");
 
-    let stdout = leader.stdout.take().unwrap();
-    let stderr = leader.stderr.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    // Wrap in guard for auto-cleanup
+    let _guard = LeaderGuard { child };
 
     let mut stdout_reader = BufReader::new(stdout).lines();
-    let mut stderr_reader = BufReader::new(stderr).lines();
 
     // Watch stdout for "listening on"
     let wait_ready = async {
@@ -127,7 +141,9 @@ agents:
     let ready = timeout(Duration::from_secs(300), wait_ready)
         .await
         .unwrap_or(false);
-    assert!(ready, "Leader failed to become ready within timeout");
+    if !ready {
+        panic!("Leader failed to become ready within timeout");
+    }
 
     tokio::spawn(async move {
         while let Ok(Some(line)) = stdout_reader.next_line().await {
@@ -135,21 +151,28 @@ agents:
         }
     });
     tokio::spawn(async move {
-        while let Ok(Some(line)) = stderr_reader.next_line().await {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
             eprintln!("[LEADER STDERR] {}", line);
         }
     });
+
+    // Ensure coder's system prompt is present before any other messages!
+    fs::write(coder_system.join("prompt.txt"),
+        "When you receive input, output only a brief acknowledgment in strict JSON format, with fields 'status' (string, value 'received' if your input was valid json) and 'domain'."
+    ).unwrap();
 
     // 3. Trigger Researcher with an Image + JSON Prompt
     println!("Multimodal Test: Triggering researcher with image...");
     create_test_image(&researcher_input.join("test.png"));
     fs::write(researcher_input.join("query.txt"),
-        "Look at this image. Describe its primary colors and pattern. Output your finding strictly as a JSON object with fields 'colors' (array) and 'pattern' (string). Include no preaamble or postscript - output only the JSON object."
+        "Look at this image. Describe its primary colors and pattern. Output your finding strictly as JSON with fields 'colors' (array) and 'pattern' (string). DO NOT use tools."
     ).unwrap();
 
     // 4. Wait for Researcher Output and parse it
     let mut researcher_data = None;
-    for _ in 0..120 {
+    let mut previous_path: PathBuf = PathBuf::new();
+    for i in 0..120 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Ok(entries) = fs::read_dir(&researcher_output) {
             let files: Vec<_> = entries.filter_map(|e| e.ok()).collect();
@@ -158,7 +181,10 @@ agents:
                 paths.sort();
                 if let Some(latest_path) = paths.last() {
                     let content = fs::read_to_string(latest_path).unwrap();
-                    println!("Multimodal Test: Researcher output: {}", content);
+                    if previous_path != *latest_path {
+                        println!("Multimodal Test: Researcher output turn {}: {}", i, content);
+                    }
+                    previous_path = latest_path.clone();
                     if let Some(start) = content.find('{') {
                         if let Some(end) = content.rfind('}') {
                             let json_str = &content[start..=end];
@@ -172,17 +198,16 @@ agents:
             }
         }
     }
+
     let researcher_data = researcher_data.expect("Researcher failed to produce valid JSON output");
     assert!(researcher_data["colors"].is_array());
 
     // 5. Coder should have been triggered automatically. Wait for its output.
     println!("Multimodal Test: Waiting for coder to acknowledge research...");
-    fs::write(coder_system.join("prompt.txt"),
-        "When you see JSON research data, output only a strict JSON format response object: {'status': 'received', 'domain': 'vision'}."
-    ).unwrap();
 
     let mut coder_data = None;
-    for _ in 0..120 {
+    let mut previous_path: PathBuf = PathBuf::new();
+    for i in 0..120 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Ok(entries) = fs::read_dir(&coder_output) {
             let files: Vec<_> = entries.filter_map(|e| e.ok()).collect();
@@ -191,7 +216,10 @@ agents:
                 paths.sort();
                 if let Some(latest_path) = paths.last() {
                     let content = fs::read_to_string(latest_path).unwrap();
-                    println!("Multimodal Test: Coder output: {}", content);
+                    if previous_path != *latest_path {
+                        println!("Multimodal Test: Coder output turn {}: {}", i, content);
+                    }
+                    previous_path = latest_path.clone();
                     if let Some(start) = content.find('{') {
                         if let Some(end) = content.rfind('}') {
                             let json_str = &content[start..=end];
@@ -206,17 +234,18 @@ agents:
         }
     }
 
-    // 6. Shutdown
-    let _ = Command::new("cargo")
-        .args(["run", "--release", "--bin", "ag", "--", "shutdown"])
-        .output()
-        .await;
-    let _ = leader.kill().await;
-    cleanup_sockets().await;
-
+    // Final check
     assert!(
         coder_data.is_some(),
         "Coder failed to trigger and produce JSON acknowledgment"
     );
     assert_eq!(coder_data.unwrap()["status"], "received");
+
+    // 6. Explicit shutdown via IPC (cleaner than kill)
+    let _ = Command::new("cargo")
+        .args(["run", "--bin", "ag", "--", "shutdown"])
+        .output()
+        .await;
+
+    cleanup_sockets().await;
 }
