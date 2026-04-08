@@ -1,8 +1,0 @@
-
-models: {}
-sampling:
-  temperature: 0.7
-  top_p: 0.9
-  top_k: 40
-  max_len: 1024
-agents: {}
