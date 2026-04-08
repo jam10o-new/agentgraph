@@ -1,3 +1,4 @@
+use image::{ImageBuffer, Rgb};
 use std::fs;
 use std::process::Stdio;
 use std::time::Duration;
@@ -15,8 +16,19 @@ async fn cleanup_sockets() {
     }
 }
 
+fn create_test_image(path: &std::path::Path) {
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(100, 100, |x, y| {
+        if (x + y) % 2 == 0 {
+            Rgb([255u8, 0, 0])
+        } else {
+            Rgb([0, 255u8, 0])
+        }
+    });
+    img.save(path).unwrap();
+}
+
 #[tokio::test]
-async fn test_real_agent_colony() {
+async fn test_multimodal_colony_structured_json() {
     // 0. Cleanup
     cleanup_sockets().await;
 
@@ -37,32 +49,32 @@ async fn test_real_agent_colony() {
     fs::create_dir_all(&coder_output).unwrap();
     fs::create_dir_all(&coder_system).unwrap();
 
-    // 1. Create Config with ISQ match
+    // 1. Create Config using Qwen-VL for multimodal
     let config_content = format!(
         r#"
 models:
-  primary:
-    id: "gemma-4-E4B"
+  vl:
+    id: "qwen3-vl-8b"
     builder: "vision"
-    path: "google/gemma-4-E4B"
+    path: "Qwen/Qwen3.5-9B"
     isq: "4"
 sampling:
   temperature: 0.1
   top_p: 0.9
   top_k: 40
-  max_len: 128
+  max_len: 256
 agents:
   researcher:
     inputs: ["{}"]
     output: "{}"
     system: ["{}"]
-    model: "primary"
+    model: "vl"
     stream: false
   coder:
     inputs: ["{}", "{}"]
     output: "{}"
     system: ["{}"]
-    model: "primary"
+    model: "vl"
     stream: false
 "#,
         researcher_input.display(),
@@ -78,10 +90,11 @@ agents:
     fs::write(&config_path, config_content).unwrap();
 
     // 2. Start Leader
-    println!("Colony Test: Starting leader with cargo run...");
+    println!("Multimodal Test: Starting leader...");
     let mut leader = Command::new("cargo")
         .args([
             "run",
+            "--release",
             "--bin",
             "ag",
             "--",
@@ -101,7 +114,6 @@ agents:
     let mut stderr_reader = BufReader::new(stderr).lines();
 
     // Watch stdout for "listening on"
-    println!("Colony Test: Waiting for leader to be ready ...");
     let wait_ready = async {
         while let Ok(Some(line)) = stdout_reader.next_line().await {
             println!("[LEADER STDOUT] {}", line);
@@ -112,16 +124,11 @@ agents:
         false
     };
 
-    // Increased timeout to 10 minutes for the large model
-    let ready = timeout(Duration::from_secs(1200), wait_ready)
+    let ready = timeout(Duration::from_secs(300), wait_ready)
         .await
         .unwrap_or(false);
-    assert!(
-        ready,
-        "Leader failed to become ready (listening) within timeout"
-    );
+    assert!(ready, "Leader failed to become ready within timeout");
 
-    // Start background tasks to keep draining and printing
     tokio::spawn(async move {
         while let Ok(Some(line)) = stdout_reader.next_line().await {
             println!("[LEADER STDOUT] {}", line);
@@ -133,58 +140,83 @@ agents:
         }
     });
 
-    // 3. Trigger Researcher
-    println!("Colony Test: Triggering researcher...");
-    fs::write(
-        researcher_input.join("query.txt"),
-        "Research this: What is the capital of France? Only output the city name.",
-    )
-    .unwrap();
+    // 3. Trigger Researcher with an Image + JSON Prompt
+    println!("Multimodal Test: Triggering researcher with image...");
+    create_test_image(&researcher_input.join("test.png"));
+    fs::write(researcher_input.join("query.txt"),
+        "Look at this image. Describe its primary colors and pattern. Output your finding strictly as a JSON object with fields 'colors' (array) and 'pattern' (string). Include no preaamble or postscript - output only the JSON object."
+    ).unwrap();
 
-    // 4. Wait for Researcher Output
-    let mut found_researcher_output = false;
-    for i in 0..180 {
+    // 4. Wait for Researcher Output and parse it
+    let mut researcher_data = None;
+    for _ in 0..120 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Ok(entries) = fs::read_dir(&researcher_output) {
             let files: Vec<_> = entries.filter_map(|e| e.ok()).collect();
             if !files.is_empty() {
-                println!("Colony Test: Researcher produced output after {}s", i);
-                found_researcher_output = true;
-                break;
+                let mut paths: Vec<_> = files.iter().map(|e| e.path()).collect();
+                paths.sort();
+                if let Some(latest_path) = paths.last() {
+                    let content = fs::read_to_string(latest_path).unwrap();
+                    println!("Multimodal Test: Researcher output: {}", content);
+                    if let Some(start) = content.find('{') {
+                        if let Some(end) = content.rfind('}') {
+                            let json_str = &content[start..=end];
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                researcher_data = Some(val);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    assert!(
-        found_researcher_output,
-        "Researcher failed to produce output"
-    );
+    let researcher_data = researcher_data.expect("Researcher failed to produce valid JSON output");
+    assert!(researcher_data["colors"].is_array());
 
-    // 5. Wait for Coder Output (triggered by researcher output)
-    println!("Colony Test: Waiting for coder...");
-    let mut found_coder_output = false;
-    for i in 0..180 {
+    // 5. Coder should have been triggered automatically. Wait for its output.
+    println!("Multimodal Test: Waiting for coder to acknowledge research...");
+    fs::write(coder_system.join("prompt.txt"),
+        "When you see JSON research data, output only a strict JSON format response object: {'status': 'received', 'domain': 'vision'}."
+    ).unwrap();
+
+    let mut coder_data = None;
+    for _ in 0..120 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Ok(entries) = fs::read_dir(&coder_output) {
             let files: Vec<_> = entries.filter_map(|e| e.ok()).collect();
             if !files.is_empty() {
-                println!("Colony Test: Coder produced output after {}s", i);
-                found_coder_output = true;
-                break;
+                let mut paths: Vec<_> = files.iter().map(|e| e.path()).collect();
+                paths.sort();
+                if let Some(latest_path) = paths.last() {
+                    let content = fs::read_to_string(latest_path).unwrap();
+                    println!("Multimodal Test: Coder output: {}", content);
+                    if let Some(start) = content.find('{') {
+                        if let Some(end) = content.rfind('}') {
+                            let json_str = &content[start..=end];
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                coder_data = Some(val);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     // 6. Shutdown
-    println!("Colony Test: Shutting down...");
     let _ = Command::new("cargo")
-        .args(["run", "--bin", "ag", "--", "shutdown"])
+        .args(["run", "--release", "--bin", "ag", "--", "shutdown"])
         .output()
         .await;
     let _ = leader.kill().await;
     cleanup_sockets().await;
 
     assert!(
-        found_coder_output,
-        "Coder failed to trigger from researcher output"
+        coder_data.is_some(),
+        "Coder failed to trigger and produce JSON acknowledgment"
     );
+    assert_eq!(coder_data.unwrap()["status"], "received");
 }

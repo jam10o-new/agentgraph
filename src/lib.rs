@@ -10,5 +10,5 @@ pub mod ipc;
 pub use config::Config;
 pub use leader::Leader;
 pub use agent::Agent;
-pub use utils::find_leader_socket;
+pub use utils::{find_leader_socket, AgentLogger};
 pub use ipc::Command;

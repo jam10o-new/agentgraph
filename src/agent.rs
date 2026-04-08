@@ -2,6 +2,7 @@ use crate::config::{AgentConfig, Config};
 use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_frontmatter};
 use crate::ipc::Command;
 use crate::find_leader_socket;
+use crate::utils::AgentLogger;
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -9,7 +10,7 @@ use notify::{Watcher, RecursiveMode, Event};
 use std::path::{Path, PathBuf};
 use mistralrs::{
     Model, RequestBuilder, SamplingParams, TextMessageRole, Response,
-    Tool, ToolType, Function, ToolChoice,
+    Tool, ToolType, Function, ToolChoice, MultimodalMessages,
 };
 use tokio::fs;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -36,17 +37,19 @@ pub struct Agent {
     pub model: Arc<Model>,
     pub sampling: SamplingParams,
     pub volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
+    pub logger: AgentLogger,
 }
 
 impl Agent {
     pub fn new(name: String, config: AgentConfig, global_config: Config, model: Arc<Model>, sampling: SamplingParams) -> Self {
         Self {
-            name,
+            name: name.clone(),
             config,
             global_config,
             model,
             sampling,
             volatile_context: Arc::new(Mutex::new(Vec::new())),
+            logger: AgentLogger::new(&name),
         }
     }
 
@@ -60,7 +63,6 @@ impl Agent {
             }
         })?;
 
-        // Canonicalize and watch all input directories
         let mut canonical_inputs = Vec::new();
         for input_path in &self.config.inputs {
             let p = PathBuf::from(input_path);
@@ -70,13 +72,12 @@ impl Agent {
             canonical_inputs.push(cp);
         }
         
-        // Ensure output and system directories exist
         fs::create_dir_all(&self.config.output).await?;
         for sys_path in &self.config.system {
-            fs::create_dir_all(sys_path).await?;
+            let _ = fs::create_dir_all(sys_path).await;
         }
 
-        println!("Agent {} watching inputs: {:?}", name, canonical_inputs);
+        self.logger.log(&format!("Watching inputs: {:?}", canonical_inputs)).await;
 
         let mut current_inference: Option<tokio::task::JoinHandle<()>> = None;
         let (interrupt_tx, _) = watch::channel(false);
@@ -101,9 +102,9 @@ impl Agent {
                 }
                 _ = &mut debounce_timer, if timer_active => {
                     timer_active = false;
-                    println!("Agent {}: Triggering inference after debounce", name);
+                    while let Ok(_) = rx.try_recv() {}
+                    self.logger.log("Triggering inference after debounce").await;
                     
-                    // Signal interrupt to current inference if any
                     let _ = interrupt_tx.send(true);
                     if let Some(handle) = current_inference.take() {
                         handle.abort();
@@ -115,12 +116,13 @@ impl Agent {
                     let global_config = self.global_config.clone();
                     let sampling = self.sampling.clone();
                     let agent_name = name.clone();
+                    let log_name = name.clone();
                     let interrupt_rx = interrupt_tx.subscribe();
                     let volatile_context = self.volatile_context.clone();
-                    let log_name = name.clone();
+                    let logger = AgentLogger::new(&name);
                     
                     current_inference = Some(tokio::spawn(async move {
-                        if let Err(e) = run_inference(agent_name, model, config, global_config, sampling, interrupt_rx, volatile_context).await {
+                        if let Err(e) = run_inference(agent_name, model, config, global_config, sampling, interrupt_rx, volatile_context, logger).await {
                             eprintln!("Inference error for agent {}: {:?}", log_name, e);
                         }
                     }));
@@ -138,15 +140,16 @@ struct FileEntry {
 }
 
 async fn run_inference(
-    name: String,
+    _name: String,
     model: Arc<Model>,
     config: AgentConfig,
     global_config: Config,
     sampling: SamplingParams,
     interrupt_rx: watch::Receiver<bool>,
     volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
+    logger: AgentLogger,
 ) -> Result<()> {
-    println!("Agent {}: Starting inference", name);
+    logger.log("Starting inference turn").await;
     
     // 1. Collate System Prompts
     let mut system_content = String::new();
@@ -175,60 +178,37 @@ async fn run_inference(
         }
     }
 
-    // 2. Collate User and Assistant History by Creation Time
+    // 2. Collate User and Assistant History
     let mut all_files = Vec::new();
-    
-    // Gather Inputs (User)
     for input_dir in &config.inputs {
         if let Ok(mut entries) = fs::read_dir(input_dir).await {
             while let Some(entry) = entries.next_entry().await? {
                 let p = entry.path();
                 if p.is_file() {
                     let metadata = fs::metadata(&p).await?;
-                    all_files.push(FileEntry {
-                        path: p,
-                        created: metadata.created()?,
-                        role: HistoryTurnRole::User,
-                    });
+                    all_files.push(FileEntry { path: p, created: metadata.created()?, role: HistoryTurnRole::User });
                 }
             }
         }
     }
-
-    // Gather Output (Assistant)
     if let Ok(mut entries) = fs::read_dir(&config.output).await {
         while let Some(entry) = entries.next_entry().await? {
             let p = entry.path();
             if p.is_file() {
                 let metadata = fs::metadata(&p).await?;
-                all_files.push(FileEntry {
-                    path: p,
-                    created: metadata.created()?,
-                    role: HistoryTurnRole::Assistant,
-                });
+                all_files.push(FileEntry { path: p, created: metadata.created()?, role: HistoryTurnRole::Assistant });
             }
         }
     }
-
-    // Sort by creation time
     all_files.sort_by_key(|f| f.created);
 
-    // Apply history limit
     let limit = config.history_limit.unwrap_or(0);
-    let start_idx = if limit > 0 && all_files.len() > limit {
-        all_files.len() - limit
-    } else {
-        0
-    };
+    let start_idx = if limit > 0 && all_files.len() > limit { all_files.len() - limit } else { 0 };
 
     let mut turn_idx = 1;
     for entry in all_files.iter().skip(start_idx) {
         if let Ok(content) = fs::read_to_string(&entry.path).await {
-            combined_history.push(HistoryTurn {
-                role: entry.role.clone(),
-                content,
-                turn_index: turn_idx,
-            });
+            combined_history.push(HistoryTurn { role: entry.role.clone(), content, turn_index: turn_idx });
             turn_idx += 1;
         }
     }
@@ -255,15 +235,34 @@ async fn run_inference(
     );
     let compressed_context = comp_mgr.get_compressed_context(model.clone(), &history, &latest_user_input, sampling.clone()).await?;
 
-    let mut messages = RequestBuilder::new();
-    for (role, content) in compressed_context { messages = messages.add_message(role, content); }
-    
+    // 4. Build Request
+    let mut multimodal = MultimodalMessages::new();
+    for (role, content) in compressed_context { multimodal = multimodal.add_message(role, content); }
     {
         let mut v_ctx = volatile_context.lock().await;
-        for (role, content) in v_ctx.drain(..) { messages = messages.add_message(role, content); }
+        for (role, content) in v_ctx.drain(..) { multimodal = multimodal.add_message(role, content); }
     }
 
-    messages = messages.add_message(TextMessageRole::User, &latest_user_input);
+    let mut images = Vec::new();
+    for input_dir in &config.inputs {
+        if let Ok(mut entries) = fs::read_dir(input_dir).await {
+            while let Some(entry) = entries.next_entry().await? {
+                let p = entry.path();
+                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                    if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp") {
+                        if let Ok(img) = image::open(&p) { images.push(img); }
+                    }
+                }
+            }
+        }
+    }
+
+    if !images.is_empty() {
+        logger.log(&format!("Adding {} images to request", images.len())).await;
+        multimodal = multimodal.add_image_message(TextMessageRole::User, &latest_user_input, images);
+    } else {
+        multimodal = multimodal.add_message(TextMessageRole::User, &latest_user_input);
+    }
 
     let tools = vec![
         Tool {
@@ -316,31 +315,33 @@ async fn run_inference(
     let timestamp = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
     let output_file_path = PathBuf::from(&config.output).join(format!("out-{}.txt", timestamp));
     
-    // In streaming mode, create the file early. In non-streaming, wait.
     let mut file = if config.stream {
+        logger.log(&format!("Streaming enabled, creating output file: {:?}", output_file_path)).await;
         Some(fs::File::create(&output_file_path).await?)
     } else {
+        logger.log("Streaming disabled, will create output file after completion").await;
         None
     };
 
-    let mut request = messages.set_sampling(sampling).set_tools(tools).set_tool_choice(ToolChoice::Auto);
+    let mut request = RequestBuilder::from(multimodal)
+        .set_sampling(sampling)
+        .set_tools(tools)
+        .set_tool_choice(ToolChoice::Auto);
     
     loop {
         let mut model_stream = model.stream_chat_request(request.clone()).await?;
         let mut accumulated_content = String::new();
-        let mut tool_calls = Vec::new();
+        let mut current_tool_calls = Vec::new();
 
         while let Some(chunk) = model_stream.next().await {
             if *interrupt_rx.borrow() { 
-                println!("Agent {}: Inference interrupted", name);
-                // Even on interrupt, we write what we have so far
+                logger.log("Inference interrupted").await;
                 if !accumulated_content.is_empty() {
                     if let Some(ref mut f) = file {
-                        f.write_all(accumulated_content.as_bytes()).await?;
-                        f.flush().await?;
+                        let _ = f.write_all(accumulated_content.as_bytes()).await;
+                        let _ = f.flush().await;
                     } else {
-                        // For non-streaming, create and write once on interrupt
-                        fs::write(&output_file_path, &accumulated_content).await?;
+                        let _ = fs::write(&output_file_path, &accumulated_content).await;
                     }
                 }
                 return Ok(()); 
@@ -351,12 +352,12 @@ async fn run_inference(
                         if let Some(ref content) = choice.delta.content {
                             accumulated_content.push_str(content);
                             if let Some(ref mut f) = file {
-                                f.write_all(content.as_bytes()).await?;
-                                f.flush().await?;
+                                let _ = f.write_all(content.as_bytes()).await;
+                                let _ = f.flush().await;
                             }
                         }
                         if let Some(ref tcs) = choice.delta.tool_calls {
-                            tool_calls.extend(tcs.clone());
+                            current_tool_calls.extend(tcs.clone());
                         }
                     }
                 }
@@ -364,15 +365,16 @@ async fn run_inference(
             }
         }
 
-        // For non-streaming, create and write full accumulated content at end of turn
         if !config.stream && !accumulated_content.is_empty() {
-            fs::write(&output_file_path, &accumulated_content).await?;
+            logger.log(&format!("Turn complete, writing to: {:?}", output_file_path)).await;
+            let _ = fs::write(&output_file_path, &accumulated_content).await;
         }
 
-        if tool_calls.is_empty() { break; }
+        if current_tool_calls.is_empty() { break; }
 
-        request = request.add_message_with_tool_call(TextMessageRole::Assistant, &accumulated_content, tool_calls.clone());
-        for tc in tool_calls {
+        logger.log(&format!("Executing {} tool calls", current_tool_calls.len())).await;
+        request = request.add_message_with_tool_call(TextMessageRole::Assistant, &accumulated_content, current_tool_calls.clone());
+        for tc in current_tool_calls {
             let result = match tc.function.name.as_str() {
                 "execute_command" => {
                     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
@@ -417,7 +419,7 @@ async fn run_inference(
         }
     }
 
-    println!("Agent {}: Inference complete.", name);
+    logger.log("Inference turn complete").await;
     Ok(())
 }
 
@@ -428,6 +430,6 @@ async fn send_ipc_command(cmd: Command) -> Result<String> {
     stream.write_all(&payload).await?;
     stream.flush().await?;
     let mut resp = String::new();
-    stream.read_to_string(&mut resp).await?;
+    let _ = stream.read_to_string(&mut resp).await;
     Ok(resp)
 }
