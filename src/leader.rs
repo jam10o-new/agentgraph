@@ -20,14 +20,18 @@ pub struct AgentEntry {
 
 pub struct Leader {
     pub config: Config,
-    pub model: Arc<mistralrs::Model>,
+    pub model: Option<Arc<mistralrs::Model>>,
     pub agents: Arc<Mutex<HashMap<String, AgentEntry>>>,
     pub sampling: SamplingParams,
 }
 
 impl Leader {
     pub async fn new(config: Config) -> Result<Self> {
-        let model = Arc::new(load_models(&config.models).await?);
+        let model = if config.models.is_empty() {
+            None
+        } else {
+            Some(Arc::new(load_models(&config.models).await?))
+        };
         
         let sampling = SamplingParams {
             temperature: config.sampling.temperature,
@@ -54,11 +58,13 @@ impl Leader {
     }
 
     pub async fn spawn_agent(&self, name: String, agent_config: AgentConfig) -> Result<()> {
+        let model = self.model.as_ref().ok_or_else(|| anyhow!("No models loaded in leader. Cannot spawn agent {}.", name))?;
+        
         let agent = Agent::new(
             name.clone(),
             agent_config.clone(),
             self.config.clone(),
-            self.model.clone(),
+            model.clone(),
             self.sampling.clone(),
         );
         
@@ -106,7 +112,7 @@ impl Leader {
         println!("Leader PID {} listening on {:?}", pid, pipe_path);
 
         let agents = self.agents.clone();
-        let model = self.model.clone();
+        let model_opt = self.model.clone();
         let global_config = self.config.clone();
         let sampling = self.sampling.clone();
 
@@ -114,7 +120,7 @@ impl Leader {
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
                     let agents = agents.clone();
-                    let model = model.clone();
+                    let model_opt = model_opt.clone();
                     let global_config = global_config.clone();
                     let sampling = sampling.clone();
                     
@@ -124,22 +130,26 @@ impl Leader {
                             if let Ok(cmd) = serde_json::from_slice::<Command>(&buf) {
                                 match cmd {
                                     Command::SpawnAgent { name, config } => {
-                                        println!("IPC: Spawning agent {}", name);
-                                        let agent = Agent::new(name.clone(), config.clone(), global_config, model, sampling);
-                                        let trigger_path = PathBuf::from(config.inputs.first().cloned().unwrap_or_else(|| ".".into()));
-                                        let volatile_context = agent.volatile_context.clone();
-                                        
-                                        let mut agents_map = agents.lock().await;
-                                        if let Some(e) = agents_map.remove(&name) { e.handle.abort(); }
-                                        
-                                        let name_for_log = name.clone();
-                                        let handle = tokio::spawn(async move {
-                                            if let Err(err) = agent.run_loop().await {
-                                                eprintln!("Agent {} loop error: {:?}", name_for_log, err);
-                                            }
-                                        });
-                                        agents_map.insert(name, AgentEntry { handle, volatile_context, trigger_path });
-                                        let _ = stream.write_all(b"Agent Spawned").await;
+                                        if let Some(model) = &model_opt {
+                                            println!("IPC: Spawning agent {}", name);
+                                            let agent = Agent::new(name.clone(), config.clone(), global_config, model.clone(), sampling);
+                                            let trigger_path = PathBuf::from(config.inputs.first().cloned().unwrap_or_else(|| ".".into()));
+                                            let volatile_context = agent.volatile_context.clone();
+                                            
+                                            let mut agents_map = agents.lock().await;
+                                            if let Some(e) = agents_map.remove(&name) { e.handle.abort(); }
+                                            
+                                            let name_for_log = name.clone();
+                                            let handle = tokio::spawn(async move {
+                                                if let Err(err) = agent.run_loop().await {
+                                                    eprintln!("Agent {} loop error: {:?}", name_for_log, err);
+                                                }
+                                            });
+                                            agents_map.insert(name, AgentEntry { handle, volatile_context, trigger_path });
+                                            let _ = stream.write_all(b"Agent Spawned").await;
+                                        } else {
+                                            let _ = stream.write_all(b"Error: No models loaded in leader").await;
+                                        }
                                     }
                                     Command::RunAgent(name, message) => {
                                         let agents_map = agents.lock().await;
@@ -167,7 +177,7 @@ impl Leader {
                                     }
                                     Command::Status => {
                                         let agents_map = agents.lock().await;
-                                        let status = format!("Active Agents: {:?}", agents_map.keys().collect::<Vec<_>>());
+                                        let status = format!("Active Agents: {:?}\nModels Loaded: {}", agents_map.keys().collect::<Vec<_>>(), model_opt.is_some());
                                         let _ = stream.write_all(status.as_bytes()).await;
                                     }
                                     Command::Shutdown => {
