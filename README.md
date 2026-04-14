@@ -1,6 +1,6 @@
 # AgentGraph
 
-An async-first multi-agent daemon for real-time vision, audio, and text inference using `mistral.rs`. AgentGraph orchestrates multiple independent agents that communicate via the filesystem, utilizing a leader/follower pattern to maximize VRAM efficiency.
+An async-first multi-agent daemon for real-time vision, audio, and text inference using [`mistral.rs`](https://github.com/EricLBuehler/mistral.rs). AgentGraph orchestrates multiple independent agents that communicate via the filesystem, utilizing a leader/follower pattern to maximize VRAM efficiency.
 
 The usecases this was built for:
 - realtime chat summarization for streaming
@@ -22,7 +22,7 @@ What I am actively working on/roadmap:
 - running into issues that warrant upstream contribution.
 - testing tool use and colony orchestration.
 
-tl;dr: this is basically an opinionated, **vibecoded** (DO NOT USE FOR CRITICAL USECASES OR WITH UNTRUSTED INPUT! WE HAVE COMMAND EXECUTION AND NO SECURITY GUARDRAILS WHATSOEVER), wrapper and orchastration layer around [`mistral.rs`]("https://github.com/EricLBuehler/mistral.rs") where the filesystem is the primary medium for context engineering and management.
+tl;dr: this is basically an opinionated, **vibecoded** (DO NOT USE FOR CRITICAL USECASES OR WITH UNTRUSTED INPUT! WE HAVE COMMAND EXECUTION AND NO SECURITY GUARDRAILS WHATSOEVER), wrapper and orchastration layer around [`mistral.rs`](https://github.com/EricLBuehler/mistral.rs) where the filesystem is the primary medium for context engineering and management.
 
 Protip: Use and spawn with [`psi-cli`](https://github.com/jam10o-new/psi-cli) - a minimal AF chat harness.
 
