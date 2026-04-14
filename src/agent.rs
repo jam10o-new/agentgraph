@@ -169,6 +169,11 @@ async fn run_inference(
         }
     }
 
+    if let Some(extra_prompt) = &config.prompt {
+        if !system_content.is_empty() { system_content.push_str("\n\n"); }
+        system_content.push_str(extra_prompt);
+    }
+
     let mut combined_history = Vec::new();
     if !system_content.is_empty() {
         if let Some((n, d, body)) = extract_frontmatter(&system_content) {
@@ -277,6 +282,7 @@ async fn run_inference(
                         "args": {"type": "array", "items": {"type": "string"}}
                     }
                 })),
+                strict: None,
             }
         },
         Tool {
@@ -292,9 +298,11 @@ async fn run_inference(
                         "output": {"type": "string"},
                         "system": {"type": "array", "items": {"type": "string"}},
                         "model": {"type": "string"},
-                        "history_limit": {"type": "integer", "nullable": true}
+                        "history_limit": {"type": "integer", "nullable": true},
+                        "prompt": {"type": "string", "nullable": true}
                     }
                 })),
+                strict: None,
             }
         },
         Tool {
@@ -308,6 +316,7 @@ async fn run_inference(
                         "files": {"type": "array", "items": {"type": "string"}}
                     }
                 })),
+                strict: None,
             }
         }
     ];
@@ -396,6 +405,7 @@ async fn run_inference(
                         history_limit: args["history_limit"].as_u64().map(|u| u as usize),
                         stream: true,
                         allowed_extensions: vec![],
+                        prompt: args["prompt"].as_str().map(|s| s.to_string()),
                     };
                     send_ipc_command(Command::SpawnAgent { name, config }).await.unwrap_or_else(|e| e.to_string())
                 }

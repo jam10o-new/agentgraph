@@ -46,6 +46,7 @@ pub struct AgentConfig {
     pub stream: bool,
     #[serde(default)]
     pub allowed_extensions: Vec<String>,
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

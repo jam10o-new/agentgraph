@@ -62,6 +62,9 @@ enum Commands {
         /// Enable streaming
         #[arg(short, long, default_value_t = true)]
         stream: bool,
+        /// Extra system prompt
+        #[arg(short, long)]
+        prompt: Option<String>,
     },
 }
 
@@ -75,7 +78,7 @@ async fn main() -> Result<()> {
             let leader = Leader::new(config).await?;
             leader.run().await?;
         }
-        Commands::Spawn { name, inputs, output, system, model, limit, stream } => {
+        Commands::Spawn { name, inputs, output, system, model, limit, stream, prompt } => {
             let config = AgentConfig {
                 inputs,
                 output,
@@ -84,6 +87,7 @@ async fn main() -> Result<()> {
                 history_limit: limit,
                 stream,
                 allowed_extensions: vec![],
+                prompt,
             };
             let cmd = Command::SpawnAgent { name, config };
             send_command(cmd).await?;

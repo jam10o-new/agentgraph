@@ -5,11 +5,11 @@ models:
   primary:
     id: "gemma-4-E4B"
     builder: "vision"
-    path: "google/gemma-4-E4B"
+    path: "google/gemma-4-E4B-it"
     isq: "4"
     # Optional: Path to a .json chat template or a literal Jinja string, which overrides any provided template.
-    # Defaults to "mistralrs-fork/chat_templates/chatml.json" if omitted, or model-provided if available.
-    chat_template: "mistralrs-fork/chat_templates/chatml.json"
+    # Defaults to model-provided if available.
+    # chat_template: "path/to/chatml.json"
   vision:
     id: "qwen35"
     builder: "vision"
