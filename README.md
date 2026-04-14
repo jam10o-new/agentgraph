@@ -93,7 +93,6 @@ Each agent watches a specific directory structure:
 - `input/`: Any new file triggers a "turn". Text files are read as user input; images are attached as multimodal data.
 - `system/`: Contains `.md` or `.txt` files used as system prompts. Supports YAML frontmatter for "Skills".
 - `output/`: Assistant responses are streamed here in real-time.
-- `interrupt`: Creating this file immediately aborts the agent's current inference.
 
 ### Tool Execution
 When a model issues a tool call, the agent loop handles the execution and feeds the results back into the context for a follow-up turn. This allows for complex multi-step reasoning and environment interaction.
