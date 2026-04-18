@@ -1,12 +1,12 @@
 use ag_config::{AgentConfig, CompressionConfig, Config, ModelConfig, SamplingConfig};
 use eframe::egui;
 use egui_snarl::{
-    ui::{PinInfo, SnarlPin, SnarlStyle, SnarlViewer},
     InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
+    ui::{PinInfo, SnarlPin, SnarlStyle, SnarlViewer},
 };
 use std::collections::HashMap;
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 enum MyNode {
     Model {
         name: String,
@@ -22,11 +22,16 @@ enum MyNode {
         name: String,
         inputs: Vec<String>,
         output_dir: String,
-        system: Vec<String>,
+        system_prompt_dirs: Vec<String>,
         history_limit: Option<usize>,
         stream: bool,
         allowed_extensions: Vec<String>,
-        prompt: Option<String>,
+        addendum_prompt: Option<String>,
+    },
+    GlobalConfig {
+        sampling: SamplingConfig,
+        compression: CompressionConfig,
+        shutdown_on_idle: bool,
     },
 }
 
@@ -51,6 +56,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
                     format!("Agent: {}", name)
                 }
             }
+            MyNode::GlobalConfig { .. } => "Global Config".to_string(),
         }
     }
 
@@ -58,18 +64,15 @@ impl SnarlViewer<MyNode> for DemoViewer {
         match node {
             MyNode::Model { .. } => 1,
             MyNode::Agent { .. } => 1,
+            MyNode::GlobalConfig { .. } => 0,
         }
     }
 
     fn inputs(&mut self, node: &MyNode) -> usize {
         match node {
             MyNode::Model { .. } => 0,
-            MyNode::Agent { inputs, .. } => {
-                // Pin 0: Model
-                // Pins 1..=N: Inputs
-                // Pin N+1: Empty input for new connections
-                inputs.len() + 2
-            }
+            MyNode::Agent { inputs, .. } => inputs.len() + 2,
+            MyNode::GlobalConfig { .. } => 0,
         }
     }
 
@@ -85,7 +88,6 @@ impl SnarlViewer<MyNode> for DemoViewer {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<MyNode>,
     ) {
-        ui.set_min_width(200.0);
         let node = &mut snarl[node_id];
         match node {
             MyNode::Model {
@@ -98,60 +100,69 @@ impl SnarlViewer<MyNode> for DemoViewer {
                 builder,
                 chat_template,
             } => {
-                ui.horizontal(|ui| {
-                    ui.label("Name:");
-                    ui.text_edit_singleline(name);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Model ID:");
-                    egui::ComboBox::from_id_salt(format!("model-id-{:?}", node_id))
-                        .selected_text(&*model_id)
-                        .show_ui(ui, |ui| {
-                            for m in &self.hf_models {
-                                ui.selectable_value(model_id, m.clone(), m);
-                            }
-                        });
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Builder:");
-                    ui.text_edit_singleline(builder);
-                });
+                ui.set_width(300.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(name);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("ID:");
+                        egui::ComboBox::from_id_salt(format!("model-id-{:?}", node_id))
+                            .selected_text(&*model_id)
+                            .show_ui(ui, |ui| {
+                                for m in &self.hf_models {
+                                    ui.selectable_value(model_id, m.clone(), m);
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Builder:");
+                        ui.text_edit_singleline(builder);
+                    });
 
-                ui.collapsing("Advanced", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Path:");
-                        let mut p = path.clone().unwrap_or_default();
-                        if ui.text_edit_singleline(&mut p).changed() {
-                            *path = if p.is_empty() { None } else { Some(p) };
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("GGUF:");
-                        let mut g = gguf.clone().unwrap_or_default();
-                        if ui.text_edit_singleline(&mut g).changed() {
-                            *gguf = if g.is_empty() { None } else { Some(g) };
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("ISQ:");
-                        let mut i = isq.clone().unwrap_or_default();
-                        if ui.text_edit_singleline(&mut i).changed() {
-                            *isq = if i.is_empty() { None } else { Some(i) };
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("DType:");
-                        let mut d = dtype.clone().unwrap_or_default();
-                        if ui.text_edit_singleline(&mut d).changed() {
-                            *dtype = if d.is_empty() { None } else { Some(d) };
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Template:");
-                        let mut t = chat_template.clone().unwrap_or_default();
-                        if ui.text_edit_singleline(&mut t).changed() {
-                            *chat_template = if t.is_empty() { None } else { Some(t) };
-                        }
+                    ui.separator();
+
+                    ui.collapsing("Advanced Fields", |ui| {
+                        egui::Grid::new(format!("model_grid_{:?}", node_id))
+                            .num_columns(2)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("Path:");
+                                let mut p = path.clone().unwrap_or_default();
+                                if ui.text_edit_singleline(&mut p).changed() {
+                                    *path = if p.is_empty() { None } else { Some(p) };
+                                }
+                                ui.end_row();
+
+                                ui.label("GGUF:");
+                                let mut g = gguf.clone().unwrap_or_default();
+                                if ui.text_edit_singleline(&mut g).changed() {
+                                    *gguf = if g.is_empty() { None } else { Some(g) };
+                                }
+                                ui.end_row();
+
+                                ui.label("ISQ:");
+                                let mut i = isq.clone().unwrap_or_default();
+                                if ui.text_edit_singleline(&mut i).changed() {
+                                    *isq = if i.is_empty() { None } else { Some(i) };
+                                }
+                                ui.end_row();
+
+                                ui.label("DType:");
+                                let mut d = dtype.clone().unwrap_or_default();
+                                if ui.text_edit_singleline(&mut d).changed() {
+                                    *dtype = if d.is_empty() { None } else { Some(d) };
+                                }
+                                ui.end_row();
+
+                                ui.label("Template:");
+                                let mut t = chat_template.clone().unwrap_or_default();
+                                if ui.text_edit_singleline(&mut t).changed() {
+                                    *chat_template = if t.is_empty() { None } else { Some(t) };
+                                }
+                                ui.end_row();
+                            });
                     });
                 });
             }
@@ -159,96 +170,185 @@ impl SnarlViewer<MyNode> for DemoViewer {
                 name,
                 inputs,
                 output_dir,
-                system,
+                system_prompt_dirs,
                 history_limit,
                 stream,
                 allowed_extensions,
-                prompt,
+                addendum_prompt,
             } => {
-                ui.horizontal(|ui| {
-                    ui.label("Name:");
-                    ui.text_edit_singleline(name);
-                });
+                ui.set_width(500.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(name);
+                    });
 
-                ui.group(|ui| {
-                    ui.label("Inputs (Paths):");
-                    let mut to_remove = None;
-                    for (i, input) in inputs.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.text_edit_singleline(input);
-                            if ui.button("x").clicked() {
-                                to_remove = Some(i);
+                    ui.separator();
+
+                    ui.columns(2, |columns| {
+                        columns[0].vertical(|ui| {
+                            ui.label(egui::RichText::new("Inputs").strong());
+                            let mut to_remove = None;
+                            for (i, input) in inputs.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.text_edit_singleline(input);
+                                    if ui.button("📁").clicked() {
+                                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                            *input = path.display().to_string();
+                                        }
+                                    }
+                                    if ui.button("❌").clicked() {
+                                        to_remove = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(i) = to_remove {
+                                inputs.remove(i);
+                            }
+                            if ui.button("➕ Add Input").clicked() {
+                                inputs.push(String::new());
                             }
                         });
-                    }
-                    if let Some(i) = to_remove {
-                        inputs.remove(i);
-                    }
-                    if ui.button("+ Add Input").clicked() {
-                        inputs.push(String::new());
-                    }
-                });
 
-                ui.horizontal(|ui| {
-                    ui.label("Output Dir:");
-                    ui.text_edit_singleline(output_dir);
-                });
-
-                ui.collapsing("Agent Config", |ui| {
-                    ui.checkbox(stream, "Stream");
-                    ui.horizontal(|ui| {
-                        ui.label("History Limit:");
-                        let mut hl = history_limit.unwrap_or(0);
-                        if ui.add(egui::DragValue::new(&mut hl)).changed() {
-                            *history_limit = if hl == 0 { None } else { Some(hl) };
-                        }
-                    });
-
-                    ui.group(|ui| {
-                        ui.label("System Prompts:");
-                        let mut to_remove = None;
-                        for (i, s) in system.iter_mut().enumerate() {
+                        columns[1].vertical(|ui| {
+                            ui.label(egui::RichText::new("Output").strong());
                             ui.horizontal(|ui| {
-                                ui.text_edit_singleline(s);
-                                if ui.button("x").clicked() {
-                                    to_remove = Some(i);
+                                ui.text_edit_singleline(output_dir);
+                                if ui.button("📁").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        *output_dir = path.display().to_string();
+                                    }
                                 }
                             });
-                        }
-                        if let Some(i) = to_remove {
-                            system.remove(i);
-                        }
-                        if ui.button("+ Add System Prompt").clicked() {
-                            system.push(String::new());
-                        }
+
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("System Prompt Dirs").strong());
+                            let mut to_remove_sys = None;
+                            for (i, s) in system_prompt_dirs.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.text_edit_singleline(s);
+                                    if ui.button("📁").clicked() {
+                                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                            *s = path.display().to_string();
+                                        }
+                                    }
+                                    if ui.button("❌").clicked() {
+                                        to_remove_sys = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(i) = to_remove_sys {
+                                system_prompt_dirs.remove(i);
+                            }
+                            if ui.button("➕ Add System Dir").clicked() {
+                                system_prompt_dirs.push(String::new());
+                            }
+                        });
                     });
 
-                    ui.group(|ui| {
-                        ui.label("Allowed Extensions:");
-                        let mut to_remove = None;
-                        for (i, ext) in allowed_extensions.iter_mut().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.text_edit_singleline(ext);
-                                if ui.button("x").clicked() {
-                                    to_remove = Some(i);
-                                }
-                            });
-                        }
-                        if let Some(i) = to_remove {
-                            allowed_extensions.remove(i);
-                        }
-                        if ui.button("+ Add Extension").clicked() {
-                            allowed_extensions.push(".txt".to_string());
-                        }
-                    });
+                    ui.separator();
 
-                    ui.horizontal(|ui| {
-                        ui.label("Override Prompt:");
-                        let mut p = prompt.clone().unwrap_or_default();
-                        if ui.text_edit_singleline(&mut p).changed() {
-                            *prompt = if p.is_empty() { None } else { Some(p) };
+                    ui.collapsing("Advanced Configuration", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(stream, "Stream");
+                            ui.label("History:");
+                            let mut hl = history_limit.unwrap_or(0);
+                            if ui.add(egui::DragValue::new(&mut hl)).changed() {
+                                *history_limit = if hl == 0 { None } else { Some(hl) };
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.label("Allowed Extensions (comma separated):");
+                        let mut ext_str = allowed_extensions.join(", ");
+                        if ui.text_edit_singleline(&mut ext_str).changed() {
+                            *allowed_extensions = ext_str
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                        }
+
+                        ui.add_space(8.0);
+                        ui.label("Addendum / Inline Prompt:");
+                        let mut p = addendum_prompt.clone().unwrap_or_default();
+                        if ui
+                            .add(
+                                egui::TextEdit::multiline(&mut p)
+                                    .hint_text("Enter additional prompt context here...")
+                                    .desired_rows(4)
+                                    .desired_width(480.0),
+                            )
+                            .changed()
+                        {
+                            *addendum_prompt = if p.is_empty() { None } else { Some(p) };
                         }
                     });
+                });
+            }
+            MyNode::GlobalConfig {
+                sampling,
+                compression,
+                shutdown_on_idle,
+            } => {
+                ui.set_width(300.0);
+                ui.vertical(|ui| {
+                    ui.checkbox(shutdown_on_idle, "Shutdown on Idle");
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("Sampling").strong());
+                    egui::Grid::new(format!("sampling_grid_{:?}", node_id))
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Temp:");
+                            let mut t = sampling.temperature.unwrap_or(0.7);
+                            if ui
+                                .add(egui::DragValue::new(&mut t).speed(0.1).range(0.0..=2.0))
+                                .changed()
+                            {
+                                sampling.temperature = Some(t);
+                            }
+                            ui.end_row();
+
+                            ui.label("Top P:");
+                            let mut p = sampling.top_p.unwrap_or(1.0);
+                            if ui
+                                .add(egui::DragValue::new(&mut p).speed(0.01).range(0.0..=1.0))
+                                .changed()
+                            {
+                                sampling.top_p = Some(p);
+                            }
+                            ui.end_row();
+
+                            ui.label("Max Len:");
+                            let mut ml = sampling.max_len.unwrap_or(0);
+                            if ui.add(egui::DragValue::new(&mut ml)).changed() {
+                                sampling.max_len = if ml == 0 { None } else { Some(ml) };
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("Compression").strong());
+                    egui::Grid::new(format!("compression_grid_{:?}", node_id))
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Threshold:");
+                            ui.add(
+                                egui::DragValue::new(&mut compression.threshold)
+                                    .speed(0.05)
+                                    .range(0.0..=1.0),
+                            );
+                            ui.end_row();
+
+                            ui.label("Inv Prob:");
+                            ui.add(
+                                egui::DragValue::new(&mut compression.inverse_probability)
+                                    .speed(0.05)
+                                    .range(0.0..=1.0),
+                            );
+                            ui.end_row();
+                        });
                 });
             }
         }
@@ -268,15 +368,16 @@ impl SnarlViewer<MyNode> for DemoViewer {
             MyNode::Agent { inputs, .. } => {
                 if pin.id.input == 0 {
                     ui.label("Model");
-                    pin_info.fill = Some(egui::Color32::from_rgb(238, 207, 109)); // Model yellow
+                    pin_info.fill = Some(egui::Color32::from_rgb(238, 207, 109));
                 } else if pin.id.input <= inputs.len() {
-                    ui.label(format!("Input {}", pin.id.input));
-                    pin_info.fill = Some(egui::Color32::from_rgb(38, 109, 211)); // Input blue
+                    ui.label(format!("In {}", pin.id.input));
+                    pin_info.fill = Some(egui::Color32::from_rgb(38, 109, 211));
                 } else {
-                    ui.label("New Input");
-                    pin_info.fill = Some(egui::Color32::from_rgb(100, 100, 100)); // Grey
+                    ui.label("New Link");
+                    pin_info.fill = Some(egui::Color32::from_rgb(100, 100, 100));
                 }
             }
+            MyNode::GlobalConfig { .. } => {}
         }
         pin_info
     }
@@ -292,13 +393,14 @@ impl SnarlViewer<MyNode> for DemoViewer {
 
         match node {
             MyNode::Model { .. } => {
-                ui.label("Model");
+                ui.label("Model Out");
                 pin_info.fill = Some(egui::Color32::from_rgb(238, 207, 109));
             }
             MyNode::Agent { .. } => {
-                ui.label("Output Dir");
-                pin_info.fill = Some(egui::Color32::from_rgb(38, 211, 109)); // Output green
+                ui.label("Out Dir");
+                pin_info.fill = Some(egui::Color32::from_rgb(38, 211, 109));
             }
+            MyNode::GlobalConfig { .. } => {}
         }
         pin_info
     }
@@ -315,20 +417,17 @@ impl SnarlViewer<MyNode> for DemoViewer {
             }
             (MyNode::Agent { output_dir, .. }, MyNode::Agent { .. }) => {
                 if to.id.input > 0 {
-                    // If connecting to the "New Input" pin, add it to the inputs vector
                     let output_path = output_dir.clone();
                     let dest_node_mut = &mut snarl[to.id.node];
                     if let MyNode::Agent { inputs, .. } = dest_node_mut {
                         if to.id.input > inputs.len() {
                             inputs.push(output_path);
-                            // The actual connection will be to the newly created pin
                             let new_in_pin = InPinId {
                                 node: to.id.node,
                                 input: inputs.len(),
                             };
                             snarl.connect(from.id, new_in_pin);
                         } else {
-                            // Connecting to an existing input pin
                             snarl.connect(from.id, to.id);
                         }
                     }
@@ -363,10 +462,7 @@ impl SnarlApp {
     fn export_config(&self) -> Config {
         let mut config = Config {
             models: HashMap::new(),
-            sampling: SamplingConfig {
-                temperature: Some(0.7),
-                ..Default::default()
-            },
+            sampling: SamplingConfig::default(),
             agents: HashMap::new(),
             compression: CompressionConfig {
                 threshold: 0.5,
@@ -378,7 +474,22 @@ impl SnarlApp {
 
         let mut node_to_model_alias: HashMap<NodeId, String> = HashMap::new();
 
-        // Pass 1: Gather Models
+        // Pass 0: Global Config
+        for (_, node) in self.snarl.node_ids() {
+            if let MyNode::GlobalConfig {
+                sampling,
+                compression,
+                shutdown_on_idle,
+            } = node
+            {
+                config.sampling = sampling.clone();
+                config.compression = compression.clone();
+                config.shutdown_on_idle = *shutdown_on_idle;
+                break;
+            }
+        }
+
+        // Pass 1: Models
         for (node_id, node) in self.snarl.node_ids() {
             if let MyNode::Model {
                 name,
@@ -412,17 +523,17 @@ impl SnarlApp {
             }
         }
 
-        // Pass 2: Gather Agents and their connections
+        // Pass 2: Agents
         for (node_id, node) in self.snarl.node_ids() {
             if let MyNode::Agent {
                 name,
                 inputs,
                 output_dir,
-                system,
+                system_prompt_dirs,
                 history_limit,
                 stream,
                 allowed_extensions,
-                prompt,
+                addendum_prompt,
             } = node
             {
                 let agent_name = if name.is_empty() {
@@ -432,8 +543,6 @@ impl SnarlApp {
                 };
 
                 let mut model_alias = String::new();
-
-                // Get model connection from input pin 0
                 let in_pin_0 = self.snarl.in_pin(InPinId {
                     node: node_id,
                     input: 0,
@@ -445,7 +554,6 @@ impl SnarlApp {
                     }
                 }
 
-                // Gather inputs: prefer connected agent's output_dir, fallback to manual path
                 let mut resolved_inputs = Vec::new();
                 for (i, manual_path) in inputs.iter().enumerate() {
                     let pin_idx = i + 1;
@@ -467,7 +575,6 @@ impl SnarlApp {
                             break;
                         }
                     }
-
                     if !found_remote {
                         resolved_inputs.push(manual_path.clone());
                     }
@@ -478,18 +585,141 @@ impl SnarlApp {
                     AgentConfig {
                         inputs: resolved_inputs,
                         output: output_dir.clone(),
-                        system: system.clone(),
+                        system: system_prompt_dirs.clone(),
                         model: model_alias,
                         history_limit: *history_limit,
                         stream: *stream,
                         allowed_extensions: allowed_extensions.clone(),
-                        prompt: prompt.clone(),
+                        prompt: addendum_prompt.clone(),
                     },
                 );
             }
         }
-
         config
+    }
+
+    fn save_to_file(&self) -> anyhow::Result<()> {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("YAML", &["yaml", "yml"])
+            .save_file()
+        {
+            let config = self.export_config();
+            let yaml = serde_yaml::to_string(&config)?;
+            std::fs::write(path, yaml)?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Save cancelled"))
+        }
+    }
+
+    fn load_from_file(&mut self) -> anyhow::Result<()> {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("YAML", &["yaml", "yml"])
+            .pick_file()
+        {
+            let config = Config::load(&path)?;
+            self.snarl = Snarl::new();
+
+            let mut model_alias_to_id = HashMap::new();
+            let mut agent_name_to_id = HashMap::new();
+
+            // 1. Global Config
+            self.snarl.insert_node(
+                egui::Pos2::new(0.0, -200.0),
+                MyNode::GlobalConfig {
+                    sampling: config.sampling.clone(),
+                    compression: config.compression.clone(),
+                    shutdown_on_idle: config.shutdown_on_idle,
+                },
+            );
+
+            // 2. Models
+            let mut y_offset = 0.0;
+            for (alias, m) in &config.models {
+                let id = self.snarl.insert_node(
+                    egui::Pos2::new(0.0, y_offset),
+                    MyNode::Model {
+                        name: alias.clone(),
+                        model_id: m.id.clone(),
+                        path: m.path.clone(),
+                        gguf: m.gguf.clone(),
+                        isq: m.isq.clone(),
+                        dtype: m.dtype.clone(),
+                        builder: m.builder.clone(),
+                        chat_template: m.chat_template.clone(),
+                    },
+                );
+                model_alias_to_id.insert(alias.clone(), id);
+                y_offset += 300.0;
+            }
+
+            // 3. Agents
+            let mut x_offset = 500.0;
+            y_offset = 0.0;
+            for (name, a) in &config.agents {
+                let id = self.snarl.insert_node(
+                    egui::Pos2::new(x_offset, y_offset),
+                    MyNode::Agent {
+                        name: name.clone(),
+                        inputs: a.inputs.clone(),
+                        output_dir: a.output.clone(),
+                        system_prompt_dirs: a.system.clone(),
+                        history_limit: a.history_limit,
+                        stream: a.stream,
+                        allowed_extensions: a.allowed_extensions.clone(),
+                        addendum_prompt: a.prompt.clone(),
+                    },
+                );
+                agent_name_to_id.insert(name.clone(), id);
+                y_offset += 500.0;
+                if y_offset > 1500.0 {
+                    y_offset = 0.0;
+                    x_offset += 600.0;
+                }
+            }
+
+            // 4. Connections
+            for (name, a) in &config.agents {
+                let agent_id = agent_name_to_id[name];
+
+                // Model connection
+                if let Some(&model_id) = model_alias_to_id.get(&a.model) {
+                    self.snarl.connect(
+                        OutPinId {
+                            node: model_id,
+                            output: 0,
+                        },
+                        InPinId {
+                            node: agent_id,
+                            input: 0,
+                        },
+                    );
+                }
+
+                // Input connections
+                for (i, input_path) in a.inputs.iter().enumerate() {
+                    for (other_name, other_a) in &config.agents {
+                        if other_a.output == *input_path {
+                            let other_id = agent_name_to_id[other_name];
+                            self.snarl.connect(
+                                OutPinId {
+                                    node: other_id,
+                                    output: 0,
+                                },
+                                InPinId {
+                                    node: agent_id,
+                                    input: i + 1,
+                                },
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Load cancelled"))
+        }
     }
 }
 
@@ -497,7 +727,22 @@ impl eframe::App for SnarlApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Add Model").clicked() {
+                if ui.button("📁 Load").clicked() {
+                    if let Err(e) = self.load_from_file() {
+                        self.status = format!("Load Error: {}", e);
+                    } else {
+                        self.status = "Config Loaded".to_string();
+                    }
+                }
+                if ui.button("💾 Save").clicked() {
+                    if let Err(e) = self.save_to_file() {
+                        self.status = format!("Save Error: {}", e);
+                    } else {
+                        self.status = "Config Saved".to_string();
+                    }
+                }
+                ui.separator();
+                if ui.button("➕ Model").clicked() {
                     self.snarl.insert_node(
                         egui::Pos2::ZERO,
                         MyNode::Model {
@@ -507,32 +752,46 @@ impl eframe::App for SnarlApp {
                             gguf: None,
                             isq: None,
                             dtype: None,
-                            builder: "mistralrs".to_string(),
+                            builder: "vision".to_string(),
                             chat_template: None,
                         },
                     );
                 }
-                if ui.button("Add Agent").clicked() {
+                if ui.button("➕ Agent").clicked() {
                     self.snarl.insert_node(
                         egui::Pos2::ZERO,
                         MyNode::Agent {
                             name: String::new(),
                             inputs: Vec::new(),
                             output_dir: String::new(),
-                            system: Vec::new(),
+                            system_prompt_dirs: Vec::new(),
                             history_limit: None,
                             stream: true,
                             allowed_extensions: Vec::new(),
-                            prompt: None,
+                            addendum_prompt: None,
+                        },
+                    );
+                }
+                if ui.button("➕ Global").clicked() {
+                    self.snarl.insert_node(
+                        egui::Pos2::ZERO,
+                        MyNode::GlobalConfig {
+                            sampling: SamplingConfig::default(),
+                            compression: CompressionConfig {
+                                threshold: 0.5,
+                                inverse_probability: 0.9,
+                                resummarize_probability: 0.1,
+                            },
+                            shutdown_on_idle: false,
                         },
                     );
                 }
                 ui.separator();
-                if ui.button("Spawn Leader").clicked() {
+                if ui.button("🚀 Spawn").clicked() {
                     let config = self.export_config();
                     match spawn_leader(config) {
                         Ok(_) => self.status = "Leader Spawned".to_string(),
-                        Err(e) => self.status = format!("Error: {}", e),
+                        Err(e) => self.status = format!("Spawn Error: {}", e),
                     }
                 }
                 ui.label(&self.status);
