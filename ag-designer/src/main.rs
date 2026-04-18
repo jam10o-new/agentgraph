@@ -10,23 +10,11 @@ use std::collections::HashMap;
 enum MyNode {
     Model {
         name: String,
-        model_id: String,
-        path: Option<String>,
-        gguf: Option<String>,
-        isq: Option<String>,
-        dtype: Option<String>,
-        builder: String,
-        chat_template: Option<String>,
+        config: ModelConfig,
     },
     Agent {
         name: String,
-        inputs: Vec<String>,
-        output_dir: String,
-        system_prompt_dirs: Vec<String>,
-        history_limit: Option<usize>,
-        stream: bool,
-        allowed_extensions: Vec<String>,
-        addendum_prompt: Option<String>,
+        config: AgentConfig,
     },
     GlobalConfig {
         sampling: SamplingConfig,
@@ -71,7 +59,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
     fn inputs(&mut self, node: &MyNode) -> usize {
         match node {
             MyNode::Model { .. } => 0,
-            MyNode::Agent { inputs, .. } => inputs.len() + 2,
+            MyNode::Agent { config, .. } => config.inputs.len() + 2,
             MyNode::GlobalConfig { .. } => 0,
         }
     }
@@ -92,13 +80,16 @@ impl SnarlViewer<MyNode> for DemoViewer {
         match node {
             MyNode::Model {
                 name,
-                model_id,
-                path,
-                gguf,
-                isq,
-                dtype,
-                builder,
-                chat_template,
+                config:
+                    ModelConfig {
+                        id,
+                        path,
+                        gguf,
+                        isq,
+                        dtype,
+                        builder,
+                        chat_template,
+                    },
             } => {
                 ui.set_width(300.0);
                 ui.vertical(|ui| {
@@ -109,10 +100,10 @@ impl SnarlViewer<MyNode> for DemoViewer {
                     ui.horizontal(|ui| {
                         ui.label("ID:");
                         egui::ComboBox::from_id_salt(format!("model-id-{:?}", node_id))
-                            .selected_text(&*model_id)
+                            .selected_text(&*id)
                             .show_ui(ui, |ui| {
                                 for m in &self.hf_models {
-                                    ui.selectable_value(model_id, m.clone(), m);
+                                    ui.selectable_value(id, m.clone(), m);
                                 }
                             });
                     });
@@ -168,13 +159,17 @@ impl SnarlViewer<MyNode> for DemoViewer {
             }
             MyNode::Agent {
                 name,
-                inputs,
-                output_dir,
-                system_prompt_dirs,
-                history_limit,
-                stream,
-                allowed_extensions,
-                addendum_prompt,
+                config:
+                    AgentConfig {
+                        inputs,
+                        output,
+                        system,
+                        model: _, // Model is driven by wire
+                        history_limit,
+                        stream,
+                        allowed_extensions,
+                        prompt,
+                    },
             } => {
                 ui.set_width(500.0);
                 ui.vertical(|ui| {
@@ -213,10 +208,10 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         columns[1].vertical(|ui| {
                             ui.label(egui::RichText::new("Output").strong());
                             ui.horizontal(|ui| {
-                                ui.text_edit_singleline(output_dir);
+                                ui.text_edit_singleline(output);
                                 if ui.button("📁").clicked() {
                                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                        *output_dir = path.display().to_string();
+                                        *output = path.display().to_string();
                                     }
                                 }
                             });
@@ -224,7 +219,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
                             ui.add_space(8.0);
                             ui.label(egui::RichText::new("System Prompt Dirs").strong());
                             let mut to_remove_sys = None;
-                            for (i, s) in system_prompt_dirs.iter_mut().enumerate() {
+                            for (i, s) in system.iter_mut().enumerate() {
                                 ui.horizontal(|ui| {
                                     ui.text_edit_singleline(s);
                                     if ui.button("📁").clicked() {
@@ -238,10 +233,10 @@ impl SnarlViewer<MyNode> for DemoViewer {
                                 });
                             }
                             if let Some(i) = to_remove_sys {
-                                system_prompt_dirs.remove(i);
+                                system.remove(i);
                             }
                             if ui.button("➕ Add System Dir").clicked() {
-                                system_prompt_dirs.push(String::new());
+                                system.push(String::new());
                             }
                         });
                     });
@@ -271,7 +266,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
 
                         ui.add_space(8.0);
                         ui.label("Addendum / Inline Prompt:");
-                        let mut p = addendum_prompt.clone().unwrap_or_default();
+                        let mut p = prompt.clone().unwrap_or_default();
                         if ui
                             .add(
                                 egui::TextEdit::multiline(&mut p)
@@ -281,7 +276,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
                             )
                             .changed()
                         {
-                            *addendum_prompt = if p.is_empty() { None } else { Some(p) };
+                            *prompt = if p.is_empty() { None } else { Some(p) };
                         }
                     });
                 });
@@ -365,11 +360,11 @@ impl SnarlViewer<MyNode> for DemoViewer {
 
         match node {
             MyNode::Model { .. } => {}
-            MyNode::Agent { inputs, .. } => {
+            MyNode::Agent { config, .. } => {
                 if pin.id.input == 0 {
                     ui.label("Model");
                     pin_info.fill = Some(egui::Color32::from_rgb(238, 207, 109));
-                } else if pin.id.input <= inputs.len() {
+                } else if pin.id.input <= config.inputs.len() {
                     ui.label(format!("In {}", pin.id.input));
                     pin_info.fill = Some(egui::Color32::from_rgb(38, 109, 211));
                 } else {
@@ -415,16 +410,26 @@ impl SnarlViewer<MyNode> for DemoViewer {
                     snarl.connect(from.id, to.id);
                 }
             }
-            (MyNode::Agent { output_dir, .. }, MyNode::Agent { .. }) => {
+            (
+                MyNode::Agent {
+                    config: source_config,
+                    ..
+                },
+                MyNode::Agent { .. },
+            ) => {
                 if to.id.input > 0 {
-                    let output_path = output_dir.clone();
+                    let output_path = source_config.output.clone();
                     let dest_node_mut = &mut snarl[to.id.node];
-                    if let MyNode::Agent { inputs, .. } = dest_node_mut {
-                        if to.id.input > inputs.len() {
-                            inputs.push(output_path);
+                    if let MyNode::Agent {
+                        config: dest_config,
+                        ..
+                    } = dest_node_mut
+                    {
+                        if to.id.input > dest_config.inputs.len() {
+                            dest_config.inputs.push(output_path);
                             let new_in_pin = InPinId {
                                 node: to.id.node,
-                                input: inputs.len(),
+                                input: dest_config.inputs.len(),
                             };
                             snarl.connect(from.id, new_in_pin);
                         } else {
@@ -493,13 +498,7 @@ impl SnarlApp {
         for (node_id, node) in self.snarl.node_ids() {
             if let MyNode::Model {
                 name,
-                model_id,
-                path,
-                gguf,
-                isq,
-                dtype,
-                builder,
-                chat_template,
+                config: m_config,
             } = node
             {
                 let alias = if name.is_empty() {
@@ -507,18 +506,7 @@ impl SnarlApp {
                 } else {
                     name.clone()
                 };
-                config.models.insert(
-                    alias.clone(),
-                    ModelConfig {
-                        id: model_id.clone(),
-                        path: path.clone(),
-                        gguf: gguf.clone(),
-                        isq: isq.clone(),
-                        dtype: dtype.clone(),
-                        builder: builder.clone(),
-                        chat_template: chat_template.clone(),
-                    },
-                );
+                config.models.insert(alias.clone(), m_config.clone());
                 node_to_model_alias.insert(node_id, alias);
             }
         }
@@ -527,13 +515,7 @@ impl SnarlApp {
         for (node_id, node) in self.snarl.node_ids() {
             if let MyNode::Agent {
                 name,
-                inputs,
-                output_dir,
-                system_prompt_dirs,
-                history_limit,
-                stream,
-                allowed_extensions,
-                addendum_prompt,
+                config: a_config,
             } = node
             {
                 let agent_name = if name.is_empty() {
@@ -555,7 +537,7 @@ impl SnarlApp {
                 }
 
                 let mut resolved_inputs = Vec::new();
-                for (i, manual_path) in inputs.iter().enumerate() {
+                for (i, manual_path) in a_config.inputs.iter().enumerate() {
                     let pin_idx = i + 1;
                     let in_pin = self.snarl.in_pin(InPinId {
                         node: node_id,
@@ -566,11 +548,11 @@ impl SnarlApp {
                     for remote in in_pin.remotes {
                         let remote_node = &self.snarl[remote.node];
                         if let MyNode::Agent {
-                            output_dir: remote_output_dir,
+                            config: remote_config,
                             ..
                         } = remote_node
                         {
-                            resolved_inputs.push(remote_output_dir.clone());
+                            resolved_inputs.push(remote_config.output.clone());
                             found_remote = true;
                             break;
                         }
@@ -580,19 +562,11 @@ impl SnarlApp {
                     }
                 }
 
-                config.agents.insert(
-                    agent_name,
-                    AgentConfig {
-                        inputs: resolved_inputs,
-                        output: output_dir.clone(),
-                        system: system_prompt_dirs.clone(),
-                        model: model_alias,
-                        history_limit: *history_limit,
-                        stream: *stream,
-                        allowed_extensions: allowed_extensions.clone(),
-                        prompt: addendum_prompt.clone(),
-                    },
-                );
+                let mut final_agent_config = a_config.clone();
+                final_agent_config.inputs = resolved_inputs;
+                final_agent_config.model = model_alias;
+
+                config.agents.insert(agent_name, final_agent_config);
             }
         }
         config
@@ -640,13 +614,7 @@ impl SnarlApp {
                     egui::Pos2::new(0.0, y_offset),
                     MyNode::Model {
                         name: alias.clone(),
-                        model_id: m.id.clone(),
-                        path: m.path.clone(),
-                        gguf: m.gguf.clone(),
-                        isq: m.isq.clone(),
-                        dtype: m.dtype.clone(),
-                        builder: m.builder.clone(),
-                        chat_template: m.chat_template.clone(),
+                        config: m.clone(),
                     },
                 );
                 model_alias_to_id.insert(alias.clone(), id);
@@ -661,13 +629,7 @@ impl SnarlApp {
                     egui::Pos2::new(x_offset, y_offset),
                     MyNode::Agent {
                         name: name.clone(),
-                        inputs: a.inputs.clone(),
-                        output_dir: a.output.clone(),
-                        system_prompt_dirs: a.system.clone(),
-                        history_limit: a.history_limit,
-                        stream: a.stream,
-                        allowed_extensions: a.allowed_extensions.clone(),
-                        addendum_prompt: a.prompt.clone(),
+                        config: a.clone(),
                     },
                 );
                 agent_name_to_id.insert(name.clone(), id);
@@ -747,13 +709,15 @@ impl eframe::App for SnarlApp {
                         egui::Pos2::ZERO,
                         MyNode::Model {
                             name: String::new(),
-                            model_id: String::new(),
-                            path: None,
-                            gguf: None,
-                            isq: None,
-                            dtype: None,
-                            builder: "vision".to_string(),
-                            chat_template: None,
+                            config: ModelConfig {
+                                id: String::new(),
+                                path: None,
+                                gguf: None,
+                                isq: None,
+                                dtype: None,
+                                builder: "vision".to_string(),
+                                chat_template: None,
+                            },
                         },
                     );
                 }
@@ -762,30 +726,45 @@ impl eframe::App for SnarlApp {
                         egui::Pos2::ZERO,
                         MyNode::Agent {
                             name: String::new(),
-                            inputs: Vec::new(),
-                            output_dir: String::new(),
-                            system_prompt_dirs: Vec::new(),
-                            history_limit: None,
-                            stream: true,
-                            allowed_extensions: Vec::new(),
-                            addendum_prompt: None,
-                        },
-                    );
-                }
-                if ui.button("➕ Global").clicked() {
-                    self.snarl.insert_node(
-                        egui::Pos2::ZERO,
-                        MyNode::GlobalConfig {
-                            sampling: SamplingConfig::default(),
-                            compression: CompressionConfig {
-                                threshold: 0.5,
-                                inverse_probability: 0.9,
-                                resummarize_probability: 0.1,
+                            config: AgentConfig {
+                                inputs: Vec::new(),
+                                output: String::new(),
+                                system: Vec::new(),
+                                model: String::new(),
+                                history_limit: None,
+                                stream: true,
+                                allowed_extensions: Vec::new(),
+                                prompt: None,
                             },
-                            shutdown_on_idle: false,
                         },
                     );
                 }
+
+                let has_global = self
+                    .snarl
+                    .node_ids()
+                    .any(|(_, node)| matches!(node, MyNode::GlobalConfig { .. }));
+
+                ui.add_enabled_ui(!has_global, |ui| {
+                    if ui
+                        .button("➕ Global")
+                        .on_disabled_hover_text("Global config already exists")
+                        .clicked()
+                    {
+                        self.snarl.insert_node(
+                            egui::Pos2::ZERO,
+                            MyNode::GlobalConfig {
+                                sampling: SamplingConfig::default(),
+                                compression: CompressionConfig {
+                                    threshold: 0.5,
+                                    inverse_probability: 0.9,
+                                    resummarize_probability: 0.1,
+                                },
+                                shutdown_on_idle: false,
+                            },
+                        );
+                    }
+                });
                 ui.separator();
                 if ui.button("🚀 Spawn").clicked() {
                     let config = self.export_config();
