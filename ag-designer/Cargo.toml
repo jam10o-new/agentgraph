@@ -1,0 +1,19 @@
+[package]
+name = "ag-designer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.33"
+egui = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+ag-config = { path = "../ag-config" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+path-clean = "1.0"
+fd-lock = "4.0"
+rfd = "0.15" 
+egui-snarl = "0.9.0"
