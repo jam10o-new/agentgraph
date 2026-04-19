@@ -9,7 +9,7 @@ fn has_model_template(model_src: &str) -> bool {
         let tp = p.join("tokenizer_config.json");
         if let Ok(c) = std::fs::read_to_string(tp) {
             c.contains("\"chat_template\"")
-        } else if let Ok(_) = std::fs::exists(ct) {
+        } else if let Ok(true) = std::fs::exists(ct) {
             true
         } else {
             false
@@ -71,8 +71,6 @@ pub async fn load_models(
         // 3. Neither -> Use fallback
         let chat_template_override = if let Some(t) = &config.chat_template {
             Some(t.clone())
-        } else if !has_model_template(model_src) {
-            Some(default_chat_template.to_string())
         } else {
             None
         };
