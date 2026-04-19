@@ -5,9 +5,12 @@ use std::path::{Path, PathBuf};
 
 fn has_model_template(model_src: &str) -> bool {
     let check_file = |p: &Path| -> bool {
+        let ct = p.join("chat_template.jinja");
         let tp = p.join("tokenizer_config.json");
         if let Ok(c) = std::fs::read_to_string(tp) {
             c.contains("\"chat_template\"")
+        } else if let Ok(_) = std::fs::exists(ct) {
+            true
         } else {
             false
         }
