@@ -17,7 +17,6 @@ enum MyNode {
         config: AgentConfig,
     },
     GlobalConfig {
-        sampling: SamplingConfig,
         compression: CompressionConfig,
         shutdown_on_idle: bool,
     },
@@ -167,8 +166,10 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         model: _, // Model is driven by wire
                         history_limit,
                         stream,
+                        realtime_audio,
                         allowed_extensions,
                         prompt,
+                        sampling,
                     },
             } => {
                 ui.set_width(500.0);
@@ -243,9 +244,43 @@ impl SnarlViewer<MyNode> for DemoViewer {
 
                     ui.separator();
 
+                    ui.collapsing("Sampling", |ui| {
+                        egui::Grid::new(format!("sampling_grid_{:?}", node_id))
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                ui.label("Temp:");
+                                let mut t = sampling.temperature.unwrap_or(0.7);
+                                if ui
+                                    .add(egui::DragValue::new(&mut t).speed(0.1).range(0.0..=2.0))
+                                    .changed()
+                                {
+                                    sampling.temperature = Some(t);
+                                }
+                                ui.end_row();
+
+                                ui.label("Top P:");
+                                let mut p = sampling.top_p.unwrap_or(1.0);
+                                if ui
+                                    .add(egui::DragValue::new(&mut p).speed(0.01).range(0.0..=1.0))
+                                    .changed()
+                                {
+                                    sampling.top_p = Some(p);
+                                }
+                                ui.end_row();
+
+                                ui.label("Max Len:");
+                                let mut ml = sampling.max_len.unwrap_or(0);
+                                if ui.add(egui::DragValue::new(&mut ml)).changed() {
+                                    sampling.max_len = if ml == 0 { None } else { Some(ml) };
+                                }
+                                ui.end_row();
+                            });
+                    });
+
                     ui.collapsing("Advanced Configuration", |ui| {
                         ui.horizontal(|ui| {
                             ui.checkbox(stream, "Stream");
+                            ui.checkbox(realtime_audio, "Realtime Audio");
                             ui.label("History:");
                             let mut hl = history_limit.unwrap_or(0);
                             if ui.add(egui::DragValue::new(&mut hl)).changed() {
@@ -282,46 +317,12 @@ impl SnarlViewer<MyNode> for DemoViewer {
                 });
             }
             MyNode::GlobalConfig {
-                sampling,
                 compression,
                 shutdown_on_idle,
             } => {
                 ui.set_width(300.0);
                 ui.vertical(|ui| {
                     ui.checkbox(shutdown_on_idle, "Shutdown on Idle");
-
-                    ui.separator();
-                    ui.label(egui::RichText::new("Sampling").strong());
-                    egui::Grid::new(format!("sampling_grid_{:?}", node_id))
-                        .num_columns(2)
-                        .show(ui, |ui| {
-                            ui.label("Temp:");
-                            let mut t = sampling.temperature.unwrap_or(0.7);
-                            if ui
-                                .add(egui::DragValue::new(&mut t).speed(0.1).range(0.0..=2.0))
-                                .changed()
-                            {
-                                sampling.temperature = Some(t);
-                            }
-                            ui.end_row();
-
-                            ui.label("Top P:");
-                            let mut p = sampling.top_p.unwrap_or(1.0);
-                            if ui
-                                .add(egui::DragValue::new(&mut p).speed(0.01).range(0.0..=1.0))
-                                .changed()
-                            {
-                                sampling.top_p = Some(p);
-                            }
-                            ui.end_row();
-
-                            ui.label("Max Len:");
-                            let mut ml = sampling.max_len.unwrap_or(0);
-                            if ui.add(egui::DragValue::new(&mut ml)).changed() {
-                                sampling.max_len = if ml == 0 { None } else { Some(ml) };
-                            }
-                            ui.end_row();
-                        });
 
                     ui.separator();
                     ui.label(egui::RichText::new("Compression").strong());
@@ -467,7 +468,6 @@ impl SnarlApp {
     fn export_config(&self) -> Config {
         let mut config = Config {
             models: HashMap::new(),
-            sampling: SamplingConfig::default(),
             agents: HashMap::new(),
             compression: CompressionConfig {
                 threshold: 0.5,
@@ -482,12 +482,10 @@ impl SnarlApp {
         // Pass 0: Global Config
         for (_, node) in self.snarl.node_ids() {
             if let MyNode::GlobalConfig {
-                sampling,
                 compression,
                 shutdown_on_idle,
             } = node
             {
-                config.sampling = sampling.clone();
                 config.compression = compression.clone();
                 config.shutdown_on_idle = *shutdown_on_idle;
                 break;
@@ -601,7 +599,6 @@ impl SnarlApp {
             self.snarl.insert_node(
                 egui::Pos2::new(0.0, -200.0),
                 MyNode::GlobalConfig {
-                    sampling: config.sampling.clone(),
                     compression: config.compression.clone(),
                     shutdown_on_idle: config.shutdown_on_idle,
                 },
@@ -734,7 +731,9 @@ impl eframe::App for SnarlApp {
                                 history_limit: None,
                                 stream: true,
                                 allowed_extensions: Vec::new(),
+                                realtime_audio: false,
                                 prompt: None,
+                                sampling: SamplingConfig::default(),
                             },
                         },
                     );
@@ -754,7 +753,6 @@ impl eframe::App for SnarlApp {
                         self.snarl.insert_node(
                             egui::Pos2::ZERO,
                             MyNode::GlobalConfig {
-                                sampling: SamplingConfig::default(),
                                 compression: CompressionConfig {
                                     threshold: 0.5,
                                     inverse_probability: 0.9,
