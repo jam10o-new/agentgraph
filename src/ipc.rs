@@ -10,4 +10,5 @@ pub enum Command {
     ReloadConfig,
     Shutdown,
     SpawnAgent { name: String, config: AgentConfig },
+    UpdateConfig(crate::config::Config),
 }

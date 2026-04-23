@@ -40,8 +40,6 @@ pub async fn load_models(
 ) -> Result<mistralrs::Model> {
     let mut builder = MultiModelBuilder::new();
 
-    let default_chat_template = "mistralrs-fork/chat_templates/chatml.json";
-
     for (alias, config) in configs {
         let isq = match config.isq.as_deref() {
             Some("2") => Some(IsqBits::Two),

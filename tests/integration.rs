@@ -30,25 +30,25 @@ agents: {}
     let config_path = "test_config_uniqueness.yaml";
     fs::write(config_path, config_content).unwrap();
 
-    // 2. Start the leader in the background
-    let mut leader = Command::new("cargo")
+    // 2. Start the leader (it will background itself)
+    let _ = Command::new("cargo")
         .args(["run", "--bin", "ag", "--", "leader", "--config", config_path])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn leader");
+        .output()
+        .await
+        .expect("Failed to start leader");
 
     // Wait for leader to start - retry status until it works or times out
     let mut success = false;
-    for _ in 0..10 {
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let status_output = Command::new("cargo")
             .args(["run", "--bin", "ag", "--", "status"])
             .output()
             .await;
         
         if let Ok(out) = status_output {
-            if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if out.status.success() && stdout.contains("Active Agents") {
                 success = true;
                 break;
             }
@@ -56,15 +56,15 @@ agents: {}
     }
     assert!(success, "Leader failed to start or respond to status");
 
-    // 4. Try to start another leader (should fail)
+    // 4. Try to start another leader (should update config now, not fail)
     let second_leader = Command::new("cargo")
         .args(["run", "--bin", "ag", "--", "leader", "--config", config_path])
         .output()
         .await
         .expect("Failed to run second leader");
     
-    let second_stderr = String::from_utf8_lossy(&second_leader.stderr);
-    assert!(second_stderr.contains("Another leader is already running"), "Second leader did not detect existing one. Stderr: {}", second_stderr);
+    let second_stdout = String::from_utf8_lossy(&second_leader.stdout);
+    assert!(second_stdout.contains("Config updated"), "Second leader call should have updated config. Stdout: {}", second_stdout);
 
     // 5. Shutdown
     let shutdown_output = Command::new("cargo")
@@ -76,7 +76,6 @@ agents: {}
     assert!(String::from_utf8_lossy(&shutdown_output.stdout).contains("Shutting down"));
 
     // Final Cleanup
-    let _ = leader.kill().await;
     let _ = fs::remove_file(config_path);
     cleanup_sockets().await;
 }

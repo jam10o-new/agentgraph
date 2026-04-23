@@ -16,14 +16,7 @@ models:
     path: "Qwen/Qwen3.5-9B"
     isq: "4"
 
-# 2. Global Sampling Parameters
-sampling:
-  temperature: 0.7
-  top_p: 0.9
-  top_k: 40
-  max_len: 2048
-
-# 3. Agent Definitions
+# 2. Agent Definitions
 agents:
   researcher:
     # A list of directories to watch for user input
@@ -39,6 +32,11 @@ agents:
     # Controls whether output is written to file token-by-token (true) or only at completion (false).
     # Set to false for agents whose output triggers other agents to prevent "interrupt storms".
     stream: false
+    sampling:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: 40
+      max_len: 2048
 
   coder:
     inputs:
@@ -50,6 +48,11 @@ agents:
     model: "primary"
     history_limit: 50
     stream: true
+    sampling:
+      temperature: 0.2
+      top_p: 0.95
+      top_k: 50
+      max_len: 4096
 
 # 4. Context Compression Settings
 # Probabilistic summarization logic: older turns (deeper depth) are more likely to be compressed.

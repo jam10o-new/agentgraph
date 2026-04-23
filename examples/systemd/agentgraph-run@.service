@@ -1,0 +1,11 @@
+[Unit]
+Description=AgentGraph Timed Run (Agent: %I)
+After=network.target
+
+[Service]
+Type=oneshot
+# ag run will automatically spawn a leader if none is present
+ExecStart=/usr/local/bin/ag run %I
+
+[Install]
+WantedBy=default.target

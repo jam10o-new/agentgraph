@@ -4,7 +4,6 @@ use std::collections::HashMap;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub models: HashMap<String, ModelConfig>,
-    pub sampling: SamplingConfig,
     pub agents: HashMap<String, AgentConfig>,
     #[serde(default = "default_compression")]
     pub compression: CompressionConfig,
@@ -47,6 +46,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub allowed_extensions: Vec<String>,
     pub prompt: Option<String>,
+    #[serde(default)]
+    pub sampling: SamplingConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

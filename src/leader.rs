@@ -19,10 +19,9 @@ pub struct AgentEntry {
 }
 
 pub struct Leader {
-    pub config: Config,
+    pub config: Arc<Mutex<Config>>,
     pub model: Option<Arc<mistralrs::Model>>,
     pub agents: Arc<Mutex<HashMap<String, AgentEntry>>>,
-    pub sampling: SamplingParams,
 }
 
 impl Leader {
@@ -33,15 +32,31 @@ impl Leader {
             Some(Arc::new(load_models(&config.models).await?))
         };
         
+        Ok(Self { 
+            config: Arc::new(Mutex::new(config)), 
+            model, 
+            agents: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub async fn spawn_agent(&self, name: String, agent_config: AgentConfig) -> Result<()> {
+        let mut agents = self.agents.lock().await;
+        if agents.contains_key(&name) {
+            println!("Agent {} already exists, skipping.", name);
+            return Ok(());
+        }
+
+        let model = self.model.as_ref().ok_or_else(|| anyhow!("No models loaded in leader. Cannot spawn agent {}.", name))?;
+        
         let sampling = SamplingParams {
-            temperature: config.sampling.temperature,
-            top_p: config.sampling.top_p,
-            top_k: config.sampling.top_k,
-            min_p: config.sampling.min_p,
-            repetition_penalty: config.sampling.repetition_penalty,
-            frequency_penalty: config.sampling.frequency_penalty,
-            presence_penalty: config.sampling.presence_penalty,
-            max_len: config.sampling.max_len,
+            temperature: agent_config.sampling.temperature,
+            top_p: agent_config.sampling.top_p,
+            top_k: agent_config.sampling.top_k,
+            min_p: agent_config.sampling.min_p,
+            repetition_penalty: agent_config.sampling.repetition_penalty,
+            frequency_penalty: agent_config.sampling.frequency_penalty,
+            presence_penalty: agent_config.sampling.presence_penalty,
+            max_len: agent_config.sampling.max_len,
             top_n_logprobs: 0,
             stop_toks: None,
             logits_bias: None,
@@ -49,30 +64,15 @@ impl Leader {
             dry_params: None,
         };
 
-        Ok(Self { 
-            config, 
-            model, 
-            agents: Arc::new(Mutex::new(HashMap::new())),
-            sampling,
-        })
-    }
-
-    pub async fn spawn_agent(&self, name: String, agent_config: AgentConfig) -> Result<()> {
-        let model = self.model.as_ref().ok_or_else(|| anyhow!("No models loaded in leader. Cannot spawn agent {}.", name))?;
-        
+        let config = self.config.lock().await.clone();
         let agent = Agent::new(
             name.clone(),
             agent_config.clone(),
-            self.config.clone(),
+            config,
             model.clone(),
-            self.sampling.clone(),
+            sampling,
         );
         
-        let mut agents = self.agents.lock().await;
-        if let Some(old_entry) = agents.remove(&name) {
-            old_entry.handle.abort();
-        }
-
         // We use the first input directory as the "trigger" path for manual runs
         let trigger_path = PathBuf::from(agent_config.inputs.first().cloned().unwrap_or_else(|| ".".into()));
         let volatile_context = agent.volatile_context.clone();
@@ -92,14 +92,18 @@ impl Leader {
         Ok(())
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         // 1. Ensure Leader Uniqueness
         if let Some(socket) = find_leader_socket().await {
             return Err(anyhow!("Another leader is already running (socket: {:?})", socket));
         }
 
         // 2. Initial agents from config
-        for (name, agent_config) in &self.config.agents {
+        let initial_agents = {
+            let config = self.config.lock().await;
+            config.agents.clone()
+        };
+        for (name, agent_config) in initial_agents {
             self.spawn_agent(name.clone(), agent_config.clone()).await?;
         }
 
@@ -113,42 +117,45 @@ impl Leader {
 
         let agents = self.agents.clone();
         let model_opt = self.model.clone();
-        let global_config = self.config.clone();
-        let sampling = self.sampling.clone();
+        let config_mutex = self.config.clone();
+        let leader_for_ipc = Arc::new(self);
 
         tokio::spawn(async move {
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
                     let agents = agents.clone();
                     let model_opt = model_opt.clone();
-                    let global_config = global_config.clone();
-                    let sampling = sampling.clone();
+                    let config_mutex = config_mutex.clone();
+                    let leader = leader_for_ipc.clone();
                     
                     tokio::spawn(async move {
                         let mut buf = Vec::new();
                         if let Ok(_) = stream.read_to_end(&mut buf).await {
                             if let Ok(cmd) = serde_json::from_slice::<Command>(&buf) {
                                 match cmd {
-                                    Command::SpawnAgent { name, config } => {
-                                        if let Some(model) = &model_opt {
-                                            println!("IPC: Spawning agent {}", name);
-                                            let agent = Agent::new(name.clone(), config.clone(), global_config, model.clone(), sampling);
-                                            let trigger_path = PathBuf::from(config.inputs.first().cloned().unwrap_or_else(|| ".".into()));
-                                            let volatile_context = agent.volatile_context.clone();
-                                            
-                                            let mut agents_map = agents.lock().await;
-                                            if let Some(e) = agents_map.remove(&name) { e.handle.abort(); }
-                                            
-                                            let name_for_log = name.clone();
-                                            let handle = tokio::spawn(async move {
-                                                if let Err(err) = agent.run_loop().await {
-                                                    eprintln!("Agent {} loop error: {:?}", name_for_log, err);
+                                    Command::UpdateConfig(new_config) => {
+                                        let config = config_mutex.lock().await;
+                                        // Ignore existing models
+                                        for (name, _) in &new_config.models {
+                                            if !config.models.contains_key(name) {
+                                                eprintln!("Warning: Dynamic model loading not yet supported for model '{}'.", name);
+                                            }
+                                        }
+                                        // Add new agents
+                                        for (name, agent_config) in new_config.agents {
+                                            if !agents.lock().await.contains_key(&name) {
+                                                if let Err(e) = leader.spawn_agent(name, agent_config).await {
+                                                    let _ = stream.write_all(format!("Error spawning agent: {}", e).as_bytes()).await;
                                                 }
-                                            });
-                                            agents_map.insert(name, AgentEntry { handle, volatile_context, trigger_path });
-                                            let _ = stream.write_all(b"Agent Spawned").await;
+                                            }
+                                        }
+                                        let _ = stream.write_all(b"Config updated").await;
+                                    }
+                                    Command::SpawnAgent { name, config: agent_config } => {
+                                        if let Err(e) = leader.spawn_agent(name, agent_config).await {
+                                            let _ = stream.write_all(format!("Error spawning agent: {}", e).as_bytes()).await;
                                         } else {
-                                            let _ = stream.write_all(b"Error: No models loaded in leader").await;
+                                            let _ = stream.write_all(b"Agent Spawned").await;
                                         }
                                     }
                                     Command::RunAgent(name, message) => {

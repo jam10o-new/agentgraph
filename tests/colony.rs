@@ -114,6 +114,7 @@ agents:
             "--config",
             config_path.to_str().unwrap(),
         ])
+        .env("AGENTGRAPH_BACKGROUND", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

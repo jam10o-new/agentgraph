@@ -72,39 +72,105 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Leader { config } => {
+    // Check if we are already in the background
+    if std::env::var("AGENTGRAPH_BACKGROUND").is_ok() {
+        if let Commands::Leader { config } = cli.command {
             let config = Config::load(config)?;
             let leader = Leader::new(config).await?;
             leader.run().await?;
+            return Ok(());
         }
-        Commands::Spawn { name, inputs, output, system, model, limit, stream, prompt } => {
-            let config = AgentConfig {
-                inputs,
-                output,
-                system,
-                model,
-                history_limit: limit,
-                stream,
-                allowed_extensions: vec![],
-                prompt,
-            };
-            let cmd = Command::SpawnAgent { name, config };
-            send_command(cmd).await?;
+    }
+
+    match cli.command {
+        Commands::Leader { config } => {
+            if find_leader_socket().await.is_some() {
+                let config_obj = Config::load(&config)?;
+                let cmd = Command::UpdateConfig(config_obj);
+                send_command(cmd).await?;
+            } else {
+                spawn_background_leader(&config)?;
+                println!("Leader started in background. Logs: /tmp/agentgraph/leader.log");
+            }
+        }
+        Commands::Status => {
+            if find_leader_socket().await.is_none() {
+                println!("No leader is present.");
+            } else {
+                send_command(Command::Status).await?;
+            }
+        }
+        Commands::Shutdown => {
+            if find_leader_socket().await.is_some() {
+                send_command(Command::Shutdown).await?;
+            } else {
+                println!("No leader is present.");
+            }
         }
         _ => {
+            ensure_leader().await?;
             let cmd = match cli.command {
                 Commands::Run { agent, message } => Command::RunAgent(agent, message),
                 Commands::Stop { agent } => Command::StopAgent(agent),
-                Commands::Status => Command::Status,
                 Commands::Reload => Command::ReloadConfig,
-                Commands::Shutdown => Command::Shutdown,
+                Commands::Spawn { name, inputs, output, system, model, limit, stream, prompt, .. } => {
+                    let config = AgentConfig {
+                        inputs,
+                        output,
+                        system,
+                        model,
+                        history_limit: limit,
+                        stream,
+                        allowed_extensions: vec![],
+                        prompt,
+                        sampling: Default::default(),
+                    };
+                    Command::SpawnAgent { name, config }
+                }
                 _ => unreachable!(),
             };
             send_command(cmd).await?;
         }
     }
 
+    Ok(())
+}
+
+fn spawn_background_leader(config_path: &str) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let log_dir = std::path::Path::new("/tmp/agentgraph");
+    if !log_dir.exists() {
+        std::fs::create_dir_all(log_dir)?;
+    }
+    let log_path = log_dir.join("leader.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+
+    std::process::Command::new(exe)
+        .arg("leader")
+        .arg("--config")
+        .arg(config_path)
+        .env("AGENTGRAPH_BACKGROUND", "1")
+        .stdout(std::process::Stdio::from(log_file.try_clone()?))
+        .stderr(std::process::Stdio::from(log_file))
+        .spawn()?;
+    Ok(())
+}
+
+async fn ensure_leader() -> Result<()> {
+    if find_leader_socket().await.is_none() {
+        spawn_background_leader("config.yaml")?;
+        // Wait a bit for it to start
+        for _ in 0..300 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if find_leader_socket().await.is_some() {
+                return Ok(());
+            }
+        }
+        return Err(anyhow!("Failed to start leader in background within 60s"));
+    }
     Ok(())
 }
 

@@ -1,0 +1,16 @@
+[Unit]
+Description=AgentGraph Leader Service (Config: %I)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Run as the user who started the service
+ExecStart=/usr/local/bin/ag leader --config %I
+# Shutdown the leader when the service is stopped
+ExecStop=/usr/local/bin/ag shutdown
+# Ensure it runs as user (if started as user --user)
+# Or specify User= if system-wide
+
+[Install]
+WantedBy=default.target

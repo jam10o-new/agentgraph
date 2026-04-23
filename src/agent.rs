@@ -406,6 +406,7 @@ async fn run_inference(
                         stream: true,
                         allowed_extensions: vec![],
                         prompt: args["prompt"].as_str().map(|s| s.to_string()),
+                        sampling: Default::default(),
                     };
                     send_ipc_command(Command::SpawnAgent { name, config }).await.unwrap_or_else(|e| e.to_string())
                 }
