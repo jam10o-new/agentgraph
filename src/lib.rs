@@ -5,6 +5,7 @@ pub mod model_loader;
 pub mod context;
 pub mod utils;
 pub mod ipc;
+pub mod audio;
 
 // Re-export key types
 pub use config::Config;

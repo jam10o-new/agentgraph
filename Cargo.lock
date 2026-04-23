@@ -172,6 +172,7 @@ dependencies = [
  "cpal",
  "flume",
  "futures",
+ "hound",
  "humantime",
  "image",
  "mistralrs",

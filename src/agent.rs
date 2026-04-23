@@ -1,3 +1,4 @@
+use crate::audio::AudioListener;
 use crate::config::{AgentConfig, Config};
 use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_frontmatter};
 use crate::ipc::Command;
@@ -78,6 +79,15 @@ impl Agent {
         }
 
         self.logger.log(&format!("Watching inputs: {:?}", canonical_inputs)).await;
+
+        if self.config.realtime_audio {
+            let listener = AudioListener::new(self.name.clone(), canonical_inputs[0].clone());
+            tokio::spawn(async move {
+                if let Err(e) = listener.start().await {
+                    eprintln!("Audio listener error: {:?}", e);
+                }
+            });
+        }
 
         let mut current_inference: Option<tokio::task::JoinHandle<()>> = None;
         let (interrupt_tx, _) = watch::channel(false);
@@ -249,13 +259,20 @@ async fn run_inference(
     }
 
     let mut images = Vec::new();
+    let mut audio_files = Vec::new();
     for input_dir in &config.inputs {
         if let Ok(mut entries) = fs::read_dir(input_dir).await {
             while let Some(entry) = entries.next_entry().await? {
                 let p = entry.path();
                 if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp") {
-                        if let Ok(img) = image::open(&p) { images.push(img); }
+                    match ext.to_lowercase().as_str() {
+                        "jpg" | "jpeg" | "png" | "webp" => {
+                            if let Ok(img) = image::open(&p) { images.push(img); }
+                        }
+                        "wav" | "mp3" | "ogg" => {
+                            audio_files.push(p);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -299,6 +316,7 @@ async fn run_inference(
                         "system": {"type": "array", "items": {"type": "string"}},
                         "model": {"type": "string"},
                         "history_limit": {"type": "integer", "nullable": true},
+                        "realtime_audio": {"type": "boolean"},
                         "prompt": {"type": "string", "nullable": true}
                     }
                 })),
@@ -405,6 +423,7 @@ async fn run_inference(
                         history_limit: args["history_limit"].as_u64().map(|u| u as usize),
                         stream: true,
                         allowed_extensions: vec![],
+                        realtime_audio: args["realtime_audio"].as_bool().unwrap_or(false),
                         prompt: args["prompt"].as_str().map(|s| s.to_string()),
                         sampling: Default::default(),
                     };

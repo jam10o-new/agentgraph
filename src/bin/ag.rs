@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
                         history_limit: limit,
                         stream,
                         allowed_extensions: vec![],
+                        realtime_audio: false,
                         prompt,
                         sampling: Default::default(),
                     };

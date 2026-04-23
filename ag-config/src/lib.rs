@@ -44,6 +44,8 @@ pub struct AgentConfig {
     pub history_limit: Option<usize>,
     pub stream: bool,
     #[serde(default)]
+    pub realtime_audio: bool,
+    #[serde(default)]
     pub allowed_extensions: Vec<String>,
     pub prompt: Option<String>,
     #[serde(default)]

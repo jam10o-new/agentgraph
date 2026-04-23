@@ -1,2 +1,6 @@
 /target
 /src/.agent_*
+repro_empty_config.yaml
+logs/*
+agents/*
+logs/*
