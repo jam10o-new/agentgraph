@@ -59,9 +59,9 @@ enum Commands {
         /// History limit (latest N)
         #[arg(short, long)]
         limit: Option<usize>,
-        /// Enable streaming
-        #[arg(short, long, default_value_t = true)]
-        stream: bool,
+    /// Optional streaming output directory
+    #[arg(short, long)]
+    stream_output: Option<String>,
         /// Extra system prompt
         #[arg(short, long)]
         prompt: Option<String>,
@@ -113,18 +113,20 @@ async fn main() -> Result<()> {
                 Commands::Run { agent, message } => Command::RunAgent(agent, message),
                 Commands::Stop { agent } => Command::StopAgent(agent),
                 Commands::Reload => Command::ReloadConfig,
-                Commands::Spawn { name, inputs, output, system, model, limit, stream, prompt, .. } => {
+                Commands::Spawn { name, inputs, output, stream_output, system, model, limit, prompt, .. } => {
                     let config = AgentConfig {
                         inputs,
                         output,
+                        stream_output,
                         system,
                         model,
                         history_limit: limit,
-                        stream,
                         allowed_extensions: vec![],
                         realtime_audio: false,
                         prompt,
                         sampling: Default::default(),
+                        compression: Default::default(),
+                        context_checkpoint_limit: None,
                     };
                     Command::SpawnAgent { name, config }
                 }

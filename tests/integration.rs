@@ -20,12 +20,8 @@ async fn test_leader_uniqueness_and_status() {
     // 1. Create a dummy config
     let config_content = r#"
 models: {}
-sampling:
-  temperature: 0.7
-  top_p: 0.9
-  top_k: 40
-  max_len: 1024
 agents: {}
+shutdown_on_idle: false
 "#;
     let config_path = "test_config_uniqueness.yaml";
     fs::write(config_path, config_content).unwrap();

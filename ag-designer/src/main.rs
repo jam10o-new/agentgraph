@@ -16,10 +16,6 @@ enum MyNode {
         name: String,
         config: AgentConfig,
     },
-    GlobalConfig {
-        compression: CompressionConfig,
-        shutdown_on_idle: bool,
-    },
 }
 
 struct DemoViewer {
@@ -43,7 +39,6 @@ impl SnarlViewer<MyNode> for DemoViewer {
                     format!("Agent: {}", name)
                 }
             }
-            MyNode::GlobalConfig { .. } => "Global Config".to_string(),
         }
     }
 
@@ -51,7 +46,6 @@ impl SnarlViewer<MyNode> for DemoViewer {
         match node {
             MyNode::Model { .. } => 1,
             MyNode::Agent { .. } => 1,
-            MyNode::GlobalConfig { .. } => 0,
         }
     }
 
@@ -59,7 +53,6 @@ impl SnarlViewer<MyNode> for DemoViewer {
         match node {
             MyNode::Model { .. } => 0,
             MyNode::Agent { config, .. } => config.inputs.len() + 2,
-            MyNode::GlobalConfig { .. } => 0,
         }
     }
 
@@ -162,14 +155,16 @@ impl SnarlViewer<MyNode> for DemoViewer {
                     AgentConfig {
                         inputs,
                         output,
+                        stream_output,
                         system,
                         model: _, // Model is driven by wire
                         history_limit,
-                        stream,
                         realtime_audio,
                         allowed_extensions,
                         prompt,
                         sampling,
+                        compression,
+                        context_checkpoint_limit,
                     },
             } => {
                 ui.set_width(500.0);
@@ -213,6 +208,20 @@ impl SnarlViewer<MyNode> for DemoViewer {
                                 if ui.button("📁").clicked() {
                                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                         *output = path.display().to_string();
+                                    }
+                                }
+                            });
+
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Stream Output").strong());
+                            ui.horizontal(|ui| {
+                                let mut so = stream_output.clone().unwrap_or_default();
+                                if ui.text_edit_singleline(&mut so).changed() {
+                                    *stream_output = if so.is_empty() { None } else { Some(so) };
+                                }
+                                if ui.button("📁").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        *stream_output = Some(path.display().to_string());
                                     }
                                 }
                             });
@@ -279,12 +288,16 @@ impl SnarlViewer<MyNode> for DemoViewer {
 
                     ui.collapsing("Advanced Configuration", |ui| {
                         ui.horizontal(|ui| {
-                            ui.checkbox(stream, "Stream");
                             ui.checkbox(realtime_audio, "Realtime Audio");
                             ui.label("History:");
                             let mut hl = history_limit.unwrap_or(0);
                             if ui.add(egui::DragValue::new(&mut hl)).changed() {
                                 *history_limit = if hl == 0 { None } else { Some(hl) };
+                            }
+                            ui.label("Checkpoint:");
+                            let mut ccl = context_checkpoint_limit.unwrap_or(0);
+                            if ui.add(egui::DragValue::new(&mut ccl)).changed() {
+                                *context_checkpoint_limit = if ccl == 0 { None } else { Some(ccl) };
                             }
                         });
 
@@ -313,38 +326,37 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         {
                             *prompt = if p.is_empty() { None } else { Some(p) };
                         }
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("Compression").strong());
+                        egui::Grid::new(format!("compression_grid_{:?}", node_id))
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                ui.label("Threshold:");
+                                ui.add(
+                                    egui::DragValue::new(&mut compression.threshold)
+                                        .speed(0.05)
+                                        .range(0.0..=1.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Inv Prob:");
+                                ui.add(
+                                    egui::DragValue::new(&mut compression.inverse_probability)
+                                        .speed(0.05)
+                                        .range(0.0..=1.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Resum Prob:");
+                                ui.add(
+                                    egui::DragValue::new(&mut compression.resummarize_probability)
+                                        .speed(0.05)
+                                        .range(0.0..=1.0),
+                                );
+                                ui.end_row();
+                            });
                     });
-                });
-            }
-            MyNode::GlobalConfig {
-                compression,
-                shutdown_on_idle,
-            } => {
-                ui.set_width(300.0);
-                ui.vertical(|ui| {
-                    ui.checkbox(shutdown_on_idle, "Shutdown on Idle");
-
-                    ui.separator();
-                    ui.label(egui::RichText::new("Compression").strong());
-                    egui::Grid::new(format!("compression_grid_{:?}", node_id))
-                        .num_columns(2)
-                        .show(ui, |ui| {
-                            ui.label("Threshold:");
-                            ui.add(
-                                egui::DragValue::new(&mut compression.threshold)
-                                    .speed(0.05)
-                                    .range(0.0..=1.0),
-                            );
-                            ui.end_row();
-
-                            ui.label("Inv Prob:");
-                            ui.add(
-                                egui::DragValue::new(&mut compression.inverse_probability)
-                                    .speed(0.05)
-                                    .range(0.0..=1.0),
-                            );
-                            ui.end_row();
-                        });
                 });
             }
         }
@@ -373,7 +385,6 @@ impl SnarlViewer<MyNode> for DemoViewer {
                     pin_info.fill = Some(egui::Color32::from_rgb(100, 100, 100));
                 }
             }
-            MyNode::GlobalConfig { .. } => {}
         }
         pin_info
     }
@@ -396,7 +407,6 @@ impl SnarlViewer<MyNode> for DemoViewer {
                 ui.label("Out Dir");
                 pin_info.fill = Some(egui::Color32::from_rgb(38, 211, 109));
             }
-            MyNode::GlobalConfig { .. } => {}
         }
         pin_info
     }
@@ -453,6 +463,7 @@ struct SnarlApp {
     style: SnarlStyle,
     hf_models: Vec<String>,
     status: String,
+    shutdown_on_idle: bool,
 }
 
 impl SnarlApp {
@@ -462,6 +473,7 @@ impl SnarlApp {
             style: SnarlStyle::new(),
             hf_models: scan_hf_cache(),
             status: "Ready".to_string(),
+            shutdown_on_idle: false,
         }
     }
 
@@ -469,28 +481,10 @@ impl SnarlApp {
         let mut config = Config {
             models: HashMap::new(),
             agents: HashMap::new(),
-            compression: CompressionConfig {
-                threshold: 0.5,
-                inverse_probability: 0.9,
-                resummarize_probability: 0.1,
-            },
-            shutdown_on_idle: false,
+            shutdown_on_idle: self.shutdown_on_idle,
         };
 
         let mut node_to_model_alias: HashMap<NodeId, String> = HashMap::new();
-
-        // Pass 0: Global Config
-        for (_, node) in self.snarl.node_ids() {
-            if let MyNode::GlobalConfig {
-                compression,
-                shutdown_on_idle,
-            } = node
-            {
-                config.compression = compression.clone();
-                config.shutdown_on_idle = *shutdown_on_idle;
-                break;
-            }
-        }
 
         // Pass 1: Models
         for (node_id, node) in self.snarl.node_ids() {
@@ -591,20 +585,12 @@ impl SnarlApp {
         {
             let config = Config::load(&path)?;
             self.snarl = Snarl::new();
+            self.shutdown_on_idle = config.shutdown_on_idle;
 
             let mut model_alias_to_id = HashMap::new();
             let mut agent_name_to_id = HashMap::new();
 
-            // 1. Global Config
-            self.snarl.insert_node(
-                egui::Pos2::new(0.0, -200.0),
-                MyNode::GlobalConfig {
-                    compression: config.compression.clone(),
-                    shutdown_on_idle: config.shutdown_on_idle,
-                },
-            );
-
-            // 2. Models
+            // 1. Models
             let mut y_offset = 0.0;
             for (alias, m) in &config.models {
                 let id = self.snarl.insert_node(
@@ -726,43 +712,27 @@ impl eframe::App for SnarlApp {
                             config: AgentConfig {
                                 inputs: Vec::new(),
                                 output: String::new(),
+                                stream_output: None,
                                 system: Vec::new(),
                                 model: String::new(),
                                 history_limit: None,
-                                stream: true,
                                 allowed_extensions: Vec::new(),
                                 realtime_audio: false,
                                 prompt: None,
                                 sampling: SamplingConfig::default(),
-                            },
-                        },
-                    );
-                }
-
-                let has_global = self
-                    .snarl
-                    .node_ids()
-                    .any(|(_, node)| matches!(node, MyNode::GlobalConfig { .. }));
-
-                ui.add_enabled_ui(!has_global, |ui| {
-                    if ui
-                        .button("➕ Global")
-                        .on_disabled_hover_text("Global config already exists")
-                        .clicked()
-                    {
-                        self.snarl.insert_node(
-                            egui::Pos2::ZERO,
-                            MyNode::GlobalConfig {
                                 compression: CompressionConfig {
                                     threshold: 0.5,
                                     inverse_probability: 0.9,
                                     resummarize_probability: 0.1,
                                 },
-                                shutdown_on_idle: false,
+                                context_checkpoint_limit: None,
                             },
-                        );
-                    }
-                });
+                        },
+                    );
+                }
+
+                ui.separator();
+                ui.checkbox(&mut self.shutdown_on_idle, "Shutdown on Idle");
                 ui.separator();
                 if ui.button("🚀 Spawn").clicked() {
                     let config = self.export_config();

@@ -29,9 +29,13 @@ agents:
       - "agents/researcher/system"
     model: "primary"
     history_limit: 20
-    # Controls whether output is written to file token-by-token (true) or only at completion (false).
-    # Set to false for agents whose output triggers other agents to prevent "interrupt storms".
-    stream: false
+    # No stream_output means the agent only writes final output.
+    # Use stream_output for agents you want to watch live.
+    compression:
+      threshold: 0.5
+      inverse_probability: 0.9
+      resummarize_probability: 0.05
+    context_checkpoint_limit: 20000
     sampling:
       temperature: 0.7
       top_p: 0.9
@@ -43,26 +47,22 @@ agents:
       - "agents/coder/input"
       - "agents/researcher/output" # Colony: watches researcher's output
     output: "agents/coder/output"
+    # Secondary human-readable streaming output in addition to the primary output above.
+    stream_output: "agents/coder/stream"
     system:
       - "agents/coder/system"
     model: "primary"
     history_limit: 50
-    stream: true
+    compression:
+      threshold: 0.5
+      inverse_probability: 0.9
+      resummarize_probability: 0.05
+    context_checkpoint_limit: 40000
     sampling:
       temperature: 0.2
       top_p: 0.95
       top_k: 50
       max_len: 4096
 
-# 4. Context Compression Settings
-# Probabilistic summarization logic: older turns (deeper depth) are more likely to be compressed.
-compression:
-  # Base probability threshold. Turns with (1.0 - inv_prob^depth) > threshold are compressed.
-  threshold: 0.5
-  # Recency factor. 0.9 means 10% prob of compression at depth 1, increasing with depth.
-  inverse_probability: 0.9
-  # Chance to re-summarize a cached entry to refine it with more context.
-  resummarize_probability: 0.05
-
-# 5. Global Settings
+# 4. Global Settings
 shutdown_on_idle: false

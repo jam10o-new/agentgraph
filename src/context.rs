@@ -23,6 +23,17 @@ pub struct SpecializedSummary {
     pub extracted_information: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MetaSummary {
+    pub turn_index: usize,
+    pub content: String,
+    #[serde(default)]
+    pub included_domains: Vec<String>,
+    #[serde(default)]
+    pub included_turn_indices: Vec<usize>,
+    pub generated_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryTurnRole {
     User,
@@ -38,6 +49,8 @@ pub struct HistoryTurn {
     pub turn_index: usize,
 }
 
+use ag_config::CompressionConfig;
+
 pub struct CompressionManager {
     pub base_path: PathBuf,
     pub threshold: f64,
@@ -46,17 +59,12 @@ pub struct CompressionManager {
 }
 
 impl CompressionManager {
-    pub fn new(
-        base_path: PathBuf,
-        threshold: f64,
-        inverse_prob: f64,
-        resummarize_prob: f64,
-    ) -> Self {
+    pub fn new(base_path: PathBuf, compression: &CompressionConfig) -> Self {
         Self {
             base_path: base_path.join(".agent_context"),
-            threshold,
-            inverse_prob,
-            resummarize_prob,
+            threshold: compression.threshold,
+            inverse_prob: compression.inverse_probability,
+            resummarize_prob: compression.resummarize_probability,
         }
     }
 
@@ -73,47 +81,203 @@ impl CompressionManager {
             .join(format!("domain_{}.json", domain))
     }
 
-    pub async fn get_compressed_context(
+    fn metasummary_dir(&self) -> PathBuf {
+        self.base_path.join("metasummaries")
+    }
+
+    fn metasummary_path(&self, turn_idx: usize) -> PathBuf {
+        self.metasummary_dir().join(format!("metasummary_{}.json", turn_idx))
+    }
+
+    async fn load_latest_metasummary(&self) -> Result<Option<MetaSummary>> {
+        let dir = self.metasummary_dir();
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let mut latest: Option<MetaSummary> = None;
+        let mut entries = fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                let content = fs::read_to_string(&p).await?;
+                let ms: MetaSummary = serde_json::from_str(&content)?;
+                if latest.as_ref().map(|l| ms.turn_index > l.turn_index).unwrap_or(true) {
+                    latest = Some(ms);
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    async fn save_metasummary(&self, ms: &MetaSummary) -> Result<()> {
+        fs::create_dir_all(self.metasummary_dir()).await?;
+        let path = self.metasummary_path(ms.turn_index);
+        fs::write(&path, serde_json::to_string_pretty(ms)?).await?;
+        Ok(())
+    }
+
+    async fn generate_metasummary(
         &self,
         model: Arc<Model>,
-        history: &[HistoryTurn],
+        turns: &[HistoryTurn],
         latest_turn: &str,
         sampling: SamplingParams,
-    ) -> Result<Vec<(TextMessageRole, String)>> {
-        let mut context = Vec::new();
-        let total_turns = history.len();
+    ) -> Result<MetaSummary> {
+        let mut summary_text = String::new();
+        let mut included_domains = Vec::new();
+        let mut included_turn_indices = Vec::new();
 
-        for (i, turn) in history.iter().enumerate() {
-            // depth is distance from the end (0 = latest turn in history)
-            let depth = total_turns - 1 - i;
-            
-            // Probability formula: older (higher depth) -> higher prob of compression
-            let prob = 1.0 - self.inverse_prob.powf(depth as f64);
+        for turn in turns {
+            included_turn_indices.push(turn.turn_index);
+            summary_text.push_str(&format!(
+                "\n--- Turn {} ({}) ---\n",
+                turn.turn_index,
+                role_to_mistral(&turn.role)
+            ));
 
-            // Never compress standard system messages, only skills
-            if let HistoryTurnRole::System = turn.role {
-                context.push((TextMessageRole::System, turn.content.clone()));
-                continue;
-            }
-
-            // If probability is above threshold, we compress
-            if prob > self.threshold {
-                let compressed = self
-                    .process_turn_compression(
-                        model.clone(),
-                        history,
-                        i,
-                        latest_turn,
-                        sampling.clone(),
-                    )
-                    .await?;
-                context.push(compressed);
+            let root_path = self.root_summary_path(turn.turn_index);
+            if root_path.exists() {
+                let content = fs::read_to_string(&root_path).await?;
+                let root: RootSummary = serde_json::from_str(&content)?;
+                summary_text.push_str(&format!("Summary: {}\n", root.micro_summary));
+                summary_text.push_str(&format!("Domains: {:?}\n", root.domains));
+                for domain in &root.domains {
+                    let spec_path = self.specialized_summary_path(turn.turn_index, domain);
+                    if spec_path.exists() {
+                        let spec_content = fs::read_to_string(&spec_path).await?;
+                        let spec: SpecializedSummary = serde_json::from_str(&spec_content)?;
+                        summary_text.push_str(&format!(
+                            "  [{}]: {}\n",
+                            spec.domain, spec.extracted_information
+                        ));
+                        if !included_domains.contains(&spec.domain) {
+                            included_domains.push(spec.domain.clone());
+                        }
+                    }
+                }
             } else {
-                context.push(turn_to_mistral(turn));
+                let preview: String = turn.content.chars().take(300).collect();
+                summary_text.push_str(&format!("Content (raw): {}\n", preview));
             }
         }
 
-        Ok(context)
+        let system_prompt = "You are a context archivist. Summarize a series of conversation summaries into a single metasummary. Deduplicate repeated information. Mention all domains/topics covered. Include the turn indices of important turns the model may want to reread. Output ONLY valid JSON with 'content' (string), 'included_domains' (array of strings), and 'included_turn_indices' (array of integers) fields.";
+        let prompt = format!(
+            "Latest turn context: {}\n\nHistorical summaries to collate:\n{}\n\nProduce a concise metasummary that captures all unique information.",
+            latest_turn, summary_text
+        );
+
+        let messages = TextMessages::new()
+            .add_message(TextMessageRole::System, system_prompt)
+            .add_message(TextMessageRole::User, prompt);
+
+        let req = RequestBuilder::from(messages).set_sampling(sampling);
+        let resp: ChatCompletionResponse = model.send_chat_request(req).await?;
+        let content = resp.choices[0]
+            .message
+            .content
+            .as_ref()
+            .context("Empty metasummary")?;
+
+        let mut ms: MetaSummary = if let Some(start_json) = content.find('{') {
+            if let Some(end_json) = content.rfind('}') {
+                let json_str = &content[start_json..=end_json];
+                serde_json::from_str(json_str)
+                    .map_err(|e| anyhow!("JSON Parse Error: {}, content: {}", e, json_str))?
+            } else {
+                anyhow::bail!("No JSON end found in model response")
+            }
+        } else {
+            anyhow::bail!("No JSON start found in model response")
+        };
+
+        ms.generated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        ms.included_domains = included_domains;
+        ms.included_turn_indices = included_turn_indices;
+        Ok(ms)
+    }
+
+    pub async fn get_compressed_context(
+        &self,
+        model: Arc<Model>,
+        history: &mut Vec<HistoryTurn>,
+        latest_turn: &str,
+        sampling: SamplingParams,
+        checkpoint_limit: Option<usize>,
+    ) -> Result<Vec<(TextMessageRole, String)>> {
+        let mut attempt = 0;
+        loop {
+            // Phase 0: Apply existing metasummaries
+            if let Some(ms) = self.load_latest_metasummary().await? {
+                let cutoff = ms.turn_index;
+                history.retain(|t| t.turn_index > cutoff);
+            }
+
+            // Phase 1: Compress remaining history
+            let mut context = Vec::new();
+            let total_turns = history.len();
+            for (i, turn) in history.iter().enumerate() {
+                let depth = total_turns - 1 - i;
+                let prob = 1.0 - self.inverse_prob.powf(depth as f64);
+
+                if let HistoryTurnRole::System = turn.role {
+                    context.push((TextMessageRole::System, turn.content.clone()));
+                    continue;
+                }
+
+                if prob > self.threshold {
+                    let compressed = self
+                        .process_turn_compression(
+                            model.clone(),
+                            history,
+                            i,
+                            latest_turn,
+                            sampling.clone(),
+                        )
+                        .await?;
+                    context.push(compressed);
+                } else {
+                    context.push(turn_to_mistral(turn));
+                }
+            }
+
+            // Phase 2: Post-compression checkpointing
+            if let Some(limit) = checkpoint_limit {
+                let total_chars: usize = context.iter().map(|(_, s)| s.len()).sum();
+                if total_chars > limit && attempt == 0 {
+                    // Determine how many oldest non-system turns to fold
+                    let mut fold_count = 0;
+                    for turn in history.iter() {
+                        if matches!(turn.role, HistoryTurnRole::System) {
+                            continue;
+                        }
+                        fold_count += 1;
+                        if fold_count >= history.len() / 2 {
+                            break;
+                        }
+                    }
+                    if fold_count > 0 {
+                        let turns_to_fold: Vec<HistoryTurn> =
+                            history.iter().take(fold_count).cloned().collect();
+                        let ms = self
+                            .generate_metasummary(
+                                model.clone(),
+                                &turns_to_fold,
+                                latest_turn,
+                                sampling.clone(),
+                            )
+                            .await?;
+                        self.save_metasummary(&ms).await?;
+                        attempt += 1;
+                        continue;
+                    }
+                }
+            }
+
+            return Ok(context);
+        }
     }
 
     async fn process_turn_compression(

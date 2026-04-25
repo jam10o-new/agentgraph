@@ -80,6 +80,9 @@ impl Agent {
         }
 
         fs::create_dir_all(&self.config.output).await?;
+        if let Some(ref stream_dir) = self.config.stream_output {
+            let _ = fs::create_dir_all(stream_dir).await;
+        }
         for sys_path in &self.config.system {
             let _ = fs::create_dir_all(sys_path).await;
         }
@@ -155,13 +158,31 @@ struct FileEntry {
     path: PathBuf,
     created: SystemTime,
     role: HistoryTurnRole,
+    metadata_str: String,
+}
+
+fn format_file_metadata(path: &Path, metadata: &std::fs::Metadata) -> String {
+    let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| format!("{}", d.as_secs()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let size = metadata.len();
+    format!(
+        "[File: {} | Modified: {} | Size: {} bytes]",
+        abs_path.display(),
+        modified,
+        size
+    )
 }
 
 async fn run_inference(
     _name: String,
     model: Arc<Model>,
     config: AgentConfig,
-    global_config: Config,
+    _global_config: Config,
     sampling: SamplingParams,
     interrupt_rx: watch::Receiver<bool>,
     volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
@@ -223,11 +244,12 @@ async fn run_inference(
                 let p = entry.path();
                 if p.is_file() {
                     let metadata = fs::metadata(&p).await?;
-                    // TODO: prepend file metadata and full filepath to message content
+                    let meta_str = format_file_metadata(&p, &metadata);
                     all_files.push(FileEntry {
                         path: p,
                         created: metadata.created()?,
                         role: HistoryTurnRole::User,
+                        metadata_str: meta_str,
                     });
                 }
             }
@@ -242,6 +264,7 @@ async fn run_inference(
                     path: p,
                     created: metadata.created()?,
                     role: HistoryTurnRole::Assistant,
+                    metadata_str: String::new(),
                 });
             }
         }
@@ -258,9 +281,14 @@ async fn run_inference(
     let mut turn_idx = 1;
     for entry in all_files.iter().skip(start_idx) {
         if let Ok(content) = fs::read_to_string(&entry.path).await {
+            let final_content = if matches!(entry.role, HistoryTurnRole::User) && !entry.metadata_str.is_empty() {
+                format!("{}\n---\n{}", entry.metadata_str, content)
+            } else {
+                content
+            };
             combined_history.push(HistoryTurn {
                 role: entry.role.clone(),
-                content,
+                content: final_content,
                 turn_index: turn_idx,
             });
             turn_idx += 1;
@@ -280,22 +308,32 @@ async fn run_inference(
         (combined_history.clone(), String::new())
     };
 
+    // Determine fallback text for multimodal messages that have no text content.
+    // This uses the metadata of the actual latest user file, even if it is binary.
+    let latest_user_file = all_files
+        .iter()
+        .filter(|f| matches!(f.role, HistoryTurnRole::User))
+        .last();
+    let fallback_text = latest_user_file
+        .map(|f| f.metadata_str.clone())
+        .unwrap_or_default();
+
     // 3. Compression
     let comp_mgr = CompressionManager::new(
         PathBuf::from(&config.output)
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf(),
-        global_config.compression.threshold,
-        global_config.compression.inverse_probability,
-        global_config.compression.resummarize_probability,
+        &config.compression,
     );
+    let mut history_mut = history;
     let compressed_context = comp_mgr
         .get_compressed_context(
             model.clone(),
-            &history,
+            &mut history_mut,
             &latest_user_input,
             sampling.clone(),
+            config.context_checkpoint_limit,
         )
         .await?;
 
@@ -334,14 +372,22 @@ async fn run_inference(
         }
     }
 
+    let effective_user_text = if latest_user_input.is_empty()
+        && (!images.is_empty() || !audio_files.is_empty())
+    {
+        fallback_text
+    } else {
+        latest_user_input
+    };
+
     if !images.is_empty() {
         logger
             .log(&format!("Adding {} images to request", images.len()))
             .await;
         multimodal =
-            multimodal.add_image_message(TextMessageRole::User, &latest_user_input, images);
+            multimodal.add_image_message(TextMessageRole::User, &effective_user_text, images);
     } else {
-        multimodal = multimodal.add_message(TextMessageRole::User, &latest_user_input);
+        multimodal = multimodal.add_message(TextMessageRole::User, &effective_user_text);
     }
 
     let tools = vec![
@@ -363,7 +409,7 @@ async fn run_inference(
         Tool {
             tp: ToolType::Function,
             function: Function {
-                name: "spawn_new_agent".into(),
+                name:                 "spawn_new_agent".into(),
                 description: Some("Spawn a new agent dynamically".into()),
                 parameters: Some(json_schema_obj!({
                     "type": "object",
@@ -371,6 +417,7 @@ async fn run_inference(
                         "name": {"type": "string"},
                         "inputs": {"type": "array", "items": {"type": "string"}},
                         "output": {"type": "string"},
+                        "stream_output": {"type": "string", "nullable": true},
                         "system": {"type": "array", "items": {"type": "string"}},
                         "model": {"type": "string"},
                         "history_limit": {"type": "integer", "nullable": true},
@@ -402,14 +449,16 @@ async fn run_inference(
         .as_millis();
     let output_file_path = PathBuf::from(&config.output).join(format!("out-{}.txt", timestamp));
 
-    let mut file = if config.stream {
+    let mut stream_file = if let Some(ref stream_dir) = config.stream_output {
+        let stream_path = PathBuf::from(stream_dir).join(format!("out-{}.txt", timestamp));
+        fs::create_dir_all(stream_dir).await?;
         logger
             .log(&format!(
-                "Streaming enabled, creating output file: {:?}",
-                output_file_path
+                "Streaming enabled, creating stream output file: {:?}",
+                stream_path
             ))
             .await;
-        Some(fs::File::create(&output_file_path).await?)
+        Some(fs::File::create(&stream_path).await?)
     } else {
         logger
             .log("Streaming disabled, will create output file after completion")
@@ -431,11 +480,10 @@ async fn run_inference(
             if *interrupt_rx.borrow() {
                 logger.log("Inference interrupted").await;
                 if !accumulated_content.is_empty() {
-                    if let Some(ref mut f) = file {
+                    let _ = fs::write(&output_file_path, &accumulated_content).await;
+                    if let Some(ref mut f) = stream_file {
                         let _ = f.write_all(accumulated_content.as_bytes()).await;
                         let _ = f.flush().await;
-                    } else {
-                        let _ = fs::write(&output_file_path, &accumulated_content).await;
                     }
                 }
                 return Ok(());
@@ -445,7 +493,7 @@ async fn run_inference(
                     if let Some(choice) = c.choices.first() {
                         if let Some(ref content) = choice.delta.content {
                             accumulated_content.push_str(content);
-                            if let Some(ref mut f) = file {
+                            if let Some(ref mut f) = stream_file {
                                 let _ = f.write_all(content.as_bytes()).await;
                                 let _ = f.flush().await;
                             }
@@ -459,7 +507,7 @@ async fn run_inference(
             }
         }
 
-        if !config.stream && !accumulated_content.is_empty() {
+        if !accumulated_content.is_empty() {
             logger
                 .log(&format!(
                     "Turn complete, writing to: {:?}",
@@ -519,6 +567,7 @@ async fn run_inference(
                             .map(|v| v.as_str().unwrap_or_default().to_string())
                             .collect(),
                         output: args["output"].as_str().unwrap_or_default().to_string(),
+                        stream_output: args["stream_output"].as_str().map(|s| s.to_string()),
                         system: args["system"]
                             .as_array()
                             .unwrap_or(&vec![])
@@ -527,11 +576,12 @@ async fn run_inference(
                             .collect(),
                         model: args["model"].as_str().unwrap_or("primary").to_string(),
                         history_limit: args["history_limit"].as_u64().map(|u| u as usize),
-                        stream: true,
-                        allowed_extensions: vec![],
                         realtime_audio: args["realtime_audio"].as_bool().unwrap_or(false),
+                        allowed_extensions: vec![],
                         prompt: args["prompt"].as_str().map(|s| s.to_string()),
                         sampling: Default::default(),
+                        compression: Default::default(),
+                        context_checkpoint_limit: None,
                     };
                     send_ipc_command(Command::SpawnAgent { name, config })
                         .await
