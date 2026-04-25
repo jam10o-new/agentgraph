@@ -1,22 +1,22 @@
 use crate::audio::AudioListener;
 use crate::config::{AgentConfig, Config};
 use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_frontmatter};
-use crate::ipc::Command;
 use crate::find_leader_socket;
+use crate::ipc::Command;
 use crate::utils::AgentLogger;
 use anyhow::{Result, anyhow};
-use std::sync::Arc;
-use tokio::sync::{mpsc, watch, Mutex};
-use notify::{Watcher, RecursiveMode, Event};
-use std::path::{Path, PathBuf};
 use mistralrs::{
-    Model, RequestBuilder, SamplingParams, TextMessageRole, Response,
-    Tool, ToolType, Function, ToolChoice, MultimodalMessages,
+    Function, Model, MultimodalMessages, RequestBuilder, Response, SamplingParams, TextMessageRole,
+    Tool, ToolChoice, ToolType,
 };
+use notify::{Event, RecursiveMode, Watcher};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::fs;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use std::time::{SystemTime, Duration};
+use tokio::sync::{Mutex, mpsc, watch};
 
 macro_rules! json_schema_obj {
     ($($json:tt)+) => {
@@ -42,7 +42,13 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(name: String, config: AgentConfig, global_config: Config, model: Arc<Model>, sampling: SamplingParams) -> Self {
+    pub fn new(
+        name: String,
+        config: AgentConfig,
+        global_config: Config,
+        model: Arc<Model>,
+        sampling: SamplingParams,
+    ) -> Self {
         Self {
             name: name.clone(),
             config,
@@ -57,7 +63,7 @@ impl Agent {
     pub async fn run_loop(&self) -> Result<()> {
         let (tx, mut rx) = mpsc::channel(100);
         let name = self.name.clone();
-        
+
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
                 let _ = tx.blocking_send(event);
@@ -72,13 +78,15 @@ impl Agent {
             watcher.watch(&cp, RecursiveMode::NonRecursive)?;
             canonical_inputs.push(cp);
         }
-        
+
         fs::create_dir_all(&self.config.output).await?;
         for sys_path in &self.config.system {
             let _ = fs::create_dir_all(sys_path).await;
         }
 
-        self.logger.log(&format!("Watching inputs: {:?}", canonical_inputs)).await;
+        self.logger
+            .log(&format!("Watching inputs: {:?}", canonical_inputs))
+            .await;
 
         if self.config.realtime_audio {
             let listener = AudioListener::new(self.name.clone(), canonical_inputs[0].clone());
@@ -114,7 +122,7 @@ impl Agent {
                     timer_active = false;
                     while let Ok(_) = rx.try_recv() {}
                     self.logger.log("Triggering inference after debounce").await;
-                    
+
                     let _ = interrupt_tx.send(true);
                     if let Some(handle) = current_inference.take() {
                         handle.abort();
@@ -130,7 +138,7 @@ impl Agent {
                     let interrupt_rx = interrupt_tx.subscribe();
                     let volatile_context = self.volatile_context.clone();
                     let logger = AgentLogger::new(&name);
-                    
+
                     current_inference = Some(tokio::spawn(async move {
                         if let Err(e) = run_inference(agent_name, model, config, global_config, sampling, interrupt_rx, volatile_context, logger).await {
                             eprintln!("Inference error for agent {}: {:?}", log_name, e);
@@ -160,19 +168,23 @@ async fn run_inference(
     logger: AgentLogger,
 ) -> Result<()> {
     logger.log("Starting inference turn").await;
-    
+
     // 1. Collate System Prompts
     let mut system_content = String::new();
     for sys_dir in &config.system {
         if let Ok(mut entries) = fs::read_dir(sys_dir).await {
             let mut files = Vec::new();
             while let Some(entry) = entries.next_entry().await? {
-                if entry.path().is_file() { files.push(entry.path()); }
+                if entry.path().is_file() {
+                    files.push(entry.path());
+                }
             }
             files.sort();
             for f in files {
                 if let Ok(content) = fs::read_to_string(&f).await {
-                    if !system_content.is_empty() { system_content.push_str("\n\n"); }
+                    if !system_content.is_empty() {
+                        system_content.push_str("\n\n");
+                    }
                     system_content.push_str(&content);
                 }
             }
@@ -180,16 +192,26 @@ async fn run_inference(
     }
 
     if let Some(extra_prompt) = &config.prompt {
-        if !system_content.is_empty() { system_content.push_str("\n\n"); }
+        if !system_content.is_empty() {
+            system_content.push_str("\n\n");
+        }
         system_content.push_str(extra_prompt);
     }
 
     let mut combined_history = Vec::new();
     if !system_content.is_empty() {
         if let Some((n, d, body)) = extract_frontmatter(&system_content) {
-            combined_history.push(HistoryTurn { role: HistoryTurnRole::Skill(n, d), content: body, turn_index: 0 });
+            combined_history.push(HistoryTurn {
+                role: HistoryTurnRole::Skill(n, d),
+                content: body,
+                turn_index: 0,
+            });
         } else {
-            combined_history.push(HistoryTurn { role: HistoryTurnRole::System, content: system_content, turn_index: 0 });
+            combined_history.push(HistoryTurn {
+                role: HistoryTurnRole::System,
+                content: system_content,
+                turn_index: 0,
+            });
         }
     }
 
@@ -201,7 +223,12 @@ async fn run_inference(
                 let p = entry.path();
                 if p.is_file() {
                     let metadata = fs::metadata(&p).await?;
-                    all_files.push(FileEntry { path: p, created: metadata.created()?, role: HistoryTurnRole::User });
+                    // TODO: prepend file metadata and full filepath to message content
+                    all_files.push(FileEntry {
+                        path: p,
+                        created: metadata.created()?,
+                        role: HistoryTurnRole::User,
+                    });
                 }
             }
         }
@@ -211,19 +238,31 @@ async fn run_inference(
             let p = entry.path();
             if p.is_file() {
                 let metadata = fs::metadata(&p).await?;
-                all_files.push(FileEntry { path: p, created: metadata.created()?, role: HistoryTurnRole::Assistant });
+                all_files.push(FileEntry {
+                    path: p,
+                    created: metadata.created()?,
+                    role: HistoryTurnRole::Assistant,
+                });
             }
         }
     }
     all_files.sort_by_key(|f| f.created);
 
     let limit = config.history_limit.unwrap_or(0);
-    let start_idx = if limit > 0 && all_files.len() > limit { all_files.len() - limit } else { 0 };
+    let start_idx = if limit > 0 && all_files.len() > limit {
+        all_files.len() - limit
+    } else {
+        0
+    };
 
     let mut turn_idx = 1;
     for entry in all_files.iter().skip(start_idx) {
         if let Ok(content) = fs::read_to_string(&entry.path).await {
-            combined_history.push(HistoryTurn { role: entry.role.clone(), content, turn_index: turn_idx });
+            combined_history.push(HistoryTurn {
+                role: entry.role.clone(),
+                content,
+                turn_index: turn_idx,
+            });
             turn_idx += 1;
         }
     }
@@ -243,19 +282,33 @@ async fn run_inference(
 
     // 3. Compression
     let comp_mgr = CompressionManager::new(
-        PathBuf::from(&config.output).parent().unwrap_or_else(|| Path::new(".")).to_path_buf(),
+        PathBuf::from(&config.output)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
         global_config.compression.threshold,
         global_config.compression.inverse_probability,
         global_config.compression.resummarize_probability,
     );
-    let compressed_context = comp_mgr.get_compressed_context(model.clone(), &history, &latest_user_input, sampling.clone()).await?;
+    let compressed_context = comp_mgr
+        .get_compressed_context(
+            model.clone(),
+            &history,
+            &latest_user_input,
+            sampling.clone(),
+        )
+        .await?;
 
     // 4. Build Request
     let mut multimodal = MultimodalMessages::new();
-    for (role, content) in compressed_context { multimodal = multimodal.add_message(role, content); }
+    for (role, content) in compressed_context {
+        multimodal = multimodal.add_message(role, content);
+    }
     {
         let mut v_ctx = volatile_context.lock().await;
-        for (role, content) in v_ctx.drain(..) { multimodal = multimodal.add_message(role, content); }
+        for (role, content) in v_ctx.drain(..) {
+            multimodal = multimodal.add_message(role, content);
+        }
     }
 
     let mut images = Vec::new();
@@ -267,7 +320,9 @@ async fn run_inference(
                 if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                     match ext.to_lowercase().as_str() {
                         "jpg" | "jpeg" | "png" | "webp" => {
-                            if let Ok(img) = image::open(&p) { images.push(img); }
+                            if let Ok(img) = image::open(&p) {
+                                images.push(img);
+                            }
                         }
                         "wav" | "mp3" | "ogg" => {
                             audio_files.push(p);
@@ -280,8 +335,11 @@ async fn run_inference(
     }
 
     if !images.is_empty() {
-        logger.log(&format!("Adding {} images to request", images.len())).await;
-        multimodal = multimodal.add_image_message(TextMessageRole::User, &latest_user_input, images);
+        logger
+            .log(&format!("Adding {} images to request", images.len()))
+            .await;
+        multimodal =
+            multimodal.add_image_message(TextMessageRole::User, &latest_user_input, images);
     } else {
         multimodal = multimodal.add_message(TextMessageRole::User, &latest_user_input);
     }
@@ -300,7 +358,7 @@ async fn run_inference(
                     }
                 })),
                 strict: None,
-            }
+            },
         },
         Tool {
             tp: ToolType::Function,
@@ -321,7 +379,7 @@ async fn run_inference(
                     }
                 })),
                 strict: None,
-            }
+            },
         },
         Tool {
             tp: ToolType::Function,
@@ -335,18 +393,27 @@ async fn run_inference(
                     }
                 })),
                 strict: None,
-            }
-        }
+            },
+        },
     ];
 
-    let timestamp = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
     let output_file_path = PathBuf::from(&config.output).join(format!("out-{}.txt", timestamp));
-    
+
     let mut file = if config.stream {
-        logger.log(&format!("Streaming enabled, creating output file: {:?}", output_file_path)).await;
+        logger
+            .log(&format!(
+                "Streaming enabled, creating output file: {:?}",
+                output_file_path
+            ))
+            .await;
         Some(fs::File::create(&output_file_path).await?)
     } else {
-        logger.log("Streaming disabled, will create output file after completion").await;
+        logger
+            .log("Streaming disabled, will create output file after completion")
+            .await;
         None
     };
 
@@ -354,14 +421,14 @@ async fn run_inference(
         .set_sampling(sampling)
         .set_tools(tools)
         .set_tool_choice(ToolChoice::Auto);
-    
+
     loop {
         let mut model_stream = model.stream_chat_request(request.clone()).await?;
         let mut accumulated_content = String::new();
         let mut current_tool_calls = Vec::new();
 
         while let Some(chunk) = model_stream.next().await {
-            if *interrupt_rx.borrow() { 
+            if *interrupt_rx.borrow() {
                 logger.log("Inference interrupted").await;
                 if !accumulated_content.is_empty() {
                     if let Some(ref mut f) = file {
@@ -371,7 +438,7 @@ async fn run_inference(
                         let _ = fs::write(&output_file_path, &accumulated_content).await;
                     }
                 }
-                return Ok(()); 
+                return Ok(());
             }
             match chunk {
                 Response::Chunk(c) => {
@@ -393,22 +460,51 @@ async fn run_inference(
         }
 
         if !config.stream && !accumulated_content.is_empty() {
-            logger.log(&format!("Turn complete, writing to: {:?}", output_file_path)).await;
+            logger
+                .log(&format!(
+                    "Turn complete, writing to: {:?}",
+                    output_file_path
+                ))
+                .await;
             let _ = fs::write(&output_file_path, &accumulated_content).await;
         }
 
-        if current_tool_calls.is_empty() { break; }
+        if current_tool_calls.is_empty() {
+            break;
+        }
 
-        logger.log(&format!("Executing {} tool calls", current_tool_calls.len())).await;
-        request = request.add_message_with_tool_call(TextMessageRole::Assistant, &accumulated_content, current_tool_calls.clone());
+        logger
+            .log(&format!(
+                "Executing {} tool calls",
+                current_tool_calls.len()
+            ))
+            .await;
+        request = request.add_message_with_tool_call(
+            TextMessageRole::Assistant,
+            &accumulated_content,
+            current_tool_calls.clone(),
+        );
         for tc in current_tool_calls {
             let result = match tc.function.name.as_str() {
                 "execute_command" => {
                     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
                     let cmd = args["command"].as_str().unwrap_or_default();
-                    let args_vec: Vec<String> = args["args"].as_array().unwrap_or(&vec![]).iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect();
-                    match tokio::process::Command::new(cmd).args(args_vec).output().await {
-                        Ok(output) => format!("Stdout: {}\nStderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)),
+                    let args_vec: Vec<String> = args["args"]
+                        .as_array()
+                        .unwrap_or(&vec![])
+                        .iter()
+                        .map(|v| v.as_str().unwrap_or_default().to_string())
+                        .collect();
+                    match tokio::process::Command::new(cmd)
+                        .args(args_vec)
+                        .output()
+                        .await
+                    {
+                        Ok(output) => format!(
+                            "Stdout: {}\nStderr: {}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        ),
                         Err(e) => format!("Error executing command: {}", e),
                     }
                 }
@@ -416,9 +512,19 @@ async fn run_inference(
                     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
                     let name = args["name"].as_str().unwrap_or_default().to_string();
                     let config = AgentConfig {
-                        inputs: args["inputs"].as_array().unwrap_or(&vec![]).iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect(),
+                        inputs: args["inputs"]
+                            .as_array()
+                            .unwrap_or(&vec![])
+                            .iter()
+                            .map(|v| v.as_str().unwrap_or_default().to_string())
+                            .collect(),
                         output: args["output"].as_str().unwrap_or_default().to_string(),
-                        system: args["system"].as_array().unwrap_or(&vec![]).iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect(),
+                        system: args["system"]
+                            .as_array()
+                            .unwrap_or(&vec![])
+                            .iter()
+                            .map(|v| v.as_str().unwrap_or_default().to_string())
+                            .collect(),
                         model: args["model"].as_str().unwrap_or("primary").to_string(),
                         history_limit: args["history_limit"].as_u64().map(|u| u as usize),
                         stream: true,
@@ -427,7 +533,9 @@ async fn run_inference(
                         prompt: args["prompt"].as_str().map(|s| s.to_string()),
                         sampling: Default::default(),
                     };
-                    send_ipc_command(Command::SpawnAgent { name, config }).await.unwrap_or_else(|e| e.to_string())
+                    send_ipc_command(Command::SpawnAgent { name, config })
+                        .await
+                        .unwrap_or_else(|e| e.to_string())
                 }
                 "load_into_context" => {
                     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
@@ -454,7 +562,9 @@ async fn run_inference(
 }
 
 async fn send_ipc_command(cmd: Command) -> Result<String> {
-    let socket_path = find_leader_socket().await.ok_or_else(|| anyhow!("Leader not found"))?;
+    let socket_path = find_leader_socket()
+        .await
+        .ok_or_else(|| anyhow!("Leader not found"))?;
     let mut stream = UnixStream::connect(socket_path).await?;
     let payload = serde_json::to_vec(&cmd)?;
     stream.write_all(&payload).await?;
