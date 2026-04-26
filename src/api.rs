@@ -46,7 +46,7 @@ struct ChatMessage {
     content: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ChatCompletionResponse {
     id: String,
     object: String,
@@ -55,20 +55,20 @@ struct ChatCompletionResponse {
     choices: Vec<Choice>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Choice {
     index: usize,
     message: MessageResponse,
     finish_reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MessageResponse {
     role: String,
     content: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ChatCompletionChunk {
     id: String,
     object: String,
@@ -77,7 +77,7 @@ struct ChatCompletionChunk {
     choices: Vec<ChunkChoice>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ChunkChoice {
     index: usize,
     delta: Delta,
@@ -85,7 +85,7 @@ struct ChunkChoice {
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<String>,
@@ -93,13 +93,13 @@ struct Delta {
     content: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ModelsListResponse {
     object: String,
     data: Vec<ModelObject>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ModelObject {
     id: String,
     object: String,
@@ -275,7 +275,7 @@ async fn wait_for_output(output_dir: &str, after: SystemTime) -> anyhow::Result<
                 if path.is_file() {
                     if let Ok(metadata) = entry.metadata().await {
                         let modified = metadata.modified().or_else(|_| metadata.created())?;
-                        if modified > after {
+                        if modified >= after {
                             candidates.push((modified, path));
                         }
                     }
@@ -415,7 +415,7 @@ async fn wait_for_stream_file(stream_dir: &str, after: SystemTime) -> anyhow::Re
                 if path.is_file() {
                     if let Ok(metadata) = entry.metadata().await {
                         let modified = metadata.modified().or_else(|_| metadata.created())?;
-                        if modified > after {
+                        if modified >= after {
                             candidates.push((modified, path));
                         }
                     }
@@ -426,5 +426,242 @@ async fn wait_for_stream_file(stream_dir: &str, after: SystemTime) -> anyhow::Re
         if let Some((_, path)) = candidates.into_iter().max_by_key(|(t, _)| *t) {
             return Ok(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::time::sleep;
+    use tower::ServiceExt;
+
+    async fn setup_test_dirs(
+        input_dir: &std::path::Path,
+        output_dir: &std::path::Path,
+        stream_dir: Option<&std::path::Path>,
+    ) {
+        let _ = fs::create_dir_all(input_dir).await;
+        let _ = fs::create_dir_all(output_dir).await;
+        if let Some(d) = stream_dir {
+            let _ = fs::create_dir_all(d).await;
+        }
+    }
+
+    fn make_test_config(
+        input_dir: &std::path::Path,
+        output_dir: &std::path::Path,
+        stream_dir: Option<&std::path::Path>,
+    ) -> Config {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test_agent".to_string(),
+            crate::config::AgentConfig {
+                inputs: vec![input_dir.to_string_lossy().to_string()],
+                output: output_dir.to_string_lossy().to_string(),
+                stream_output: stream_dir.map(|p| p.to_string_lossy().to_string()),
+                tool_output: None,
+                system: vec![],
+                model: "primary".to_string(),
+                history_limit: None,
+                realtime_audio: false,
+                allowed_extensions: vec![],
+                prompt: None,
+                sampling: Default::default(),
+                compression: Default::default(),
+                context_checkpoint_limit: Some(10000),
+                excluded_from_summary: vec![],
+                tools_enabled: true,
+            },
+        );
+
+        crate::config::Config {
+            models: HashMap::new(),
+            agents,
+            shutdown_on_idle: false,
+            api: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_models() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_dir = temp_dir.path().join("input");
+        let output_dir = temp_dir.path().join("output");
+
+        setup_test_dirs(&input_dir, &output_dir, None).await;
+
+        let config = Arc::new(Mutex::new(make_test_config(&input_dir, &output_dir, None)));
+        let state = Arc::new(ApiState { config });
+        let app = router(state);
+
+        let response = app
+            .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let models: ModelsListResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(models.object, "list");
+        assert_eq!(models.data.len(), 1);
+        assert_eq!(models.data[0].id, "test_agent");
+        assert_eq!(models.data[0].context_window, Some(10000));
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_non_streaming() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_dir = temp_dir.path().join("input");
+        let output_dir = temp_dir.path().join("output");
+
+        setup_test_dirs(&input_dir, &output_dir, None).await;
+
+        let config = Arc::new(Mutex::new(make_test_config(&input_dir, &output_dir, None)));
+        let state = Arc::new(ApiState { config });
+        let app = router(state);
+
+        // Spawn a task to create the output file after a delay
+        let output_dir_clone = output_dir.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(300)).await;
+            let output_file = output_dir_clone.join("out-1234567890123.txt");
+            fs::write(&output_file, "Hello from agent")
+                .await
+                .unwrap();
+        });
+
+        let request_body = serde_json::json!({
+            "model": "test_agent",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify input file was created
+        let mut entries = Vec::new();
+        let mut dir = fs::read_dir(&input_dir).await.unwrap();
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            entries.push(entry);
+        }
+        assert_eq!(entries.len(), 1);
+
+        let input_content = fs::read_to_string(&entries[0].path()).await.unwrap();
+        assert_eq!(input_content, "Hello");
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let completion: ChatCompletionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(completion.choices[0].message.content, "Hello from agent");
+        assert_eq!(completion.object, "chat.completion");
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_streaming() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_dir = temp_dir.path().join("input");
+        let output_dir = temp_dir.path().join("output");
+        let stream_dir = temp_dir.path().join("stream");
+
+        setup_test_dirs(&input_dir, &output_dir, Some(&stream_dir)).await;
+
+        let config = Arc::new(Mutex::new(make_test_config(
+            &input_dir,
+            &output_dir,
+            Some(&stream_dir),
+        )));
+        let state = Arc::new(ApiState { config });
+        let app = router(state);
+
+        // Spawn a task to simulate streaming output
+        let stream_dir_clone = stream_dir.clone();
+        let output_dir_clone = output_dir.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(200)).await;
+            let _ = fs::create_dir_all(&stream_dir_clone).await;
+            let stream_file = stream_dir_clone.join("out-1234567890123.txt");
+            fs::write(&stream_file, "Hello ").await.unwrap();
+
+            sleep(Duration::from_millis(100)).await;
+            fs::write(&stream_file, "world").await.unwrap();
+
+            sleep(Duration::from_millis(100)).await;
+            let output_file = output_dir_clone.join("out-1234567890123.txt");
+            fs::write(&output_file, "Hello world").await.unwrap();
+        });
+
+        let request_body = serde_json::json!({
+            "model": "test_agent",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+
+        // Should contain SSE data lines
+        assert!(text.contains("chat.completion.chunk"));
+        assert!(text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_model_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_dir = temp_dir.path().join("input");
+        let output_dir = temp_dir.path().join("output");
+
+        let config = Arc::new(Mutex::new(make_test_config(&input_dir, &output_dir, None)));
+        let state = Arc::new(ApiState { config });
+        let app = router(state);
+
+        let request_body = serde_json::json!({
+            "model": "nonexistent_agent",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
