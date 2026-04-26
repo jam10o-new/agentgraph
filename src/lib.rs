@@ -6,6 +6,7 @@ pub mod context;
 pub mod utils;
 pub mod ipc;
 pub mod audio;
+pub mod api;
 
 // Re-export key types
 pub use config::Config;

@@ -74,5 +74,14 @@ agents:
       top_k: 50
       max_len: 4096
 
+# 3. OpenAI-compatible API Server (optional)
+# When enabled, each configured agent is exposed as a "model" via the API.
+# Messages sent via /v1/chat/completions are written to the agent's first input
+# directory, and responses are read from the output directory.
+api:
+  enabled: false
+  bind_address: "127.0.0.1"
+  port: 3000
+
 # 4. Global Settings
 shutdown_on_idle: false

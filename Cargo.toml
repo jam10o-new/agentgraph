@@ -38,6 +38,11 @@ ag-config = { path = "ag-config" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tempfile = "3"
 hound = "3.5.1"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower = { version = "0.5", features = ["util"] }
+tokio-stream = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
 [features]
 default = ["cuda", "cudnn", "flash-attn"]

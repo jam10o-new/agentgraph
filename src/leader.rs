@@ -107,7 +107,35 @@ impl Leader {
             self.spawn_agent(name.clone(), agent_config.clone()).await?;
         }
 
-        // 3. IPC listener
+        // 3. Start API server if enabled
+        let api_config = {
+            let config = self.config.lock().await;
+            config.api.clone()
+        };
+        if let Some(ref api) = api_config {
+            if api.enabled {
+                let api_state = Arc::new(crate::api::ApiState {
+                    config: self.config.clone(),
+                });
+                let bind_addr = format!("{}:{}", api.bind_address, api.port);
+                tokio::spawn(async move {
+                    let app = crate::api::router(api_state);
+                    match tokio::net::TcpListener::bind(&bind_addr).await {
+                        Ok(listener) => {
+                            println!("API server listening on {}", bind_addr);
+                            if let Err(e) = axum::serve(listener, app).await {
+                                eprintln!("API server error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to bind API server to {}: {}", bind_addr, e);
+                        }
+                    }
+                });
+            }
+        }
+
+        // 4. IPC listener
         let pid = std::process::id();
         let pipe_path = PathBuf::from("/tmp/agentgraph").join(format!("ag-{}.sock", pid));
         tokio::fs::create_dir_all(pipe_path.parent().unwrap()).await?;
