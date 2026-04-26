@@ -83,6 +83,9 @@ impl Agent {
         if let Some(ref stream_dir) = self.config.stream_output {
             let _ = fs::create_dir_all(stream_dir).await;
         }
+        if let Some(ref tool_dir) = self.config.tool_output {
+            let _ = fs::create_dir_all(tool_dir).await;
+        }
         for sys_path in &self.config.system {
             let _ = fs::create_dir_all(sys_path).await;
         }
@@ -159,6 +162,7 @@ struct FileEntry {
     created: SystemTime,
     role: HistoryTurnRole,
     metadata_str: String,
+    excluded: bool,
 }
 
 fn format_file_metadata(path: &Path, metadata: &std::fs::Metadata) -> String {
@@ -226,19 +230,31 @@ async fn run_inference(
                 role: HistoryTurnRole::Skill(n, d),
                 content: body,
                 turn_index: 0,
+                excluded_from_compression: false,
             });
         } else {
             combined_history.push(HistoryTurn {
                 role: HistoryTurnRole::System,
                 content: system_content,
                 turn_index: 0,
+                excluded_from_compression: false,
             });
+        }
+    }
+
+    // Build canonical excluded directories for comparison
+    let mut excluded_canonical = Vec::new();
+    for ex in &config.excluded_from_summary {
+        if let Ok(c) = fs::canonicalize(ex).await {
+            excluded_canonical.push(c);
         }
     }
 
     // 2. Collate User and Assistant History
     let mut all_files = Vec::new();
     for input_dir in &config.inputs {
+        let input_canonical = fs::canonicalize(input_dir).await.unwrap_or_else(|_| PathBuf::from(input_dir));
+        let is_excluded = excluded_canonical.iter().any(|ex| input_canonical.starts_with(ex) || ex.starts_with(&input_canonical));
         if let Ok(mut entries) = fs::read_dir(input_dir).await {
             while let Some(entry) = entries.next_entry().await? {
                 let p = entry.path();
@@ -250,6 +266,7 @@ async fn run_inference(
                         created: metadata.created()?,
                         role: HistoryTurnRole::User,
                         metadata_str: meta_str,
+                        excluded: is_excluded,
                     });
                 }
             }
@@ -265,7 +282,26 @@ async fn run_inference(
                     created: metadata.created()?,
                     role: HistoryTurnRole::Assistant,
                     metadata_str: String::new(),
+                    excluded: false,
                 });
+            }
+        }
+    }
+    // Tool outputs are loaded as assistant history so the model sees its own prior tool results.
+    if let Some(ref tool_dir) = config.tool_output {
+        if let Ok(mut entries) = fs::read_dir(tool_dir).await {
+            while let Some(entry) = entries.next_entry().await? {
+                let p = entry.path();
+                if p.is_file() {
+                    let metadata = fs::metadata(&p).await?;
+                    all_files.push(FileEntry {
+                        path: p,
+                        created: metadata.created()?,
+                        role: HistoryTurnRole::Assistant,
+                        metadata_str: String::new(),
+                        excluded: false,
+                    });
+                }
             }
         }
     }
@@ -290,6 +326,7 @@ async fn run_inference(
                 role: entry.role.clone(),
                 content: final_content,
                 turn_index: turn_idx,
+                excluded_from_compression: entry.excluded,
             });
             turn_idx += 1;
         }
@@ -390,59 +427,95 @@ async fn run_inference(
         multimodal = multimodal.add_message(TextMessageRole::User, &effective_user_text);
     }
 
-    let tools = vec![
-        Tool {
-            tp: ToolType::Function,
-            function: Function {
-                name: "execute_command".into(),
-                description: Some("Execute a shell command on the host".into()),
-                parameters: Some(json_schema_obj!({
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "args": {"type": "array", "items": {"type": "string"}}
-                    }
-                })),
-                strict: None,
+    let tools = if config.tools_enabled {
+        vec![
+            Tool {
+                tp: ToolType::Function,
+                function: Function {
+                    name: "execute_command".into(),
+                    description: Some("Execute a shell command on the host".into()),
+                    parameters: Some(json_schema_obj!({
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "args": {"type": "array", "items": {"type": "string"}}
+                        }
+                    })),
+                    strict: None,
+                },
             },
-        },
-        Tool {
-            tp: ToolType::Function,
-            function: Function {
-                name:                 "spawn_new_agent".into(),
-                description: Some("Spawn a new agent dynamically".into()),
-                parameters: Some(json_schema_obj!({
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "inputs": {"type": "array", "items": {"type": "string"}},
-                        "output": {"type": "string"},
-                        "stream_output": {"type": "string", "nullable": true},
-                        "system": {"type": "array", "items": {"type": "string"}},
-                        "model": {"type": "string"},
-                        "history_limit": {"type": "integer", "nullable": true},
-                        "realtime_audio": {"type": "boolean"},
-                        "prompt": {"type": "string", "nullable": true}
-                    }
-                })),
-                strict: None,
+            Tool {
+                tp: ToolType::Function,
+                function: Function {
+                    name: "spawn_new_agent".into(),
+                    description: Some("Spawn a new agent dynamically".into()),
+                    parameters: Some(json_schema_obj!({
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "inputs": {"type": "array", "items": {"type": "string"}},
+                            "output": {"type": "string"},
+                            "stream_output": {"type": "string", "nullable": true},
+                            "tool_output": {"type": "string", "nullable": true},
+                            "system": {"type": "array", "items": {"type": "string"}},
+                            "model": {"type": "string"},
+                            "history_limit": {"type": "integer", "nullable": true},
+                            "realtime_audio": {"type": "boolean"},
+                            "prompt": {"type": "string", "nullable": true},
+                            "tools_enabled": {"type": "boolean"},
+                            "excluded_from_summary": {"type": "array", "items": {"type": "string"}},
+                            "context_checkpoint_limit": {"type": "integer", "nullable": true}
+                        }
+                    })),
+                    strict: None,
+                },
             },
-        },
-        Tool {
-            tp: ToolType::Function,
-            function: Function {
-                name: "load_into_context".into(),
-                description: Some("Load files into context for the next turn".into()),
-                parameters: Some(json_schema_obj!({
-                    "type": "object",
-                    "properties": {
-                        "files": {"type": "array", "items": {"type": "string"}}
-                    }
-                })),
-                strict: None,
+            Tool {
+                tp: ToolType::Function,
+                function: Function {
+                    name: "load_into_context".into(),
+                    description: Some("Load files into context for the next turn".into()),
+                    parameters: Some(json_schema_obj!({
+                        "type": "object",
+                        "properties": {
+                            "files": {"type": "array", "items": {"type": "string"}}
+                        }
+                    })),
+                    strict: None,
+                },
             },
-        },
-    ];
+            Tool {
+                tp: ToolType::Function,
+                function: Function {
+                    name: "read_file".into(),
+                    description: Some("Read the contents of one or more files and return them immediately".into()),
+                    parameters: Some(json_schema_obj!({
+                        "type": "object",
+                        "properties": {
+                            "files": {"type": "array", "items": {"type": "string"}}
+                        }
+                    })),
+                    strict: None,
+                },
+            },
+            Tool {
+                tp: ToolType::Function,
+                function: Function {
+                    name: "list_directory".into(),
+                    description: Some("List files and directories at a given path".into()),
+                    parameters: Some(json_schema_obj!({
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        }
+                    })),
+                    strict: None,
+                },
+            },
+        ]
+    } else {
+        vec![]
+    };
 
     let timestamp = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -532,7 +605,7 @@ async fn run_inference(
             &accumulated_content,
             current_tool_calls.clone(),
         );
-        for tc in current_tool_calls {
+        for (tool_idx, tc) in current_tool_calls.iter().enumerate() {
             let result = match tc.function.name.as_str() {
                 "execute_command" => {
                     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
@@ -568,6 +641,7 @@ async fn run_inference(
                             .collect(),
                         output: args["output"].as_str().unwrap_or_default().to_string(),
                         stream_output: args["stream_output"].as_str().map(|s| s.to_string()),
+                        tool_output: args["tool_output"].as_str().map(|s| s.to_string()),
                         system: args["system"]
                             .as_array()
                             .unwrap_or(&vec![])
@@ -581,7 +655,14 @@ async fn run_inference(
                         prompt: args["prompt"].as_str().map(|s| s.to_string()),
                         sampling: Default::default(),
                         compression: Default::default(),
-                        context_checkpoint_limit: None,
+                        context_checkpoint_limit: args["context_checkpoint_limit"].as_u64().map(|u| u as usize),
+                        excluded_from_summary: args["excluded_from_summary"]
+                            .as_array()
+                            .unwrap_or(&vec![])
+                            .iter()
+                            .map(|v| v.as_str().unwrap_or_default().to_string())
+                            .collect(),
+                        tools_enabled: args["tools_enabled"].as_bool().unwrap_or(true),
                     };
                     send_ipc_command(Command::SpawnAgent { name, config })
                         .await
@@ -601,9 +682,71 @@ async fn run_inference(
                     volatile_context.lock().await.extend(loaded);
                     "Files loaded into context for next turn".into()
                 }
+                "read_file" => {
+                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
+                    let empty_vec = vec![];
+                    let files = args["files"].as_array().unwrap_or(&empty_vec);
+                    let mut out = String::new();
+                    for f in files {
+                        let p = f.as_str().unwrap_or_default();
+                        match fs::read_to_string(p).await {
+                            Ok(c) => {
+                                out.push_str(&format!("--- {} ---\n{}\n", p, c));
+                            }
+                            Err(e) => {
+                                out.push_str(&format!("--- {} ---\nError: {}\n", p, e));
+                            }
+                        }
+                    }
+                    if out.is_empty() {
+                        "No files requested.".into()
+                    } else {
+                        out
+                    }
+                }
+                "list_directory" => {
+                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
+                    let p = args["path"].as_str().unwrap_or(".");
+                    let mut out = String::new();
+                    match fs::read_dir(p).await {
+                        Ok(mut entries) => {
+                            while let Some(entry) = entries.next_entry().await? {
+                                let meta = entry.metadata().await?;
+                                let file_type = if meta.is_dir() { "dir" } else { "file" };
+                                out.push_str(&format!(
+                                    "[{}] {} ({} bytes)\n",
+                                    file_type,
+                                    entry.path().display(),
+                                    meta.len()
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            out.push_str(&format!("Error reading directory: {}", e));
+                        }
+                    }
+                    if out.is_empty() {
+                        "Directory is empty or path not found.".into()
+                    } else {
+                        out
+                    }
+                }
                 _ => format!("Unknown tool: {}", tc.function.name),
             };
-            request = request.add_tool_message(result, tc.id);
+
+            // Persist tool result to the dedicated tool_output directory if configured,
+            // otherwise fall back to the main output directory.
+            let tool_dest_dir = config.tool_output.as_ref().unwrap_or(&config.output);
+            let _ = fs::create_dir_all(tool_dest_dir).await;
+            let tool_output_path = PathBuf::from(tool_dest_dir).join(format!(
+                "tool-{}-{}-{}.txt",
+                tc.function.name,
+                tool_idx,
+                timestamp
+            ));
+            let _ = fs::write(&tool_output_path, &result).await;
+
+            request = request.add_tool_message(result, tc.id.clone());
         }
     }
 

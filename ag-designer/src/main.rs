@@ -156,6 +156,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         inputs,
                         output,
                         stream_output,
+                        tool_output,
                         system,
                         model: _, // Model is driven by wire
                         history_limit,
@@ -165,6 +166,8 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         sampling,
                         compression,
                         context_checkpoint_limit,
+                        excluded_from_summary,
+                        tools_enabled,
                     },
             } => {
                 ui.set_width(500.0);
@@ -199,6 +202,29 @@ impl SnarlViewer<MyNode> for DemoViewer {
                             if ui.button("➕ Add Input").clicked() {
                                 inputs.push(String::new());
                             }
+
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Excluded from Summary").strong());
+                            let mut to_remove_ex = None;
+                            for (i, ex) in excluded_from_summary.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.text_edit_singleline(ex);
+                                    if ui.button("📁").clicked() {
+                                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                            *ex = path.display().to_string();
+                                        }
+                                    }
+                                    if ui.button("❌").clicked() {
+                                        to_remove_ex = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(i) = to_remove_ex {
+                                excluded_from_summary.remove(i);
+                            }
+                            if ui.button("➕ Add Excluded Dir").clicked() {
+                                excluded_from_summary.push(String::new());
+                            }
                         });
 
                         columns[1].vertical(|ui| {
@@ -222,6 +248,20 @@ impl SnarlViewer<MyNode> for DemoViewer {
                                 if ui.button("📁").clicked() {
                                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                         *stream_output = Some(path.display().to_string());
+                                    }
+                                }
+                            });
+
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Tool Output").strong());
+                            ui.horizontal(|ui| {
+                                let mut to = tool_output.clone().unwrap_or_default();
+                                if ui.text_edit_singleline(&mut to).changed() {
+                                    *tool_output = if to.is_empty() { None } else { Some(to) };
+                                }
+                                if ui.button("📁").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        *tool_output = Some(path.display().to_string());
                                     }
                                 }
                             });
@@ -289,6 +329,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
                     ui.collapsing("Advanced Configuration", |ui| {
                         ui.horizontal(|ui| {
                             ui.checkbox(realtime_audio, "Realtime Audio");
+                            ui.checkbox(tools_enabled, "Tools Enabled");
                             ui.label("History:");
                             let mut hl = history_limit.unwrap_or(0);
                             if ui.add(egui::DragValue::new(&mut hl)).changed() {
@@ -713,6 +754,7 @@ impl eframe::App for SnarlApp {
                                 inputs: Vec::new(),
                                 output: String::new(),
                                 stream_output: None,
+                                tool_output: None,
                                 system: Vec::new(),
                                 model: String::new(),
                                 history_limit: None,
@@ -726,6 +768,8 @@ impl eframe::App for SnarlApp {
                                     resummarize_probability: 0.1,
                                 },
                                 context_checkpoint_limit: None,
+                                excluded_from_summary: Vec::new(),
+                                tools_enabled: true,
                             },
                         },
                     );

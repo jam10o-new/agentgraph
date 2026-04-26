@@ -36,6 +36,13 @@ agents:
       inverse_probability: 0.9
       resummarize_probability: 0.05
     context_checkpoint_limit: 20000
+    # Optional: separate directory for tool results. Keeps main output clean.
+    tool_output: "agents/researcher/tools"
+    # Inputs listed here are never compressed or folded into metasummaries.
+    # Use for ephemeral/mutable inputs that must always reach the model verbatim.
+    excluded_from_summary: []
+    # Allow this agent to use tools (execute_command, read_file, etc.)
+    tools_enabled: true
     sampling:
       temperature: 0.7
       top_p: 0.9
@@ -58,6 +65,9 @@ agents:
       inverse_probability: 0.9
       resummarize_probability: 0.05
     context_checkpoint_limit: 40000
+    tool_output: "agents/coder/tools"
+    excluded_from_summary: []
+    tools_enabled: true
     sampling:
       temperature: 0.2
       top_p: 0.95

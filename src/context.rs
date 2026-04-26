@@ -47,6 +47,8 @@ pub struct HistoryTurn {
     pub role: HistoryTurnRole,
     pub content: String,
     pub turn_index: usize,
+    /// If true, this turn is never compressed or folded into a metasummary.
+    pub excluded_from_compression: bool,
 }
 
 use ag_config::CompressionConfig;
@@ -128,6 +130,10 @@ impl CompressionManager {
         let mut included_turn_indices = Vec::new();
 
         for turn in turns {
+            // Never fold excluded turns into a metasummary
+            if turn.excluded_from_compression {
+                continue;
+            }
             included_turn_indices.push(turn.turn_index);
             summary_text.push_str(&format!(
                 "\n--- Turn {} ({}) ---\n",
@@ -209,16 +215,22 @@ impl CompressionManager {
     ) -> Result<Vec<(TextMessageRole, String)>> {
         let mut attempt = 0;
         loop {
-            // Phase 0: Apply existing metasummaries
+            // Phase 0: Apply existing metasummaries, but never filter excluded turns
             if let Some(ms) = self.load_latest_metasummary().await? {
                 let cutoff = ms.turn_index;
-                history.retain(|t| t.turn_index > cutoff);
+                history.retain(|t| t.turn_index > cutoff || t.excluded_from_compression);
             }
 
             // Phase 1: Compress remaining history
             let mut context = Vec::new();
             let total_turns = history.len();
             for (i, turn) in history.iter().enumerate() {
+                // Excluded turns are passed verbatim, never compressed
+                if turn.excluded_from_compression {
+                    context.push(turn_to_mistral(turn));
+                    continue;
+                }
+
                 let depth = total_turns - 1 - i;
                 let prob = 1.0 - self.inverse_prob.powf(depth as f64);
 
@@ -247,10 +259,10 @@ impl CompressionManager {
             if let Some(limit) = checkpoint_limit {
                 let total_chars: usize = context.iter().map(|(_, s)| s.len()).sum();
                 if total_chars > limit && attempt == 0 {
-                    // Determine how many oldest non-system turns to fold
+                    // Determine how many oldest non-system, non-excluded turns to fold
                     let mut fold_count = 0;
                     for turn in history.iter() {
-                        if matches!(turn.role, HistoryTurnRole::System) {
+                        if matches!(turn.role, HistoryTurnRole::System) || turn.excluded_from_compression {
                             continue;
                         }
                         fold_count += 1;

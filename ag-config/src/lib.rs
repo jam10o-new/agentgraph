@@ -31,6 +31,11 @@ pub struct AgentConfig {
     /// primary `output` directory receiving the final result.
     #[serde(default)]
     pub stream_output: Option<String>,
+    /// Optional directory to write tool results into. When set, tool outputs
+    /// are persisted here instead of the primary output directory, keeping
+    /// downstream agent inputs clean from tool noise.
+    #[serde(default)]
+    pub tool_output: Option<String>,
     pub system: Vec<String>,
     pub model: String,
     /// Latest N turns to load. 0 or None means unbound (all).
@@ -49,6 +54,17 @@ pub struct AgentConfig {
     /// 0 or None disables checkpointing.
     #[serde(default)]
     pub context_checkpoint_limit: Option<usize>,
+    /// Input directories whose files should never be compressed or folded into metasummaries.
+    /// Useful for mutable/ephemeral inputs that must always reach the model verbatim.
+    #[serde(default)]
+    pub excluded_from_summary: Vec<String>,
+    /// Whether this agent is allowed to use tools. Defaults to true.
+    #[serde(default = "default_true")]
+    pub tools_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

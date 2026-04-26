@@ -62,6 +62,9 @@ enum Commands {
     /// Optional streaming output directory
     #[arg(short, long)]
     stream_output: Option<String>,
+    /// Optional tool output directory
+    #[arg(long)]
+    tool_output: Option<String>,
         /// Extra system prompt
         #[arg(short, long)]
         prompt: Option<String>,
@@ -113,11 +116,12 @@ async fn main() -> Result<()> {
                 Commands::Run { agent, message } => Command::RunAgent(agent, message),
                 Commands::Stop { agent } => Command::StopAgent(agent),
                 Commands::Reload => Command::ReloadConfig,
-                Commands::Spawn { name, inputs, output, stream_output, system, model, limit, prompt, .. } => {
+                Commands::Spawn { name, inputs, output, stream_output, tool_output, system, model, limit, prompt, .. } => {
                     let config = AgentConfig {
                         inputs,
                         output,
                         stream_output,
+                        tool_output,
                         system,
                         model,
                         history_limit: limit,
@@ -127,6 +131,8 @@ async fn main() -> Result<()> {
                         sampling: Default::default(),
                         compression: Default::default(),
                         context_checkpoint_limit: None,
+                        excluded_from_summary: Vec::new(),
+                        tools_enabled: true,
                     };
                     Command::SpawnAgent { name, config }
                 }
