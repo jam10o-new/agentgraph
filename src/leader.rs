@@ -116,6 +116,7 @@ impl Leader {
             if api.enabled {
                 let api_state = Arc::new(crate::api::ApiState {
                     config: self.config.clone(),
+                    model: self.model.clone(),
                 });
                 let bind_addr = format!("{}:{}", api.bind_address, api.port);
                 tokio::spawn(async move {
