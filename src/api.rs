@@ -233,7 +233,7 @@ async fn chat_completions(
         // Build isolated agent config: only temp directories.
         let mut isolated_config = base_agent_config.clone();
         isolated_config.inputs = vec![api_input.to_string_lossy().to_string()];
-        isolated_config.output = api_output.to_string_lossy().to_string();
+        isolated_config.output = Some(api_output.to_string_lossy().to_string());
         isolated_config.stream_output = Some(api_stream.to_string_lossy().to_string());
         isolated_config.tool_output = Some(api_tools.to_string_lossy().to_string());
         isolated_config.system = if system_msgs.is_empty() {
@@ -380,7 +380,7 @@ async fn chat_completions(
             let model_name = req.model;
 
             tokio::spawn(async move {
-                match wait_for_output(Some(base_agent_config.output), start_time).await {
+                match wait_for_output(base_agent_config.output, start_time).await {
                     Ok(content) => {
                         let chunk = ChatCompletionChunk {
                             id: id.clone(),
@@ -424,7 +424,7 @@ async fn chat_completions(
 
             Ok(Sse::new(ReceiverStream::new(rx)).into_response())
         } else {
-            let content = wait_for_output(Some(base_agent_config.output), start_time)
+            let content = wait_for_output(base_agent_config.output, start_time)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -669,7 +669,7 @@ mod tests {
             "test_agent".to_string(),
             crate::config::AgentConfig {
                 inputs: vec![input_dir.to_string_lossy().to_string()],
-                output: output_dir.to_string_lossy().to_string(),
+                output: Some(output_dir.to_string_lossy().to_string()),
                 stream_output: stream_dir.map(|p| p.to_string_lossy().to_string()),
                 tool_output: None,
                 system: vec![],

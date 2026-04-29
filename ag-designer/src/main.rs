@@ -230,10 +230,13 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         columns[1].vertical(|ui| {
                             ui.label(egui::RichText::new("Output").strong());
                             ui.horizontal(|ui| {
-                                ui.text_edit_singleline(output);
+                                let mut o = output.clone().unwrap_or_default();
+                                if ui.text_edit_singleline(&mut o).changed() {
+                                    *output = if o.is_empty() { None } else { Some(o) };
+                                }
                                 if ui.button("📁").clicked() {
                                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                        *output = path.display().to_string();
+                                        *output = Some(path.display().to_string());
                                     }
                                 }
                             });
@@ -470,22 +473,23 @@ impl SnarlViewer<MyNode> for DemoViewer {
                 MyNode::Agent { .. },
             ) => {
                 if to.id.input > 0 {
-                    let output_path = source_config.output.clone();
-                    let dest_node_mut = &mut snarl[to.id.node];
-                    if let MyNode::Agent {
-                        config: dest_config,
-                        ..
-                    } = dest_node_mut
-                    {
-                        if to.id.input > dest_config.inputs.len() {
-                            dest_config.inputs.push(output_path);
-                            let new_in_pin = InPinId {
-                                node: to.id.node,
-                                input: dest_config.inputs.len(),
-                            };
-                            snarl.connect(from.id, new_in_pin);
-                        } else {
-                            snarl.connect(from.id, to.id);
+                    if let Some(output_path) = source_config.output.clone() {
+                        let dest_node_mut = &mut snarl[to.id.node];
+                        if let MyNode::Agent {
+                            config: dest_config,
+                            ..
+                        } = dest_node_mut
+                        {
+                            if to.id.input > dest_config.inputs.len() {
+                                dest_config.inputs.push(output_path);
+                                let new_in_pin = InPinId {
+                                    node: to.id.node,
+                                    input: dest_config.inputs.len(),
+                                };
+                                snarl.connect(from.id, new_in_pin);
+                            } else {
+                                snarl.connect(from.id, to.id);
+                            }
                         }
                     }
                 }
@@ -523,6 +527,7 @@ impl SnarlApp {
             models: HashMap::new(),
             agents: HashMap::new(),
             shutdown_on_idle: self.shutdown_on_idle,
+            api: None,
         };
 
         let mut node_to_model_alias: HashMap<NodeId, String> = HashMap::new();
@@ -585,9 +590,11 @@ impl SnarlApp {
                             ..
                         } = remote_node
                         {
-                            resolved_inputs.push(remote_config.output.clone());
-                            found_remote = true;
-                            break;
+                            if let Some(ref output) = remote_config.output {
+                                resolved_inputs.push(output.clone());
+                                found_remote = true;
+                                break;
+                            }
                         }
                     }
                     if !found_remote {
@@ -685,7 +692,7 @@ impl SnarlApp {
                 // Input connections
                 for (i, input_path) in a.inputs.iter().enumerate() {
                     for (other_name, other_a) in &config.agents {
-                        if other_a.output == *input_path {
+                        if other_a.output.as_ref() == Some(input_path) {
                             let other_id = agent_name_to_id[other_name];
                             self.snarl.connect(
                                 OutPinId {
@@ -752,7 +759,7 @@ impl eframe::App for SnarlApp {
                             name: String::new(),
                             config: AgentConfig {
                                 inputs: Vec::new(),
-                                output: String::new(),
+                                output: None,
                                 stream_output: None,
                                 tool_output: None,
                                 system: Vec::new(),

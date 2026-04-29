@@ -49,7 +49,7 @@ enum Commands {
         inputs: Vec<String>,
         /// Output directory
         #[arg(short, long)]
-        output: String,
+        output: Option<String>,
         /// System prompt directories (comma separated)
         #[arg(short, long, value_delimiter = ',')]
         system: Vec<String>,

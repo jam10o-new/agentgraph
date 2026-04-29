@@ -44,7 +44,7 @@ pub struct AgentConfig {
     pub inputs: Vec<String>,
     /// Primary output directory. Written only at turn completion (or interrupt).
     /// Other agents should watch this directory for triggered downstream work.
-    pub output: String,
+    pub output: Option<String>,
     /// Optional streaming output directory. When set, assistant tokens are
     /// written live to this directory for human display, in addition to the
     /// primary `output` directory receiving the final result.

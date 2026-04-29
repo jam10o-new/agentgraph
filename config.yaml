@@ -1,4 +1,16 @@
 # AgentGraph Configuration Template
+#
+# OUTPUT SEMANTICS:
+# - output: Optional directory for final assistant response files. If present, the complete
+#   inference result is written here when a turn finishes.
+# - stream_output: Optional directory for live streaming of assistant tokens as they are
+#   generated. If present, tokens are written in real-time to this directory.
+# - If both are present, both final output AND streaming output are written.
+# - If only stream_output is present, only streaming output is written (no final output file).
+# - If neither are present, the agent runs inference without writing any output files
+#   (useful for pure tool execution agents).
+# - tool_output: Optional separate directory for tool execution results (keeps output clean).
+#   Falls back to `output` if not set.
 
 # 1. Model Definitions
 models:
@@ -22,15 +34,17 @@ agents:
     # A list of directories to watch for user input
     inputs:
       - "agents/researcher/input"
-    # A single directory to write assistant responses
+    # Primary output directory. Written only at turn completion (or interrupt).
+    # Other agents should watch this directory for triggered downstream work.
+    # May be omitted if using only stream_output or pure tool execution.
     output: "agents/researcher/output"
+    # Optional: live-streaming output directory for watching tokens in real-time.
+    stream_output: "agents/researcher/stream"
     # A list of directories containing system prompts and skills
     system:
       - "agents/researcher/system"
     model: "primary"
     history_limit: 20
-    # No stream_output means the agent only writes final output.
-    # Use stream_output for agents you want to watch live.
     compression:
       threshold: 0.5
       inverse_probability: 0.9
@@ -49,10 +63,39 @@ agents:
       top_k: 40
       max_len: 2048
 
+  # Example: stream-only agent (no final output files, only live streaming)
+  stream_watcher:
+    inputs:
+      - "agents/stream_watcher/input"
+    stream_output: "agents/stream_watcher/stream"
+    system:
+      - "agents/stream_watcher/system"
+    model: "primary"
+    history_limit: 10
+    tools_enabled: false
+    sampling:
+      temperature: 0.7
+      top_p: 0.9
+      max_len: 1024
+
+  # Example: pure tool-execution agent (no output files at all, just runs tools)
+  tool_runner:
+    inputs:
+      - "agents/tool_runner/input"
+    system:
+      - "agents/tool_runner/system"
+    model: "primary"
+    history_limit: 0
+    tool_output: "agents/tool_runner/tools"
+    tools_enabled: true
+    sampling:
+      temperature: 0.2
+      max_len: 512
+
   coder:
     inputs:
       - "agents/coder/input"
-      - "agents/researcher/output" # Colony: watches researcher's output
+      - "agents/researcher/output"  # Colony: watches researcher's output
     output: "agents/coder/output"
     # Secondary human-readable streaming output in addition to the primary output above.
     stream_output: "agents/coder/stream"

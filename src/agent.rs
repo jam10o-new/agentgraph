@@ -79,7 +79,9 @@ impl Agent {
             canonical_inputs.push(cp);
         }
 
-        fs::create_dir_all(&self.config.output).await?;
+        if let Some(ref output) = self.config.output {
+            fs::create_dir_all(output).await?;
+        }
         if let Some(ref stream_dir) = self.config.stream_output {
             let _ = fs::create_dir_all(stream_dir).await;
         }
@@ -276,18 +278,20 @@ async fn run_inference(
             }
         }
     }
-    if let Ok(mut entries) = fs::read_dir(&config.output).await {
-        while let Some(entry) = entries.next_entry().await? {
-            let p = entry.path();
-            if p.is_file() {
-                let metadata = fs::metadata(&p).await?;
-                all_files.push(FileEntry {
-                    path: p,
-                    created: metadata.created()?,
-                    role: HistoryTurnRole::Assistant,
-                    metadata_str: String::new(),
-                    excluded: false,
-                });
+    if let Some(ref output) = config.output {
+        if let Ok(mut entries) = fs::read_dir(output).await {
+            while let Some(entry) = entries.next_entry().await? {
+                let p = entry.path();
+                if p.is_file() {
+                    let metadata = fs::metadata(&p).await?;
+                    all_files.push(FileEntry {
+                        path: p,
+                        created: metadata.created()?,
+                        role: HistoryTurnRole::Assistant,
+                        metadata_str: String::new(),
+                        excluded: false,
+                    });
+                }
             }
         }
     }
@@ -361,13 +365,11 @@ async fn run_inference(
         .unwrap_or_default();
 
     // 3. Compression
-    let comp_mgr = CompressionManager::new(
-        PathBuf::from(&config.output)
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-        &config.compression,
-    );
+    let checkpoint_base = config.output.as_ref()
+        .and_then(|o| PathBuf::from(o).parent().map(|p| p.to_path_buf()))
+        .or_else(|| config.stream_output.as_ref().and_then(|s| PathBuf::from(s).parent().map(|p| p.to_path_buf())))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let comp_mgr = CompressionManager::new(checkpoint_base, &config.compression);
     let mut history_mut = history;
     let compressed_context = comp_mgr
         .get_compressed_context(
@@ -526,7 +528,9 @@ async fn run_inference(
     let timestamp = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
-    let output_file_path = PathBuf::from(&config.output).join(format!("out-{}.txt", timestamp));
+    let output_file_path: Option<PathBuf> = config.output.as_ref().map(|o| {
+        PathBuf::from(o).join(format!("out-{}.txt", timestamp))
+    });
 
     let mut stream_file = if let Some(ref stream_dir) = config.stream_output {
         let stream_path = PathBuf::from(stream_dir).join(format!("out-{}.txt", timestamp));
@@ -559,7 +563,9 @@ async fn run_inference(
             if *interrupt_rx.borrow() {
                 logger.log("Inference interrupted").await;
                 if !accumulated_content.is_empty() {
-                    let _ = fs::write(&output_file_path, &accumulated_content).await;
+                    if let Some(ref output_path) = output_file_path {
+                        let _ = fs::write(output_path, &accumulated_content).await;
+                    }
                     if let Some(ref mut f) = stream_file {
                         let _ = f.write_all(accumulated_content.as_bytes()).await;
                         let _ = f.flush().await;
@@ -587,13 +593,15 @@ async fn run_inference(
         }
 
         if !accumulated_content.is_empty() {
-            logger
-                .log(&format!(
-                    "Turn complete, writing to: {:?}",
-                    output_file_path
-                ))
-                .await;
-            let _ = fs::write(&output_file_path, &accumulated_content).await;
+            if let Some(ref output_path) = output_file_path {
+                logger
+                    .log(&format!(
+                        "Turn complete, writing to: {:?}",
+                        output_path
+                    ))
+                    .await;
+                let _ = fs::write(output_path, &accumulated_content).await;
+            }
         }
 
         if current_tool_calls.is_empty() {
@@ -744,7 +752,8 @@ async fn run_inference(
 
             // Persist tool result to the dedicated tool_output directory if configured,
             // otherwise fall back to the main output directory.
-            let tool_dest_dir = config.tool_output.as_ref().unwrap_or(&config.output.unwrap_or(String::from("/tmp/agentgraph_tool_output")));
+            let fallback_tool_dir = config.output.as_ref().cloned().unwrap_or_else(|| "/tmp/agentgraph_tool_output".to_string());
+            let tool_dest_dir = config.tool_output.as_ref().unwrap_or(&fallback_tool_dir);
             let _ = fs::create_dir_all(tool_dest_dir).await;
             let tool_output_path = PathBuf::from(tool_dest_dir).join(format!(
                 "tool-{}-{}-{}.txt",
