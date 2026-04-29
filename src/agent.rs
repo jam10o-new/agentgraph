@@ -520,6 +520,36 @@ async fn run_inference(
                     strict: None,
                 },
             },
+            Tool {
+                tp: ToolType::Function,
+                function: Function {
+                    name: "list_skills".into(),
+                    description: Some("Discover available skills by searching for SKILL.md files in ~/.config and the current working directory. Returns a list of skills with their names, descriptions, and paths.".into()),
+                    parameters: Some(json_schema_obj!({
+                        "type": "object",
+                        "properties": {
+                            "search_paths": {"type": "array", "items": {"type": "string"}, "description": "Optional additional paths to search. Defaults to ~/.config and cwd."}
+                        }
+                    })),
+                    strict: None,
+                },
+            },
+            Tool {
+                tp: ToolType::Function,
+                function: Function {
+                    name: "load_skill".into(),
+                    description: Some("Load a skill into the agent's system context by copying its directory into a system prompt directory. The skill's SKILL.md and any reference files become part of the agent's system prompt.".into()),
+                    parameters: Some(json_schema_obj!({
+                        "type": "object",
+                        "properties": {
+                            "skill_path": {"type": "string", "description": "Path to the skill directory containing SKILL.md"},
+                            "system_dir": {"type": "string", "description": "Target system directory to copy the skill into. Defaults to the agent's first system directory."}
+                        },
+                        "required": ["skill_path"]
+                    })),
+                    strict: None,
+                },
+            },
         ]
     } else {
         vec![]
@@ -748,6 +778,89 @@ async fn run_inference(
                         out
                     }
                 }
+                "list_skills" => {
+                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
+                    let mut search_roots: Vec<String> = args["search_paths"]
+                        .as_array()
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                        .unwrap_or_default();
+                    if search_roots.is_empty() {
+                        if let Ok(home) = std::env::var("HOME") {
+                            search_roots.push(format!("{}/.config", home));
+                        }
+                        if let Ok(cwd) = std::env::current_dir() {
+                            search_roots.push(cwd.to_string_lossy().to_string());
+                        }
+                    }
+                    let mut skills = Vec::new();
+                    for root in &search_roots {
+                        let root_path = PathBuf::from(root);
+                        if !root_path.exists() {
+                            continue;
+                        }
+                        let mut stack = vec![root_path];
+                        while let Some(dir) = stack.pop() {
+                            let skill_md = dir.join("SKILL.md");
+                            if skill_md.exists() && skill_md.is_file() {
+                                let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                                let mut description = String::new();
+                                if let Ok(content) = tokio::fs::read_to_string(&skill_md).await {
+                                    if content.starts_with("---") {
+                                        if let Some(end) = content[3..].find("---") {
+                                            let frontmatter = &content[3..end+3];
+                                            for line in frontmatter.lines() {
+                                                if line.starts_with("description:") {
+                                                    description = line["description:".len()..].trim().to_string();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if description.is_empty() && content.len() > 100 {
+                                        description = content.lines().skip(1).find(|l| !l.trim().is_empty() && !l.starts_with("---")).unwrap_or("").to_string();
+                                    }
+                                }
+                                skills.push(format!("- {} ({}): {}", name, dir.display(), description));
+                                continue; // Don't recurse into skill directories
+                            }
+                            if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+                                while let Ok(Some(entry)) = entries.next_entry().await {
+                                    let path = entry.path();
+                                    if path.is_dir() {
+                                        stack.push(path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if skills.is_empty() {
+                        "No skills found. Skills are directories containing a SKILL.md file.".into()
+                    } else {
+                        format!("Found {} skills:\n{}", skills.len(), skills.join("\n"))
+                    }
+                }
+                "load_skill" => {
+                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
+                    let skill_path = args["skill_path"].as_str().unwrap_or_default();
+                    let system_dir = args["system_dir"].as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| config.system.first().cloned())
+                        .unwrap_or_else(|| ".".to_string());
+                    if skill_path.is_empty() {
+                        "Error: skill_path is required".into()
+                    } else {
+                        let src = PathBuf::from(skill_path);
+                        let skill_md = src.join("SKILL.md");
+                        if !skill_md.exists() {
+                            format!("Error: No SKILL.md found at {}", skill_md.display())
+                        } else {
+                            let dest = PathBuf::from(&system_dir).join(src.file_name().unwrap_or_default());
+                            match copy_dir(&src, &dest).await {
+                                Ok(_) => format!("Skill loaded from {} into {}", src.display(), dest.display()),
+                                Err(e) => format!("Error copying skill: {}", e),
+                            }
+                        }
+                    }
+                }
                 _ => format!("Unknown tool: {}", tc.function.name),
             };
 
@@ -781,4 +894,19 @@ async fn send_ipc_command(cmd: Command) -> Result<String> {
     let mut resp = String::new();
     let _ = stream.read_to_string(&mut resp).await;
     Ok(resp)
+}
+
+async fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest).await?;
+    let mut entries = fs::read_dir(src).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        if src_path.is_dir() {
+            Box::pin(copy_dir(&src_path, &dest_path)).await?;
+        } else {
+            fs::copy(&src_path, &dest_path).await?;
+        }
+    }
+    Ok(())
 }
