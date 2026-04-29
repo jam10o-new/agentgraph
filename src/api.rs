@@ -1,9 +1,10 @@
+use anyhow::anyhow;
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
-    response::{sse::Event, IntoResponse, Sse},
+    response::{IntoResponse, Sse, sse::Event},
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -262,13 +263,7 @@ async fn chat_completions(
 
         // Spawn a throw-away agent inside the temp workspace.
         let agent_name = format!("api-{}-{}", req.model, uuid::Uuid::new_v4());
-        let agent = crate::Agent::new(
-            agent_name,
-            isolated_config,
-            global_config,
-            model,
-            sampling,
-        );
+        let agent = crate::Agent::new(agent_name, isolated_config, global_config, model, sampling);
 
         let handle = tokio::spawn(async move {
             if let Err(e) = agent.run_loop().await {
@@ -327,7 +322,7 @@ async fn chat_completions(
 
             Ok(Sse::new(ReceiverStream::new(rx)).into_response())
         } else {
-            let content = wait_for_output(&output_path, start_time)
+            let content = wait_for_output(Some(output_path), start_time)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -385,7 +380,7 @@ async fn chat_completions(
             let model_name = req.model;
 
             tokio::spawn(async move {
-                match wait_for_output(&base_agent_config.output, start_time).await {
+                match wait_for_output(Some(base_agent_config.output), start_time).await {
                     Ok(content) => {
                         let chunk = ChatCompletionChunk {
                             id: id.clone(),
@@ -421,8 +416,7 @@ async fn chat_completions(
                         let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
                     }
                     Err(e) => {
-                        let err_json =
-                            serde_json::json!({"error": e.to_string()}).to_string();
+                        let err_json = serde_json::json!({"error": e.to_string()}).to_string();
                         let _ = tx.send(Ok(Event::default().data(err_json))).await;
                     }
                 }
@@ -430,7 +424,7 @@ async fn chat_completions(
 
             Ok(Sse::new(ReceiverStream::new(rx)).into_response())
         } else {
-            let content = wait_for_output(&base_agent_config.output, start_time)
+            let content = wait_for_output(Some(base_agent_config.output), start_time)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -455,37 +449,45 @@ async fn chat_completions(
 
 // ---------- Helpers ----------
 
-async fn wait_for_output(output_dir: &str, after: SystemTime) -> anyhow::Result<String> {
-    let output_path = PathBuf::from(output_dir);
-    let result = timeout(Duration::from_secs(120), async {
-        loop {
-            sleep(Duration::from_millis(100)).await;
+async fn wait_for_output(
+    output_dir_maybe: Option<String>,
+    after: SystemTime,
+) -> anyhow::Result<String> {
+    if let Some(output_dir) = output_dir_maybe {
+        let output_path = PathBuf::from(output_dir);
+        let result = timeout(Duration::from_secs(120), async {
+            loop {
+                sleep(Duration::from_millis(100)).await;
 
-            let mut candidates = Vec::new();
-            if let Ok(mut entries) = fs::read_dir(&output_path).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Ok(metadata) = entry.metadata().await {
-                            let modified = metadata.modified().or_else(|_| metadata.created())?;
-                            if modified >= after {
-                                candidates.push((modified, path));
+                let mut candidates = Vec::new();
+                if let Ok(mut entries) = fs::read_dir(&output_path).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Ok(metadata) = entry.metadata().await {
+                                let modified =
+                                    metadata.modified().or_else(|_| metadata.created())?;
+                                if modified >= after {
+                                    candidates.push((modified, path));
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            if let Some((_, path)) = candidates.into_iter().max_by_key(|(t, _)| *t) {
-                // Give the agent a moment to finish flushing.
-                sleep(Duration::from_millis(200)).await;
-                return anyhow::Result::Ok(fs::read_to_string(&path).await?);
+                if let Some((_, path)) = candidates.into_iter().max_by_key(|(t, _)| *t) {
+                    // Give the agent a moment to finish flushing.
+                    sleep(Duration::from_millis(200)).await;
+                    return anyhow::Result::Ok(fs::read_to_string(&path).await?);
+                }
             }
-        }
-    })
-    .await;
+        })
+        .await;
 
-    result.map_err(|_| anyhow::anyhow!("Timeout waiting for agent output"))?
+        result.map_err(|_| anyhow::anyhow!("Timeout waiting for agent output"))?
+    } else {
+        Err(anyhow::anyhow!("No non-streaming output set"))?
+    }
 }
 
 async fn stream_from_dir(
@@ -701,11 +703,19 @@ mod tests {
         setup_test_dirs(&input_dir, &output_dir, None).await;
 
         let config = Arc::new(Mutex::new(make_test_config(&input_dir, &output_dir, None)));
-        let state = Arc::new(ApiState { config, model: None });
+        let state = Arc::new(ApiState {
+            config,
+            model: None,
+        });
         let app = router(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -728,7 +738,10 @@ mod tests {
         setup_test_dirs(&input_dir, &output_dir, None).await;
 
         let config = Arc::new(Mutex::new(make_test_config(&input_dir, &output_dir, None)));
-        let state = Arc::new(ApiState { config, model: None });
+        let state = Arc::new(ApiState {
+            config,
+            model: None,
+        });
         let app = router(state);
 
         // Simulate a "model" writing the response file after a short delay.
@@ -736,9 +749,7 @@ mod tests {
         tokio::spawn(async move {
             sleep(Duration::from_millis(300)).await;
             let output_file = output_dir_clone.join("out-1234567890123.txt");
-            fs::write(&output_file, "Hello from agent")
-                .await
-                .unwrap();
+            fs::write(&output_file, "Hello from agent").await.unwrap();
         });
 
         let request_body = serde_json::json!({
@@ -791,7 +802,10 @@ mod tests {
             &output_dir,
             Some(&stream_dir),
         )));
-        let state = Arc::new(ApiState { config, model: None });
+        let state = Arc::new(ApiState {
+            config,
+            model: None,
+        });
         let app = router(state);
 
         // Simulate a streaming model writing pieces into the stream dir,
@@ -847,7 +861,10 @@ mod tests {
         let output_dir = temp_dir.path().join("output");
 
         let config = Arc::new(Mutex::new(make_test_config(&input_dir, &output_dir, None)));
-        let state = Arc::new(ApiState { config, model: None });
+        let state = Arc::new(ApiState {
+            config,
+            model: None,
+        });
         let app = router(state);
 
         let request_body = serde_json::json!({

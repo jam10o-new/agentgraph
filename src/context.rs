@@ -88,7 +88,8 @@ impl CompressionManager {
     }
 
     fn metasummary_path(&self, turn_idx: usize) -> PathBuf {
-        self.metasummary_dir().join(format!("metasummary_{}.json", turn_idx))
+        self.metasummary_dir()
+            .join(format!("metasummary_{}.json", turn_idx))
     }
 
     async fn load_latest_metasummary(&self) -> Result<Option<MetaSummary>> {
@@ -103,7 +104,11 @@ impl CompressionManager {
             if p.extension().and_then(|e| e.to_str()) == Some("json") {
                 let content = fs::read_to_string(&p).await?;
                 let ms: MetaSummary = serde_json::from_str(&content)?;
-                if latest.as_ref().map(|l| ms.turn_index > l.turn_index).unwrap_or(true) {
+                if latest
+                    .as_ref()
+                    .map(|l| ms.turn_index > l.turn_index)
+                    .unwrap_or(true)
+                {
                     latest = Some(ms);
                 }
             }
@@ -240,7 +245,7 @@ impl CompressionManager {
                 }
 
                 if prob > self.threshold {
-                    let compressed = self
+                    let maybe_compressed = self
                         .process_turn_compression(
                             model.clone(),
                             history,
@@ -248,8 +253,12 @@ impl CompressionManager {
                             latest_turn,
                             sampling.clone(),
                         )
-                        .await?;
-                    context.push(compressed);
+                        .await;
+                    if let Ok(compressed) = maybe_compressed {
+                        context.push(compressed);
+                    } else {
+                        context.push(turn_to_mistral(turn));
+                    }
                 } else {
                     context.push(turn_to_mistral(turn));
                 }
@@ -257,12 +266,22 @@ impl CompressionManager {
 
             // Phase 2: Post-compression checkpointing
             if let Some(limit) = checkpoint_limit {
+                let model_max_seq_chars =
+                    if let Some(model_max_seq_len) = model.clone().config().unwrap().max_seq_len {
+                        model_max_seq_len * 3 //TOD0 make a const or calc max token length from config instead of hardcoding here
+                    } else {
+                        limit
+                    };
                 let total_chars: usize = context.iter().map(|(_, s)| s.len()).sum();
-                if total_chars > limit && attempt == 0 {
+                if ((total_chars > limit && limit != 0) || total_chars > model_max_seq_chars)
+                    && attempt == 0
+                {
                     // Determine how many oldest non-system, non-excluded turns to fold
                     let mut fold_count = 0;
                     for turn in history.iter() {
-                        if matches!(turn.role, HistoryTurnRole::System) || turn.excluded_from_compression {
+                        if matches!(turn.role, HistoryTurnRole::System)
+                            || turn.excluded_from_compression
+                        {
                             continue;
                         }
                         fold_count += 1;
@@ -436,18 +455,20 @@ impl CompressionManager {
 
         let req = RequestBuilder::from(messages).set_sampling(sampling);
         let resp: ChatCompletionResponse = model.send_chat_request(req).await?;
-        let content = resp.choices[0]
-            .message
-            .content
-            .as_ref()
-            .context("Empty summary")?;
+        let content;
+        let empty = String::new();
+        if let Some(choice) = resp.choices.first() {
+            content = choice.message.content.as_ref().unwrap_or(&empty);
+        } else {
+            content = &empty;
+        }
 
         let root: RootSummary = if let Some(start_json) = content.find('{') {
             if let Some(end_json) = content.rfind('}') {
                 let json_str = &content[start_json..=end_json];
                 let mut r: RootSummary = serde_json::from_str(json_str)
                     .map_err(|e| anyhow!("JSON Parse Error: {}, content: {}", e, json_str))?;
-                
+
                 // Populate non-JSON fields
                 r.included_turn_indices = window_indices;
                 if let Some(er) = existing_root {
@@ -501,11 +522,8 @@ impl CompressionManager {
         let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
         let req = RequestBuilder::from(messages).set_sampling(sampling);
         let resp: ChatCompletionResponse = model.send_chat_request(req).await?;
-        let content = resp.choices[0]
-            .message
-            .content
-            .as_ref()
-            .context("Empty specialized summary")?;
+        let empty = &String::new();
+        let content = resp.choices[0].message.content.as_ref().unwrap_or(empty);
 
         if let Some(start) = content.find('{') {
             if let Some(end) = content.rfind('}') {

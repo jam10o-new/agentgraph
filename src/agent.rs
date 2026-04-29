@@ -253,8 +253,12 @@ async fn run_inference(
     // 2. Collate User and Assistant History
     let mut all_files = Vec::new();
     for input_dir in &config.inputs {
-        let input_canonical = fs::canonicalize(input_dir).await.unwrap_or_else(|_| PathBuf::from(input_dir));
-        let is_excluded = excluded_canonical.iter().any(|ex| input_canonical.starts_with(ex) || ex.starts_with(&input_canonical));
+        let input_canonical = fs::canonicalize(input_dir)
+            .await
+            .unwrap_or_else(|_| PathBuf::from(input_dir));
+        let is_excluded = excluded_canonical
+            .iter()
+            .any(|ex| input_canonical.starts_with(ex) || ex.starts_with(&input_canonical));
         if let Ok(mut entries) = fs::read_dir(input_dir).await {
             while let Some(entry) = entries.next_entry().await? {
                 let p = entry.path();
@@ -317,11 +321,12 @@ async fn run_inference(
     let mut turn_idx = 1;
     for entry in all_files.iter().skip(start_idx) {
         if let Ok(content) = fs::read_to_string(&entry.path).await {
-            let final_content = if matches!(entry.role, HistoryTurnRole::User) && !entry.metadata_str.is_empty() {
-                format!("{}\n---\n{}", entry.metadata_str, content)
-            } else {
-                content
-            };
+            let final_content =
+                if matches!(entry.role, HistoryTurnRole::User) && !entry.metadata_str.is_empty() {
+                    format!("{}\n---\n{}", entry.metadata_str, content)
+                } else {
+                    content
+                };
             combined_history.push(HistoryTurn {
                 role: entry.role.clone(),
                 content: final_content,
@@ -409,13 +414,12 @@ async fn run_inference(
         }
     }
 
-    let effective_user_text = if latest_user_input.is_empty()
-        && (!images.is_empty() || !audio_files.is_empty())
-    {
-        fallback_text
-    } else {
-        latest_user_input
-    };
+    let effective_user_text =
+        if latest_user_input.is_empty() && (!images.is_empty() || !audio_files.is_empty()) {
+            fallback_text
+        } else {
+            latest_user_input
+        };
 
     if !images.is_empty() {
         logger
@@ -488,7 +492,9 @@ async fn run_inference(
                 tp: ToolType::Function,
                 function: Function {
                     name: "read_file".into(),
-                    description: Some("Read the contents of one or more files and return them immediately".into()),
+                    description: Some(
+                        "Read the contents of one or more files and return them immediately".into(),
+                    ),
                     parameters: Some(json_schema_obj!({
                         "type": "object",
                         "properties": {
@@ -601,7 +607,7 @@ async fn run_inference(
             ))
             .await;
         request = request.add_message_with_tool_call(
-            TextMessageRole::Assistant,
+            TextMessageRole::Tool,
             &accumulated_content,
             current_tool_calls.clone(),
         );
@@ -639,7 +645,7 @@ async fn run_inference(
                             .iter()
                             .map(|v| v.as_str().unwrap_or_default().to_string())
                             .collect(),
-                        output: args["output"].as_str().unwrap_or_default().to_string(),
+                        output: args["output"].as_str().map(|s| s.to_string()),
                         stream_output: args["stream_output"].as_str().map(|s| s.to_string()),
                         tool_output: args["tool_output"].as_str().map(|s| s.to_string()),
                         system: args["system"]
@@ -655,7 +661,9 @@ async fn run_inference(
                         prompt: args["prompt"].as_str().map(|s| s.to_string()),
                         sampling: Default::default(),
                         compression: Default::default(),
-                        context_checkpoint_limit: args["context_checkpoint_limit"].as_u64().map(|u| u as usize),
+                        context_checkpoint_limit: args["context_checkpoint_limit"]
+                            .as_u64()
+                            .map(|u| u as usize),
                         excluded_from_summary: args["excluded_from_summary"]
                             .as_array()
                             .unwrap_or(&vec![])
@@ -736,13 +744,11 @@ async fn run_inference(
 
             // Persist tool result to the dedicated tool_output directory if configured,
             // otherwise fall back to the main output directory.
-            let tool_dest_dir = config.tool_output.as_ref().unwrap_or(&config.output);
+            let tool_dest_dir = config.tool_output.as_ref().unwrap_or(&config.output.unwrap_or(String::from("/tmp/agentgraph_tool_output")));
             let _ = fs::create_dir_all(tool_dest_dir).await;
             let tool_output_path = PathBuf::from(tool_dest_dir).join(format!(
                 "tool-{}-{}-{}.txt",
-                tc.function.name,
-                tool_idx,
-                timestamp
+                tc.function.name, tool_idx, timestamp
             ));
             let _ = fs::write(&tool_output_path, &result).await;
 
