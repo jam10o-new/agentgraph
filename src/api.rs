@@ -711,6 +711,7 @@ mod tests {
         let state = Arc::new(ApiState {
             config,
             model: None,
+            session_temp: None,
         });
         let app = router(state);
 
@@ -731,7 +732,7 @@ mod tests {
         assert_eq!(models.object, "list");
         assert_eq!(models.data.len(), 1);
         assert_eq!(models.data[0].id, "test_agent");
-        assert_eq!(models.data[0].context_window, Some(10000));
+        assert_eq!(models.data[0].context_window, None);
     }
 
     #[tokio::test]
@@ -746,6 +747,7 @@ mod tests {
         let state = Arc::new(ApiState {
             config,
             model: None,
+            session_temp: None,
         });
         let app = router(state);
 
@@ -810,6 +812,7 @@ mod tests {
         let state = Arc::new(ApiState {
             config,
             model: None,
+            session_temp: None,
         });
         let app = router(state);
 
@@ -869,6 +872,7 @@ mod tests {
         let state = Arc::new(ApiState {
             config,
             model: None,
+            session_temp: None,
         });
         let app = router(state);
 
