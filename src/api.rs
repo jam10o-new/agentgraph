@@ -25,6 +25,10 @@ pub struct ApiState {
     /// the agent's configured directories directly (used in tests and when no model
     /// is configured).
     pub model: Option<Arc<mistralrs::Model>>,
+    /// Shared temp workspace reused across API requests. Each agent gets its own
+    /// subdirectory (input/output/stream/system). The tempdir handle is kept alive
+    /// so the directory is not dropped between requests.
+    pub session_temp: Option<Arc<tempfile::TempDir>>,
 }
 
 pub fn router(state: Arc<ApiState>) -> Router {
@@ -133,7 +137,7 @@ async fn list_models(
             object: "model".to_string(),
             created,
             owned_by: "agentgraph".to_string(),
-            context_window: agent_config.context_checkpoint_limit,
+            context_window: None, // Virtual agents have no fixed token cap; automatic summarization adapts context
         })
         .collect();
 

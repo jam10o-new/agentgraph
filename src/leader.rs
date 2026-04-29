@@ -114,9 +114,12 @@ impl Leader {
         };
         if let Some(ref api) = api_config {
             if api.enabled {
+                let session_temp = Arc::new(tempfile::tempdir().expect("Failed to create API session temp dir"));
+                let session_temp = Arc::new(tempfile::tempdir().expect("Failed to create API session temp dir"));
                 let api_state = Arc::new(crate::api::ApiState {
                     config: self.config.clone(),
                     model: self.model.clone(),
+                    session_temp: Some(session_temp),
                 });
                 let bind_addr = format!("{}:{}", api.bind_address, api.port);
                 tokio::spawn(async move {

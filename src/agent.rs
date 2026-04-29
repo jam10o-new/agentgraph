@@ -622,16 +622,14 @@ async fn run_inference(
             }
         }
 
-        if !accumulated_content.is_empty() {
-            if let Some(ref output_path) = output_file_path {
-                logger
-                    .log(&format!(
-                        "Turn complete, writing to: {:?}",
-                        output_path
-                    ))
-                    .await;
-                let _ = fs::write(output_path, &accumulated_content).await;
-            }
+        if let Some(ref output_path) = output_file_path {
+            logger
+                .log(&format!(
+                    "Turn complete, writing to: {:?}",
+                    output_path
+                ))
+                .await;
+            let _ = fs::write(output_path, &accumulated_content).await;
         }
 
         if current_tool_calls.is_empty() {
