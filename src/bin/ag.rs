@@ -133,6 +133,7 @@ async fn main() -> Result<()> {
                         context_checkpoint_limit: None,
                         excluded_from_summary: Vec::new(),
                         tools_enabled: true,
+                        enable_thinking: false,
                     };
                     Command::SpawnAgent { name, config }
                 }

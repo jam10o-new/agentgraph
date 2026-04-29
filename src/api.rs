@@ -683,6 +683,7 @@ mod tests {
                 context_checkpoint_limit: Some(10000),
                 excluded_from_summary: vec![],
                 tools_enabled: true,
+                enable_thinking: false,
             },
         );
 

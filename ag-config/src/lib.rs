@@ -80,6 +80,11 @@ pub struct AgentConfig {
     /// Whether this agent is allowed to use tools. Defaults to true.
     #[serde(default = "default_true")]
     pub tools_enabled: bool,
+    /// Enable extended thinking / chain-of-thought for models that support it
+    /// (e.g. Qwen3.5). Defaults to false because thinking mode can interfere
+    /// with streaming output reliability.
+    #[serde(default)]
+    pub enable_thinking: bool,
 }
 
 fn default_true() -> bool {

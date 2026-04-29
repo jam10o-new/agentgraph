@@ -382,7 +382,7 @@ async fn run_inference(
         .await?;
 
     // 4. Build Request
-    let mut multimodal = MultimodalMessages::new();
+    let mut multimodal = MultimodalMessages::new().enable_thinking(config.enable_thinking);
     for (role, content) in compressed_context {
         multimodal = multimodal.add_message(role, content);
     }
@@ -679,6 +679,7 @@ async fn run_inference(
                             .map(|v| v.as_str().unwrap_or_default().to_string())
                             .collect(),
                         tools_enabled: args["tools_enabled"].as_bool().unwrap_or(true),
+                        enable_thinking: args["enable_thinking"].as_bool().unwrap_or(false),
                     };
                     send_ipc_command(Command::SpawnAgent { name, config })
                         .await
