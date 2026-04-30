@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
                 Commands::Spawn { name, inputs, output, stream_output, tool_output, system, model, limit, prompt, .. } => {
                     let config = AgentConfig {
                         inputs,
-                        output,
+                        output: output.map(|s| vec![s]).unwrap_or_default(),
                         stream_output,
                         tool_output,
                         system,

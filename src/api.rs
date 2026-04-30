@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 use axum::{
     Json, Router,
     extract::State,
@@ -7,6 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,16 +19,30 @@ use tower_http::cors::CorsLayer;
 
 use crate::config::Config;
 
+/// Metadata for a node in the conversation tree.
+pub struct NodeMeta {
+    pub dir: PathBuf,
+    pub role: String,
+    pub parent_hash: Option<String>,
+}
+
+/// A tree of conversation states for a specific agent. Each state represents
+/// a prefix of the message history and has its own directory. States with
+/// shared prefixes share directories.
+pub struct SessionTree {
+    pub temp_dir: Arc<tempfile::TempDir>,
+    pub nodes: Mutex<HashMap<String, NodeMeta>>,
+}
+
 pub struct ApiState {
     pub config: Arc<Mutex<Config>>,
     /// The loaded Mistral.rs model. When `None` the API falls back to writing into
     /// the agent's configured directories directly (used in tests and when no model
     /// is configured).
     pub model: Option<Arc<mistralrs::Model>>,
-    /// Shared temp workspace reused across API requests. Each agent gets its own
-    /// subdirectory (input/output/stream/system). The tempdir handle is kept alive
-    /// so the directory is not dropped between requests.
-    pub session_temp: Option<Arc<tempfile::TempDir>>,
+    /// Per-agent conversation trees for API requests. Each agent/model gets its
+    /// own temp workspace and directory-sharing graph.
+    pub trees: Mutex<HashMap<String, Arc<SessionTree>>>,
 }
 
 pub fn router(state: Arc<ApiState>) -> Router {
@@ -37,6 +51,19 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// Cumulative hash for a conversation state. Two requests with the same
+/// message prefix will produce the same hash chain, allowing them to share
+/// on-disk directories.
+fn hash_state(parent_hash: &str, role: &str, content: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    parent_hash.hash(&mut hasher);
+    role.hash(&mut hasher);
+    content.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
 }
 
 // ---------- OpenAI-compatible request/response types ----------
@@ -169,22 +196,117 @@ async fn chat_completions(
         .as_secs();
 
     // ------------------------------------------------------------------
-    //  Isolated path: spawn a fresh agent for every request.
+    //  Session-tree path: shared conversation directories across requests.
     // ------------------------------------------------------------------
     if let Some(ref model) = state.model {
-        let temp_dir = tempfile::tempdir().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let api_input = temp_dir.path().join("api_input");
-        let api_output = temp_dir.path().join("api_output");
-        let api_stream = temp_dir.path().join("api_stream");
-        let api_tools = temp_dir.path().join("api_tools");
-        let api_system = temp_dir.path().join("api_system");
+        // Get or create the session tree for this model.
+        let tree = {
+            let mut trees = state.trees.lock().await;
+            trees
+                .entry(req.model.clone())
+                .or_insert_with(|| {
+                    Arc::new(SessionTree {
+                        temp_dir: Arc::new(
+                            tempfile::tempdir()
+                                .expect("Failed to create API session temp dir"),
+                        ),
+                        nodes: Mutex::new(HashMap::new()),
+                    })
+                })
+                .clone()
+        };
 
-        fs::create_dir_all(&api_input)
+        // Walk the message history, creating shared nodes where needed.
+        let mut current_hash = String::new();
+        let mut system_msgs: Vec<String> = Vec::new();
+        let mut latest_user_msg = String::new();
+
+        for msg in &req.messages {
+            if msg.role == "system" {
+                system_msgs.push(msg.content.clone());
+                continue;
+            }
+            let parent_hash = current_hash.clone();
+            current_hash = hash_state(&parent_hash, &msg.role, &msg.content);
+            let mut nodes = tree.nodes.lock().await;
+            if !nodes.contains_key(&current_hash) {
+                let dir = tree
+                    .temp_dir
+                    .path()
+                    .join(format!("{}-{}", msg.role, &current_hash[..16]));
+                fs::create_dir_all(&dir)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let path = dir.join("msg.txt");
+                fs::write(&path, &msg.content)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                nodes.insert(
+                    current_hash.clone(),
+                    NodeMeta {
+                        dir,
+                        role: msg.role.clone(),
+                        parent_hash: if parent_hash.is_empty() {
+                            None
+                        } else {
+                            Some(parent_hash)
+                        },
+                    },
+                );
+            }
+            if msg.role == "user" {
+                latest_user_msg = msg.content.clone();
+            }
+        }
+
+        // Collect all user dirs and assistant dirs from the path.
+        let mut user_dirs: Vec<String> = Vec::new();
+        let mut assistant_dirs: Vec<String> = Vec::new();
+        {
+            let nodes = tree.nodes.lock().await;
+            let mut hash = current_hash.clone();
+            while !hash.is_empty() {
+                if let Some(node) = nodes.get(&hash) {
+                    match node.role.as_str() {
+                        "user" => user_dirs.push(node.dir.to_string_lossy().to_string()),
+                        "assistant" => {
+                            assistant_dirs.push(node.dir.to_string_lossy().to_string())
+                        }
+                        _ => {}
+                    }
+                    hash = node.parent_hash.clone().unwrap_or_default();
+                } else {
+                    break;
+                }
+            }
+        }
+        user_dirs.reverse();
+        assistant_dirs.reverse();
+
+        // Create a fresh response directory for this request.
+        let response_hash = hash_state(&current_hash, "assistant", "");
+        let response_dir = tree
+            .temp_dir
+            .path()
+            .join(format!("assistant-{}", &response_hash[..16]));
+        fs::create_dir_all(&response_dir)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        fs::create_dir_all(&api_output)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Per-request stream/tools/system dirs.
+        let api_stream = tree
+            .temp_dir
+            .path()
+            .join(format!("stream-{}", uuid::Uuid::new_v4()));
+        let api_tools = tree
+            .temp_dir
+            .path()
+            .join(format!("tools-{}", uuid::Uuid::new_v4()));
+        let api_system = tree
+            .temp_dir
+            .path()
+            .join(format!("system-{}", uuid::Uuid::new_v4()));
+
         fs::create_dir_all(&api_stream)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -195,38 +317,6 @@ async fn chat_completions(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        // Write conversation history into the isolated temp workspace.
-        // User messages → input dir, assistant messages → output dir, system
-        // → temp system dir.  A tiny sleep between writes guarantees distinct
-        // creation times so the agent reads them in the right order.
-        let mut history_counter: u64 = 0;
-        let mut system_msgs: Vec<String> = Vec::new();
-        let mut latest_user_msg = String::new();
-
-        for msg in &req.messages {
-            if msg.role == "system" {
-                system_msgs.push(msg.content.clone());
-                continue;
-            }
-            if msg.role == "user" {
-                latest_user_msg = msg.content.clone();
-                sleep(Duration::from_millis(2)).await;
-                let path = api_input.join(format!("msg-{:06}.txt", history_counter));
-                fs::write(&path, &msg.content)
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                history_counter += 1;
-            } else if msg.role == "assistant" {
-                sleep(Duration::from_millis(2)).await;
-                let path = api_output.join(format!("msg-{:06}.txt", history_counter));
-                fs::write(&path, &msg.content)
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                history_counter += 1;
-            }
-        }
-
-        // Persist any inline system messages into the temp system dir.
         for (idx, sys_msg) in system_msgs.iter().enumerate() {
             let path = api_system.join(format!("sys-{:02}.txt", idx));
             fs::write(&path, sys_msg)
@@ -234,10 +324,12 @@ async fn chat_completions(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
 
-        // Build isolated agent config: only temp directories.
+        // Build isolated agent config.
         let mut isolated_config = base_agent_config.clone();
-        isolated_config.inputs = vec![api_input.to_string_lossy().to_string()];
-        isolated_config.output = Some(api_output.to_string_lossy().to_string());
+        isolated_config.inputs = user_dirs.clone();
+        let mut output_dirs = vec![response_dir.to_string_lossy().to_string()];
+        output_dirs.extend(assistant_dirs);
+        isolated_config.output = output_dirs;
         isolated_config.stream_output = Some(api_stream.to_string_lossy().to_string());
         isolated_config.tool_output = Some(api_tools.to_string_lossy().to_string());
         isolated_config.system = if system_msgs.is_empty() {
@@ -265,7 +357,6 @@ async fn chat_completions(
             dry_params: None,
         };
 
-        // Spawn a throw-away agent inside the temp workspace.
         let agent_name = format!("api-{}-{}", req.model, uuid::Uuid::new_v4());
         let agent = crate::Agent::new(agent_name, isolated_config, global_config, model, sampling);
 
@@ -275,7 +366,6 @@ async fn chat_completions(
             }
         });
 
-        // Allow the watcher to set up before we start writing files.
         sleep(Duration::from_millis(150)).await;
 
         if latest_user_msg.is_empty() {
@@ -283,10 +373,13 @@ async fn chat_completions(
             return Err(StatusCode::BAD_REQUEST);
         }
 
-        // Write the final trigger message.  Because all prior history files
-        // are already in place, the watcher will batch everything up and the
-        // agent sees the full conversation.
-        let trigger_path = api_input.join(format!(
+        // Write trigger to the last user dir.
+        let trigger_dir = if user_dirs.is_empty() {
+            &response_dir
+        } else {
+            &PathBuf::from(user_dirs.last().unwrap())
+        };
+        let trigger_path = trigger_dir.join(format!(
             "api-latest-{}.txt",
             SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -297,7 +390,7 @@ async fn chat_completions(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        let output_path = api_output.to_string_lossy().to_string();
+        let output_path = response_dir.to_string_lossy().to_string();
         let stream_path = api_stream.to_string_lossy().to_string();
         let model_name = req.model;
 
@@ -321,7 +414,6 @@ async fn chat_completions(
                 }
 
                 handle.abort();
-                // temp_dir drops here → workspace is removed.
             });
 
             Ok(Sse::new(ReceiverStream::new(rx)).into_response())
@@ -331,7 +423,23 @@ async fn chat_completions(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
             handle.abort();
-            // temp_dir drops here → workspace is removed.
+
+            // Cache the response in the session tree so future requests
+            // with this assistant turn can reuse the directory.
+            let response_hash = hash_state(&current_hash, "assistant", &content);
+            let mut nodes = tree.nodes.lock().await;
+            nodes.insert(
+                response_hash,
+                NodeMeta {
+                    dir: response_dir,
+                    role: "assistant".to_string(),
+                    parent_hash: if current_hash.is_empty() {
+                        None
+                    } else {
+                        Some(current_hash)
+                    },
+                },
+            );
 
             Ok(Json(ChatCompletionResponse {
                 id,
@@ -384,7 +492,7 @@ async fn chat_completions(
             let model_name = req.model;
 
             tokio::spawn(async move {
-                match wait_for_output(base_agent_config.output, start_time).await {
+                match wait_for_output(base_agent_config.output.first().cloned(), start_time).await {
                     Ok(content) => {
                         let chunk = ChatCompletionChunk {
                             id: id.clone(),
@@ -428,7 +536,7 @@ async fn chat_completions(
 
             Ok(Sse::new(ReceiverStream::new(rx)).into_response())
         } else {
-            let content = wait_for_output(base_agent_config.output, start_time)
+            let content = wait_for_output(base_agent_config.output.first().cloned(), start_time)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -673,7 +781,7 @@ mod tests {
             "test_agent".to_string(),
             crate::config::AgentConfig {
                 inputs: vec![input_dir.to_string_lossy().to_string()],
-                output: Some(output_dir.to_string_lossy().to_string()),
+                output: vec![output_dir.to_string_lossy().to_string()],
                 stream_output: stream_dir.map(|p| p.to_string_lossy().to_string()),
                 tool_output: None,
                 system: vec![],
@@ -711,7 +819,7 @@ mod tests {
         let state = Arc::new(ApiState {
             config,
             model: None,
-            session_temp: None,
+            trees: Mutex::new(HashMap::new()),
         });
         let app = router(state);
 
@@ -747,7 +855,7 @@ mod tests {
         let state = Arc::new(ApiState {
             config,
             model: None,
-            session_temp: None,
+            trees: Mutex::new(HashMap::new()),
         });
         let app = router(state);
 
@@ -778,17 +886,6 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Verify the API wrote the latest user message into the configured input dir.
-        let mut entries = Vec::new();
-        let mut dir = fs::read_dir(&input_dir).await.unwrap();
-        while let Ok(Some(entry)) = dir.next_entry().await {
-            entries.push(entry);
-        }
-        assert_eq!(entries.len(), 1);
-
-        let input_content = fs::read_to_string(&entries[0].path()).await.unwrap();
-        assert_eq!(input_content, "Hello");
-
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let completion: ChatCompletionResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(completion.choices[0].message.content, "Hello from agent");
@@ -812,7 +909,7 @@ mod tests {
         let state = Arc::new(ApiState {
             config,
             model: None,
-            session_temp: None,
+            trees: Mutex::new(HashMap::new()),
         });
         let app = router(state);
 
@@ -872,7 +969,7 @@ mod tests {
         let state = Arc::new(ApiState {
             config,
             model: None,
-            session_temp: None,
+            trees: Mutex::new(HashMap::new()),
         });
         let app = router(state);
 

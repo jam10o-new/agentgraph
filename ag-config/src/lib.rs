@@ -42,9 +42,12 @@ pub struct Config {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentConfig {
     pub inputs: Vec<String>,
-    /// Primary output directory. Written only at turn completion (or interrupt).
-    /// Other agents should watch this directory for triggered downstream work.
-    pub output: Option<String>,
+    /// Primary output directories. The agent writes its response to the first
+    /// directory, and reads all directories for assistant context. Other agents
+    /// should watch the first directory for triggered downstream work.
+    /// Accepts either a single string (backward-compatible) or a list of strings.
+    #[serde(default, deserialize_with = "deserialize_output")]
+    pub output: Vec<String>,
     /// Optional streaming output directory. When set, assistant tokens are
     /// written live to this directory for human display, in addition to the
     /// primary `output` directory receiving the final result.
@@ -89,6 +92,36 @@ pub struct AgentConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn deserialize_output<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OutputVisitor;
+    impl<'de> serde::de::Visitor<'de> for OutputVisitor {
+        type Value = Vec<String>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or a list of strings")
+        }
+        fn visit_str<E>(self, value: &str) -> Result<Vec<String>, E> {
+            Ok(vec![value.to_string()])
+        }
+        fn visit_string<E>(self, value: String) -> Result<Vec<String>, E> {
+            Ok(vec![value])
+        }
+        fn visit_seq<A>(self, mut seq: A) -> Result<Vec<String>, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while let Some(elem) = seq.next_element::<String>()? {
+                vec.push(elem);
+            }
+            Ok(vec)
+        }
+    }
+    deserializer.deserialize_any(OutputVisitor)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

@@ -79,7 +79,7 @@ impl Agent {
             canonical_inputs.push(cp);
         }
 
-        if let Some(ref output) = self.config.output {
+        for output in &self.config.output {
             fs::create_dir_all(output).await?;
         }
         if let Some(ref stream_dir) = self.config.stream_output {
@@ -278,7 +278,7 @@ async fn run_inference(
             }
         }
     }
-    if let Some(ref output) = config.output {
+    for output in &config.output {
         if let Ok(mut entries) = fs::read_dir(output).await {
             while let Some(entry) = entries.next_entry().await? {
                 let p = entry.path();
@@ -365,7 +365,7 @@ async fn run_inference(
         .unwrap_or_default();
 
     // 3. Compression
-    let checkpoint_base = config.output.as_ref()
+    let checkpoint_base = config.output.first()
         .and_then(|o| PathBuf::from(o).parent().map(|p| p.to_path_buf()))
         .or_else(|| config.stream_output.as_ref().and_then(|s| PathBuf::from(s).parent().map(|p| p.to_path_buf())))
         .unwrap_or_else(|| PathBuf::from("."));
@@ -558,7 +558,7 @@ async fn run_inference(
     let timestamp = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
-    let output_file_path: Option<PathBuf> = config.output.as_ref().map(|o| {
+    let output_file_path: Option<PathBuf> = config.output.first().map(|o| {
         PathBuf::from(o).join(format!("out-{}.txt", timestamp))
     });
 
@@ -681,7 +681,7 @@ async fn run_inference(
                             .iter()
                             .map(|v| v.as_str().unwrap_or_default().to_string())
                             .collect(),
-                        output: args["output"].as_str().map(|s| s.to_string()),
+                        output: args["output"].as_str().map(|s| vec![s.to_string()]).unwrap_or_default(),
                         stream_output: args["stream_output"].as_str().map(|s| s.to_string()),
                         tool_output: args["tool_output"].as_str().map(|s| s.to_string()),
                         system: args["system"]
@@ -864,7 +864,7 @@ async fn run_inference(
 
             // Persist tool result to the dedicated tool_output directory if configured,
             // otherwise fall back to the main output directory.
-            let fallback_tool_dir = config.output.as_ref().cloned().unwrap_or_else(|| "/tmp/agentgraph_tool_output".to_string());
+            let fallback_tool_dir = config.output.first().cloned().unwrap_or_else(|| "/tmp/agentgraph_tool_output".to_string());
             let tool_dest_dir = config.tool_output.as_ref().unwrap_or(&fallback_tool_dir);
             let _ = fs::create_dir_all(tool_dest_dir).await;
             let tool_output_path = PathBuf::from(tool_dest_dir).join(format!(

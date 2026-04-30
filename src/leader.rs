@@ -114,12 +114,40 @@ impl Leader {
         };
         if let Some(ref api) = api_config {
             if api.enabled {
-                let session_temp = Arc::new(tempfile::tempdir().expect("Failed to create API session temp dir"));
-                let session_temp = Arc::new(tempfile::tempdir().expect("Failed to create API session temp dir"));
+                // Inject a default "api" agent template so consumers can
+                // unconditionally POST to /v1/chat/completions with model "api".
+                {
+                    let mut config = self.config.lock().await;
+                    if !config.agents.contains_key("api") {
+                        let first_model = config.models.keys().next().cloned().unwrap_or_else(|| "primary".to_string());
+                        config.agents.insert(
+                            "api".to_string(),
+                            AgentConfig {
+                                inputs: vec![],
+                                output: vec![],
+                                stream_output: None,
+                                tool_output: None,
+                                system: vec![],
+                                model: first_model,
+                                history_limit: None,
+                                realtime_audio: false,
+                                allowed_extensions: vec![],
+                                prompt: None,
+                                sampling: Default::default(),
+                                compression: Default::default(),
+                                context_checkpoint_limit: Some(10000),
+                                excluded_from_summary: vec![],
+                                tools_enabled: true,
+                                enable_thinking: false,
+                            },
+                        );
+                    }
+                }
+
                 let api_state = Arc::new(crate::api::ApiState {
                     config: self.config.clone(),
                     model: self.model.clone(),
-                    session_temp: Some(session_temp),
+                    trees: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                 });
                 let bind_addr = format!("{}:{}", api.bind_address, api.port);
                 tokio::spawn(async move {
