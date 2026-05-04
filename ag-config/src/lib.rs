@@ -88,6 +88,24 @@ pub struct AgentConfig {
     /// with streaming output reliability.
     #[serde(default)]
     pub enable_thinking: bool,
+    /// Number of times to retry inference on recoverable errors (OOMs, timeouts).
+    /// Defaults to 3. Set to 0 to disable retries.
+    /// Each retry includes the previously accumulated content as an assistant prefill,
+    /// so the model picks up where it left off rather than restarting from scratch.
+    #[serde(default = "default_inference_retries")]
+    pub inference_retries: u32,
+    /// Delay in milliseconds between inference retry attempts.
+    /// Defaults to 500ms. Larger values help OOM recovery as VRAM may take time to free.
+    #[serde(default = "default_inference_retry_delay_ms")]
+    pub inference_retry_delay_ms: u64,
+}
+
+fn default_inference_retries() -> u32 {
+    3
+}
+
+fn default_inference_retry_delay_ms() -> u64 {
+    500
 }
 
 fn default_true() -> bool {

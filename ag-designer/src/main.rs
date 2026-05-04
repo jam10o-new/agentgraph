@@ -168,6 +168,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         context_checkpoint_limit,
                         excluded_from_summary,
                         tools_enabled,
+                        ..
                     },
             } => {
                 ui.set_width(500.0);
@@ -770,6 +771,9 @@ impl eframe::App for SnarlApp {
                                 context_checkpoint_limit: None,
                                 excluded_from_summary: Vec::new(),
                                 tools_enabled: true,
+                                enable_thinking: false,
+                                inference_retries: 3,
+                                inference_retry_delay_ms: 500,
                             },
                         },
                     );

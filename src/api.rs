@@ -796,6 +796,8 @@ mod tests {
                 excluded_from_summary: vec![],
                 tools_enabled: true,
                 enable_thinking: false,
+                inference_retries: 3,
+                inference_retry_delay_ms: 500,
             },
         );
 

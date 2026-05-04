@@ -584,52 +584,130 @@ async fn run_inference(
         .set_tools(tools)
         .set_tool_choice(ToolChoice::Auto);
 
+    let retry_limit = config.inference_retries;
+    let retry_delay = Duration::from_millis(config.inference_retry_delay_ms);
+
     loop {
-        let mut model_stream = model.stream_chat_request(request.clone()).await?;
+        let base_request = request.clone();
         let mut accumulated_content = String::new();
         let mut current_tool_calls = Vec::new();
+        let mut remaining_retries = retry_limit;
 
-        while let Some(chunk) = model_stream.next().await {
-            if *interrupt_rx.borrow() {
-                logger.log("Inference interrupted").await;
-                if !accumulated_content.is_empty() {
-                    if let Some(ref output_path) = output_file_path {
-                        let _ = fs::write(output_path, &accumulated_content).await;
-                    }
-                    if let Some(ref mut f) = stream_file {
-                        let _ = f.write_all(accumulated_content.as_bytes()).await;
-                        let _ = f.flush().await;
-                    }
-                }
-                return Ok(());
+        // Retry loop: wraps the streaming inference call so that
+        // recoverable errors (OOMs, timeouts) trigger a retry with
+        // the partial response prefilled.
+        loop {
+            let mut retry_request = base_request.clone();
+            if !accumulated_content.is_empty() {
+                retry_request = retry_request.add_message(
+                    TextMessageRole::Assistant,
+                    accumulated_content.clone(),
+                );
+                logger
+                    .log(&format!(
+                        "Retrying inference with {} chars of prefill content",
+                        accumulated_content.len()
+                    ))
+                    .await;
             }
-            match chunk {
-                Response::Chunk(c) => {
-                    if let Some(choice) = c.choices.first() {
-                        if let Some(ref content) = choice.delta.content {
-                            accumulated_content.push_str(content);
-                            if let Some(ref mut f) = stream_file {
-                                let _ = f.write_all(content.as_bytes()).await;
-                                let _ = f.flush().await;
+
+            let mut model_stream = match model.stream_chat_request(retry_request).await {
+                Ok(s) => s,
+                Err(e) => {
+                    logger
+                        .log(&format!(
+                            "Inference error: {:?} (retries left: {})",
+                            e, remaining_retries
+                        ))
+                        .await;
+                    if remaining_retries > 0 {
+                        remaining_retries -= 1;
+                        tokio::time::sleep(retry_delay).await;
+                        continue;
+                    }
+                    // Final failure — remove any incomplete stream file
+                    if let Some(ref stream_dir) = config.stream_output {
+                        let stream_path =
+                            PathBuf::from(stream_dir).join(format!("out-{}.txt", timestamp));
+                        let _ = fs::remove_file(&stream_path).await;
+                    }
+                    // Drop the stream file handle so we don't leave a
+                    // dangling fd; the file is already cleaned above.
+                    drop(stream_file.take());
+                    return Err(e.into());
+                }
+            };
+
+            // Consume stream chunks
+            while let Some(chunk) = model_stream.next().await {
+                if *interrupt_rx.borrow() {
+                    logger.log("Inference interrupted").await;
+                    if !accumulated_content.is_empty() {
+                        if let Some(ref output_path) = output_file_path {
+                            if let Err(e) = fs::write(output_path, &accumulated_content).await {
+                                logger
+                                    .log(&format!(
+                                        "Failed to write output on interrupt: {:?}",
+                                        e
+                                    ))
+                                    .await;
                             }
                         }
-                        if let Some(ref tcs) = choice.delta.tool_calls {
-                            current_tool_calls.extend(tcs.clone());
+                        if let Some(ref mut f) = stream_file {
+                            let _ = f.write_all(accumulated_content.as_bytes()).await;
+                            let _ = f.flush().await;
                         }
                     }
+                    return Ok(());
                 }
-                _ => {}
+                match chunk {
+                    Response::Chunk(c) => {
+                        if let Some(choice) = c.choices.first() {
+                            if let Some(ref content) = choice.delta.content {
+                                accumulated_content.push_str(content);
+                                if let Some(ref mut f) = stream_file {
+                                    if let Err(e) = f.write_all(content.as_bytes()).await {
+                                        logger
+                                            .log(&format!(
+                                                "Stream write error: {:?}",
+                                                e
+                                            ))
+                                            .await;
+                                    }
+                                    let _ = f.flush().await;
+                                }
+                            }
+                            if let Some(ref tcs) = choice.delta.tool_calls {
+                                current_tool_calls.extend(tcs.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
+
+            // Streaming completed cleanly for this attempt
+            break;
         }
 
-        if let Some(ref output_path) = output_file_path {
+        // Only write the output file when we have a complete, non-empty
+        // response. On error we cleaned up and returned above, so by the
+        // time we reach this point the response is good.
+        if !accumulated_content.is_empty() {
+            if let Some(ref output_path) = output_file_path {
+                logger
+                    .log(&format!("Turn complete, writing to: {:?}", output_path))
+                    .await;
+                if let Err(e) = fs::write(output_path, &accumulated_content).await {
+                    logger
+                        .log(&format!("Failed to write output file: {:?}", e))
+                        .await;
+                }
+            }
+        } else if output_file_path.is_some() {
             logger
-                .log(&format!(
-                    "Turn complete, writing to: {:?}",
-                    output_path
-                ))
+                .log("Inference produced empty output; no output file written")
                 .await;
-            let _ = fs::write(output_path, &accumulated_content).await;
         }
 
         if current_tool_calls.is_empty() {
@@ -708,6 +786,8 @@ async fn run_inference(
                             .collect(),
                         tools_enabled: args["tools_enabled"].as_bool().unwrap_or(true),
                         enable_thinking: args["enable_thinking"].as_bool().unwrap_or(false),
+                        inference_retries: 3,
+                        inference_retry_delay_ms: 500,
                     };
                     send_ipc_command(Command::SpawnAgent { name, config })
                         .await
@@ -866,12 +946,20 @@ async fn run_inference(
             // otherwise fall back to the main output directory.
             let fallback_tool_dir = config.output.first().cloned().unwrap_or_else(|| "/tmp/agentgraph_tool_output".to_string());
             let tool_dest_dir = config.tool_output.as_ref().unwrap_or(&fallback_tool_dir);
-            let _ = fs::create_dir_all(tool_dest_dir).await;
+            if let Err(e) = fs::create_dir_all(tool_dest_dir).await {
+                logger
+                    .log(&format!("Failed to create tool output dir: {:?}", e))
+                    .await;
+            }
             let tool_output_path = PathBuf::from(tool_dest_dir).join(format!(
                 "tool-{}-{}-{}.txt",
                 tc.function.name, tool_idx, timestamp
             ));
-            let _ = fs::write(&tool_output_path, &result).await;
+            if let Err(e) = fs::write(&tool_output_path, &result).await {
+                logger
+                    .log(&format!("Failed to write tool output: {:?}", e))
+                    .await;
+            }
 
             request = request.add_tool_message(result, tc.id.clone());
         }

@@ -5,6 +5,7 @@ use mistralrs::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -183,7 +184,8 @@ impl CompressionManager {
             .add_message(TextMessageRole::User, prompt);
 
         let req = RequestBuilder::from(messages).set_sampling(sampling);
-        let resp: ChatCompletionResponse = model.send_chat_request(req).await?;
+        let resp: ChatCompletionResponse =
+            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content = resp.choices[0]
             .message
             .content
@@ -454,7 +456,8 @@ impl CompressionManager {
             .add_message(TextMessageRole::User, prompt);
 
         let req = RequestBuilder::from(messages).set_sampling(sampling);
-        let resp: ChatCompletionResponse = model.send_chat_request(req).await?;
+        let resp: ChatCompletionResponse =
+            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content;
         let empty = String::new();
         if let Some(choice) = resp.choices.first() {
@@ -498,7 +501,8 @@ impl CompressionManager {
         );
         let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
         let req = RequestBuilder::from(messages).set_sampling(sampling);
-        let resp: ChatCompletionResponse = model.send_chat_request(req).await?;
+        let resp: ChatCompletionResponse =
+            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content = resp.choices[0]
             .message
             .content
@@ -521,7 +525,8 @@ impl CompressionManager {
         );
         let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
         let req = RequestBuilder::from(messages).set_sampling(sampling);
-        let resp: ChatCompletionResponse = model.send_chat_request(req).await?;
+        let resp: ChatCompletionResponse =
+            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let empty = &String::new();
         let content = resp.choices[0].message.content.as_ref().unwrap_or(empty);
 
@@ -549,7 +554,8 @@ impl CompressionManager {
         );
         let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
         let req = RequestBuilder::from(messages).set_sampling(sampling);
-        let resp: ChatCompletionResponse = model.send_chat_request(req).await?;
+        let resp: ChatCompletionResponse =
+            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content = resp.choices[0]
             .message
             .content
@@ -563,6 +569,30 @@ impl CompressionManager {
             .filter(|s| s == "root" || root.domains.contains(s))
             .collect();
         Ok(selected)
+    }
+}
+
+/// Send a non-streaming chat request with retry on recoverable errors
+/// (OOMs, timeouts). Used for compression-related LLM calls in context
+/// summarization, where losing a single summarization attempt is not
+/// critical but a clean retry with backoff can recover from transient
+/// resource exhaustion.
+async fn send_chat_request_with_retry(
+    model: &Model,
+    req: RequestBuilder,
+    max_retries: u32,
+    delay: Duration,
+) -> Result<ChatCompletionResponse> {
+    let mut remaining = max_retries;
+    loop {
+        match model.send_chat_request(req.clone()).await {
+            Ok(resp) => return Ok(resp),
+            Err(_e) if remaining > 0 => {
+                remaining -= 1;
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
