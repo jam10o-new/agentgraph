@@ -105,8 +105,7 @@ impl Agent {
             });
         }
 
-        let mut current_inference: Option<tokio::task::JoinHandle<()>> = None;
-        let (interrupt_tx, _) = watch::channel(false);
+        let (interrupt_tx, _) = watch::channel(0u64);
         let mut debounce_timer = Box::pin(tokio::time::sleep(Duration::MAX));
         let mut timer_active = false;
         let debounce_duration = Duration::from_millis(250);
@@ -131,11 +130,11 @@ impl Agent {
                     while let Ok(_) = rx.try_recv() {}
                     self.logger.log("Triggering inference after debounce").await;
 
-                    let _ = interrupt_tx.send(true);
-                    if let Some(handle) = current_inference.take() {
-                        handle.abort();
-                    }
-                    let _ = interrupt_tx.send(false);
+                    let current_gen = *interrupt_tx.borrow();
+                    let _ = interrupt_tx.send(current_gen.wrapping_add(1));
+                    // No abort — the inference task detects the counter
+                    // change and drains the stream gracefully to avoid
+                    // panicking the model engine.
 
                     let model = self.model.clone();
                     let config = self.config.clone();
@@ -147,11 +146,11 @@ impl Agent {
                     let volatile_context = self.volatile_context.clone();
                     let logger = AgentLogger::new(&name);
 
-                    current_inference = Some(tokio::spawn(async move {
+                    tokio::spawn(async move {
                         if let Err(e) = run_inference(agent_name, model, config, global_config, sampling, interrupt_rx, volatile_context, logger).await {
                             eprintln!("Inference error for agent {}: {:?}", log_name, e);
                         }
-                    }));
+                    });
                 }
             }
         }
@@ -190,7 +189,7 @@ async fn run_inference(
     config: AgentConfig,
     _global_config: Config,
     sampling: SamplingParams,
-    interrupt_rx: watch::Receiver<bool>,
+    interrupt_rx: watch::Receiver<u64>,
     volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
     logger: AgentLogger,
 ) -> Result<()> {
@@ -586,6 +585,9 @@ async fn run_inference(
 
     let retry_limit = config.inference_retries;
     let retry_delay = Duration::from_millis(config.inference_retry_delay_ms);
+    let started_gen = *interrupt_rx.borrow();
+    let mut interrupted = false;
+    let mut interrupt_cutoff: Option<usize> = None;
 
     loop {
         let base_request = request.clone();
@@ -620,7 +622,7 @@ async fn run_inference(
                             e, remaining_retries
                         ))
                         .await;
-                    if remaining_retries > 0 {
+                    if remaining_retries > 0 && !interrupted {
                         remaining_retries -= 1;
                         tokio::time::sleep(retry_delay).await;
                         continue;
@@ -638,27 +640,19 @@ async fn run_inference(
                 }
             };
 
-            // Consume stream chunks
+            // Consume stream chunks. If we detect an interrupt (counter
+            // changed), we continue draining the stream to completion to
+            // avoid dropping the receiver while the engine is still
+            // generating — which would panic the engine.
             while let Some(chunk) = model_stream.next().await {
-                if *interrupt_rx.borrow() {
-                    logger.log("Inference interrupted").await;
-                    if !accumulated_content.is_empty() {
-                        if let Some(ref output_path) = output_file_path {
-                            if let Err(e) = fs::write(output_path, &accumulated_content).await {
-                                logger
-                                    .log(&format!(
-                                        "Failed to write output on interrupt: {:?}",
-                                        e
-                                    ))
-                                    .await;
-                            }
-                        }
-                        if let Some(ref mut f) = stream_file {
-                            let _ = f.write_all(accumulated_content.as_bytes()).await;
-                            let _ = f.flush().await;
-                        }
+                if *interrupt_rx.borrow() != started_gen {
+                    if !interrupted {
+                        interrupted = true;
+                        interrupt_cutoff = Some(accumulated_content.len());
+                        logger
+                            .log("Interrupt received; draining stream gracefully")
+                            .await;
                     }
-                    return Ok(());
                 }
                 match chunk {
                     Response::Chunk(c) => {
@@ -688,6 +682,50 @@ async fn run_inference(
 
             // Streaming completed cleanly for this attempt
             break;
+        }
+
+        // The stream drained to completion. If we were interrupted,
+        // save output (partial or full per config) and end the turn.
+        // Tool calls are never executed on an interrupted turn.
+        if interrupted {
+            let save_end = if config.interrupt_save_full {
+                accumulated_content.len()
+            } else {
+                interrupt_cutoff
+                    .unwrap_or(0)
+                    .min(accumulated_content.len())
+            };
+
+            if save_end > 0 {
+                let save_content = &accumulated_content[..save_end];
+                if let Some(ref output_path) = output_file_path {
+                    logger
+                        .log(&format!(
+                            "Saving {} chars of {} output after interrupted turn",
+                            save_content.len(),
+                            if config.interrupt_save_full {
+                                "full"
+                            } else {
+                                "partial"
+                            }
+                        ))
+                        .await;
+                    if let Err(e) = fs::write(output_path, save_content).await {
+                        logger
+                            .log(&format!(
+                                "Failed to write interrupted output: {:?}",
+                                e
+                            ))
+                            .await;
+                    }
+                }
+            } else if output_file_path.is_some() {
+                logger
+                    .log("Interrupt before any output; no output file written")
+                    .await;
+            }
+            logger.log("Inference turn interrupted").await;
+            return Ok(());
         }
 
         // Only write the output file when we have a complete, non-empty
@@ -786,6 +824,7 @@ async fn run_inference(
                             .collect(),
                         tools_enabled: args["tools_enabled"].as_bool().unwrap_or(true),
                         enable_thinking: args["enable_thinking"].as_bool().unwrap_or(false),
+                        interrupt_save_full: false,
                         inference_retries: 3,
                         inference_retry_delay_ms: 500,
                     };

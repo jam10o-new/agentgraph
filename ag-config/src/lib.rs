@@ -98,6 +98,14 @@ pub struct AgentConfig {
     /// Defaults to 500ms. Larger values help OOM recovery as VRAM may take time to free.
     #[serde(default = "default_inference_retry_delay_ms")]
     pub inference_retry_delay_ms: u64,
+    /// When an interrupt is received during inference, whether to save the
+    /// complete response (true) or only the content generated before the
+    /// interrupt point (false). In both cases the stream is drained
+    /// gracefully to avoid panicking the model engine. Tool calls are
+    /// never executed on an interrupted turn regardless of this setting.
+    /// Defaults to false (partial save).
+    #[serde(default = "default_true")]
+    pub interrupt_save_full: bool,
 }
 
 fn default_inference_retries() -> u32 {
