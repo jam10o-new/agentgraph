@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use either::Either;
 use mistralrs::{
     ChatCompletionResponse, Model, RequestBuilder, SamplingParams, TextMessageRole, TextMessages,
 };
@@ -288,34 +289,46 @@ impl CompressionManager {
                 }
             }
 
-            // Phase 2: Post-compression checkpointing
+            // Phase 2: Post-compression checkpointing.
+            // If the context still exceeds token limits, fold the oldest
+            // turns into a metasummary and retry.  Up to 3 fold attempts
+            // to progressively reduce context size.
             if let Some(limit) = checkpoint_limit {
-                let model_max_seq_chars =
-                    if let Some(model_max_seq_len) = model.clone().config().unwrap().max_seq_len {
-                        model_max_seq_len * 3 //TOD0 make a const or calc max token length from config instead of hardcoding here
-                    } else {
-                        limit
-                    };
-                let total_chars: usize = context.iter().map(|(_, s)| s.len()).sum();
-                if ((total_chars > limit && limit != 0) || total_chars > model_max_seq_chars)
-                    && attempt == 0
+                // Determine the effective token limit: use the model's
+                // native max_seq_len if available, capped at the
+                // checkpoint limit (which is in characters).
+                let max_tokens = if let Some(model_max_seq_len) =
+                    model.clone().config().unwrap().max_seq_len
                 {
-                    // Determine how many oldest non-system, non-excluded turns to fold
-                    let mut fold_count = 0;
-                    for turn in history.iter() {
-                        if matches!(turn.role, HistoryTurnRole::System)
-                            || turn.excluded_from_compression
-                        {
-                            continue;
-                        }
-                        fold_count += 1;
-                        if fold_count >= history.len() / 2 {
-                            break;
-                        }
-                    }
-                    if fold_count > 0 {
-                        let turns_to_fold: Vec<HistoryTurn> =
-                            history.iter().take(fold_count).cloned().collect();
+                    model_max_seq_len
+                } else {
+                    // No model max_seq_len — estimate from char limit.
+                    // Conservative: 4 chars per token.
+                    limit / 4
+                };
+
+                // Build a single string from the context to count tokens
+                // once.  The tokenizer concatenates messages, so we do
+                // the same for an accurate count.
+                let context_text: String =
+                    context.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+                let token_count = count_tokens(&model, &context_text).await;
+
+                if token_count >= max_tokens && attempt < 3 {
+                    // Fold the oldest non-system, non-excluded turns.
+                    // Each attempt covers a progressively larger slice.
+                    let slice = history.len().min((attempt + 1) * history.len() / 3);
+                    let turns_to_fold: Vec<HistoryTurn> = history
+                        .iter()
+                        .take(slice)
+                        .filter(|t| {
+                            !matches!(t.role, HistoryTurnRole::System)
+                                && !t.excluded_from_compression
+                        })
+                        .cloned()
+                        .collect();
+
+                    if !turns_to_fold.is_empty() {
                         let ms = self
                             .generate_metasummary(
                                 model.clone(),
@@ -326,7 +339,32 @@ impl CompressionManager {
                             .await?;
                         self.save_metasummary(&ms).await?;
                         attempt += 1;
-                        continue;
+                        continue; // Re-enter Phase 0 with the new metasummary
+                    }
+                }
+
+                // Safety net: if context is still too large after all
+                // fold attempts, forcefully strip the oldest non-system
+                // turns to stay within the token limit.
+                if token_count >= max_tokens {
+                    let mut running = 0usize;
+                    // Count tokens from the end to find the cutoff.
+                    let mut cutoff = 0usize;
+                    for (i, (_, content)) in context.iter().enumerate().rev() {
+                        running += content.len() / 4; // fast char approximation
+                        if running >= max_tokens {
+                            cutoff = i + 1;
+                            break;
+                        }
+                    }
+                    if cutoff > 0 {
+                        // Keep system prompts (always at the front)
+                        let system_count = context
+                            .iter()
+                            .take_while(|(r, _)| matches!(r, TextMessageRole::System))
+                            .count();
+                        let final_cutoff = cutoff.max(system_count);
+                        context.drain(..final_cutoff);
                     }
                 }
             }
@@ -628,6 +666,30 @@ impl CompressionManager {
             .filter(|s| s == "root" || root.domains.contains(s))
             .collect();
         Ok(selected)
+    }
+}
+
+/// Count tokens in a text string using the model's native tokenizer.
+/// Falls back to a conservative chars÷4 heuristic if the tokenizer
+/// call fails (tokenizer not available, model still loading, etc.).
+async fn count_tokens(model: &Model, text: &str) -> usize {
+    match model
+        .tokenize(
+            Either::Right(text.to_string()),
+            None,
+            false,
+            false,
+            None,
+        )
+        .await
+    {
+        Ok(tokens) => tokens.len(),
+        Err(_) => {
+            // Fallback: conservative char count for most tokenizers.
+            // English ≈ 4-5 chars/token, code ≈ 5-7, multilingual ≈ 2-4.
+            // 4 gives reasonable headroom across the board.
+            text.len() / 4
+        }
     }
 }
 
