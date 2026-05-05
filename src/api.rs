@@ -236,11 +236,17 @@ async fn chat_completions(
                     .join(format!("{}-{}", msg.role, &current_hash[..16]));
                 fs::create_dir_all(&dir)
                     .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    .map_err(|e| {
+                        eprintln!("API: create_dir_all({}): {e:?}", dir.display());
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
                 let path = dir.join("msg.txt");
                 fs::write(&path, &msg.content)
                     .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    .map_err(|e| {
+                        eprintln!("API: write({}): {e:?}", path.display());
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
                 nodes.insert(
                     current_hash.clone(),
                     NodeMeta {
@@ -291,7 +297,10 @@ async fn chat_completions(
             .join(format!("assistant-{}", &response_hash[..16]));
         fs::create_dir_all(&response_dir)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|e| {
+                eprintln!("API: create_dir_all({}): {e:?}", response_dir.display());
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         // Per-request stream/tools/system dirs.
         let api_stream = tree
@@ -309,19 +318,31 @@ async fn chat_completions(
 
         fs::create_dir_all(&api_stream)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|e| {
+                eprintln!("API: create_dir_all({}): {e:?}", api_stream.display());
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
         fs::create_dir_all(&api_tools)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|e| {
+                eprintln!("API: create_dir_all({}): {e:?}", api_tools.display());
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
         fs::create_dir_all(&api_system)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|e| {
+                eprintln!("API: create_dir_all({}): {e:?}", api_system.display());
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         for (idx, sys_msg) in system_msgs.iter().enumerate() {
             let path = api_system.join(format!("sys-{:02}.txt", idx));
             fs::write(&path, sys_msg)
                 .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                .map_err(|e| {
+                    eprintln!("API: write({}): {e:?}", path.display());
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
         }
 
         // Build isolated agent config.
@@ -388,7 +409,10 @@ async fn chat_completions(
         ));
         fs::write(&trigger_path, &latest_user_msg)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|e| {
+                eprintln!("API: write({}): {e:?}", trigger_path.display());
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         let output_path = response_dir.to_string_lossy().to_string();
         let stream_path = api_stream.to_string_lossy().to_string();
@@ -418,9 +442,12 @@ async fn chat_completions(
 
             Ok(Sse::new(ReceiverStream::new(rx)).into_response())
         } else {
-            let content = wait_for_output(Some(output_path), start_time)
+            let content = wait_for_output(Some(output_path.clone()), start_time)
                 .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                .map_err(|e| {
+                    eprintln!("API: wait_for_output({}): {e:?}", output_path);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
 
             handle.abort();
 
@@ -577,8 +604,15 @@ async fn wait_for_output(
                         let path = entry.path();
                         if path.is_file() {
                             if let Ok(metadata) = entry.metadata().await {
-                                let modified =
-                                    metadata.modified().or_else(|_| metadata.created())?;
+                                let modified = metadata
+                                    .modified()
+                                    .or_else(|_| metadata.created())
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "Failed to read mtime for {}: {e}",
+                                            path.display()
+                                        )
+                                    })?;
                                 if modified >= after {
                                     candidates.push((modified, path));
                                 }
@@ -590,7 +624,11 @@ async fn wait_for_output(
                 if let Some((_, path)) = candidates.into_iter().max_by_key(|(t, _)| *t) {
                     // Give the agent a moment to finish flushing.
                     sleep(Duration::from_millis(200)).await;
-                    return anyhow::Result::Ok(fs::read_to_string(&path).await?);
+                    return anyhow::Result::Ok(
+                        fs::read_to_string(&path).await.map_err(|e| {
+                            anyhow::anyhow!("Failed to read output file {}: {e}", path.display())
+                        })?,
+                    );
                 }
             }
         })
@@ -728,7 +766,15 @@ async fn wait_for_stream_file(stream_dir: &str, after: SystemTime) -> anyhow::Re
                     let path = entry.path();
                     if path.is_file() {
                         if let Ok(metadata) = entry.metadata().await {
-                            let modified = metadata.modified().or_else(|_| metadata.created())?;
+                            let modified = metadata
+                                .modified()
+                                .or_else(|_| metadata.created())
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "Failed to read mtime for stream file {}: {e}",
+                                        path.display()
+                                    )
+                                })?;
                             if modified >= after {
                                 candidates.push((modified, path));
                             }
@@ -796,7 +842,6 @@ mod tests {
                 excluded_from_summary: vec![],
                 tools_enabled: true,
                 enable_thinking: false,
-                interrupt_save_full: false,
                 inference_retries: 3,
                 inference_retry_delay_ms: 500,
             },

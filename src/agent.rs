@@ -4,7 +4,7 @@ use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_f
 use crate::find_leader_socket;
 use crate::ipc::Command;
 use crate::utils::AgentLogger;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use mistralrs::{
     Function, Model, MultimodalMessages, RequestBuilder, Response, SamplingParams, TextMessageRole,
     Tool, ToolChoice, ToolType,
@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, mpsc};
 
 macro_rules! json_schema_obj {
     ($($json:tt)+) => {
@@ -73,14 +73,20 @@ impl Agent {
         let mut canonical_inputs = Vec::new();
         for input_path in &self.config.inputs {
             let p = PathBuf::from(input_path);
-            fs::create_dir_all(&p).await?;
-            let cp = fs::canonicalize(&p).await?;
+            fs::create_dir_all(&p)
+                .await
+                .context(format!("Failed to create input directory: {}", p.display()))?;
+            let cp = fs::canonicalize(&p)
+                .await
+                .context(format!("Failed to canonicalize input path: {}", p.display()))?;
             watcher.watch(&cp, RecursiveMode::NonRecursive)?;
             canonical_inputs.push(cp);
         }
 
         for output in &self.config.output {
-            fs::create_dir_all(output).await?;
+            fs::create_dir_all(output)
+                .await
+                .context(format!("Failed to create output directory: {}", output))?;
         }
         if let Some(ref stream_dir) = self.config.stream_output {
             let _ = fs::create_dir_all(stream_dir).await;
@@ -105,7 +111,9 @@ impl Agent {
             });
         }
 
-        let (interrupt_tx, _) = watch::channel(0u64);
+        let (inference_done_tx, mut inference_done_rx) = mpsc::channel::<()>(1);
+        let mut inference_in_progress = false;
+        let mut retrigger_pending = false;
         let mut debounce_timer = Box::pin(tokio::time::sleep(Duration::MAX));
         let mut timer_active = false;
         let debounce_duration = Duration::from_millis(250);
@@ -120,6 +128,9 @@ impl Agent {
                         });
 
                         if is_input_event {
+                            if inference_in_progress {
+                                retrigger_pending = true;
+                            }
                             debounce_timer.as_mut().reset(tokio::time::Instant::now() + debounce_duration);
                             timer_active = true;
                         }
@@ -128,13 +139,12 @@ impl Agent {
                 _ = &mut debounce_timer, if timer_active => {
                     timer_active = false;
                     while let Ok(_) = rx.try_recv() {}
+                    if inference_in_progress {
+                        // Already running — just note that new input is waiting.
+                        // The completion handler below will retrigger.
+                        continue;
+                    }
                     self.logger.log("Triggering inference after debounce").await;
-
-                    let current_gen = *interrupt_tx.borrow();
-                    let _ = interrupt_tx.send(current_gen.wrapping_add(1));
-                    // No abort — the inference task detects the counter
-                    // change and drains the stream gracefully to avoid
-                    // panicking the model engine.
 
                     let model = self.model.clone();
                     let config = self.config.clone();
@@ -142,15 +152,48 @@ impl Agent {
                     let sampling = self.sampling.clone();
                     let agent_name = name.clone();
                     let log_name = name.clone();
-                    let interrupt_rx = interrupt_tx.subscribe();
                     let volatile_context = self.volatile_context.clone();
                     let logger = AgentLogger::new(&name);
+                    let done_tx = inference_done_tx.clone();
 
+                    inference_in_progress = true;
+                    retrigger_pending = false;
                     tokio::spawn(async move {
-                        if let Err(e) = run_inference(agent_name, model, config, global_config, sampling, interrupt_rx, volatile_context, logger).await {
+                        let result = run_inference(agent_name, model, config, global_config, sampling, volatile_context, logger).await;
+                        if let Err(e) = result {
                             eprintln!("Inference error for agent {}: {:?}", log_name, e);
                         }
+                        let _ = done_tx.send(()).await;
                     });
+                }
+                _ = inference_done_rx.recv() => {
+                    inference_in_progress = false;
+                    if retrigger_pending {
+                        // New input arrived during the previous turn.
+                        // Start a fresh inference immediately.
+                        retrigger_pending = false;
+                        while let Ok(_) = rx.try_recv() {}
+                        self.logger.log("Retriggering inference for pending input").await;
+
+                        let model = self.model.clone();
+                        let config = self.config.clone();
+                        let global_config = self.global_config.clone();
+                        let sampling = self.sampling.clone();
+                        let agent_name = name.clone();
+                        let log_name = name.clone();
+                        let volatile_context = self.volatile_context.clone();
+                        let logger = AgentLogger::new(&name);
+                        let done_tx = inference_done_tx.clone();
+
+                        inference_in_progress = true;
+                        tokio::spawn(async move {
+                            let result = run_inference(agent_name, model, config, global_config, sampling, volatile_context, logger).await;
+                            if let Err(e) = result {
+                                eprintln!("Inference error for agent {}: {:?}", log_name, e);
+                            }
+                            let _ = done_tx.send(()).await;
+                        });
+                    }
                 }
             }
         }
@@ -189,7 +232,6 @@ async fn run_inference(
     config: AgentConfig,
     _global_config: Config,
     sampling: SamplingParams,
-    interrupt_rx: watch::Receiver<u64>,
     volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
     logger: AgentLogger,
 ) -> Result<()> {
@@ -264,11 +306,24 @@ async fn run_inference(
             while let Some(entry) = entries.next_entry().await? {
                 let p = entry.path();
                 if p.is_file() {
-                    let metadata = fs::metadata(&p).await?;
+                    let p_display = p.display().to_string();
+                    let metadata = fs::metadata(&p)
+                        .await
+                        .context(format!(
+                            "Failed to read metadata for input file: {}",
+                            p_display
+                        ))?;
                     let meta_str = format_file_metadata(&p, &metadata);
                     all_files.push(FileEntry {
                         path: p,
-                        created: metadata.created()?,
+                        created: metadata
+                            .created()
+                            .map_err(|e| {
+                                anyhow!(
+                                    "Failed to get creation time for {}: {e}",
+                                    p_display
+                                )
+                            })?,
                         role: HistoryTurnRole::User,
                         metadata_str: meta_str,
                         excluded: is_excluded,
@@ -282,10 +337,23 @@ async fn run_inference(
             while let Some(entry) = entries.next_entry().await? {
                 let p = entry.path();
                 if p.is_file() {
-                    let metadata = fs::metadata(&p).await?;
+                    let p_display = p.display().to_string();
+                    let metadata = fs::metadata(&p)
+                        .await
+                        .context(format!(
+                            "Failed to read metadata for output file: {}",
+                            p_display
+                        ))?;
                     all_files.push(FileEntry {
                         path: p,
-                        created: metadata.created()?,
+                        created: metadata
+                            .created()
+                            .map_err(|e| {
+                                anyhow!(
+                                    "Failed to get creation time for {}: {e}",
+                                    p_display
+                                )
+                            })?,
                         role: HistoryTurnRole::Assistant,
                         metadata_str: String::new(),
                         excluded: false,
@@ -300,10 +368,23 @@ async fn run_inference(
             while let Some(entry) = entries.next_entry().await? {
                 let p = entry.path();
                 if p.is_file() {
-                    let metadata = fs::metadata(&p).await?;
+                    let p_display = p.display().to_string();
+                    let metadata = fs::metadata(&p)
+                        .await
+                        .context(format!(
+                            "Failed to read metadata for tool output file: {}",
+                            p_display
+                        ))?;
                     all_files.push(FileEntry {
                         path: p,
-                        created: metadata.created()?,
+                        created: metadata
+                            .created()
+                            .map_err(|e| {
+                                anyhow!(
+                                    "Failed to get creation time for {}: {e}",
+                                    p_display
+                                )
+                            })?,
                         role: HistoryTurnRole::Assistant,
                         metadata_str: String::new(),
                         excluded: false,
@@ -570,7 +651,14 @@ async fn run_inference(
                 stream_path
             ))
             .await;
-        Some(fs::File::create(&stream_path).await?)
+        Some(
+            fs::File::create(&stream_path)
+                .await
+                .context(format!(
+                    "Failed to create stream output file: {}",
+                    stream_path.display()
+                ))?,
+        )
     } else {
         logger
             .log("Streaming disabled, will create output file after completion")
@@ -585,9 +673,6 @@ async fn run_inference(
 
     let retry_limit = config.inference_retries;
     let retry_delay = Duration::from_millis(config.inference_retry_delay_ms);
-    let started_gen = *interrupt_rx.borrow();
-    let mut interrupted = false;
-    let mut interrupt_cutoff: Option<usize> = None;
 
     loop {
         let base_request = request.clone();
@@ -622,7 +707,7 @@ async fn run_inference(
                             e, remaining_retries
                         ))
                         .await;
-                    if remaining_retries > 0 && !interrupted {
+                    if remaining_retries > 0 {
                         remaining_retries -= 1;
                         tokio::time::sleep(retry_delay).await;
                         continue;
@@ -640,20 +725,8 @@ async fn run_inference(
                 }
             };
 
-            // Consume stream chunks. If we detect an interrupt (counter
-            // changed), we continue draining the stream to completion to
-            // avoid dropping the receiver while the engine is still
-            // generating — which would panic the engine.
+            // Consume stream chunks.
             while let Some(chunk) = model_stream.next().await {
-                if *interrupt_rx.borrow() != started_gen {
-                    if !interrupted {
-                        interrupted = true;
-                        interrupt_cutoff = Some(accumulated_content.len());
-                        logger
-                            .log("Interrupt received; draining stream gracefully")
-                            .await;
-                    }
-                }
                 match chunk {
                     Response::Chunk(c) => {
                         if let Some(choice) = c.choices.first() {
@@ -682,50 +755,6 @@ async fn run_inference(
 
             // Streaming completed cleanly for this attempt
             break;
-        }
-
-        // The stream drained to completion. If we were interrupted,
-        // save output (partial or full per config) and end the turn.
-        // Tool calls are never executed on an interrupted turn.
-        if interrupted {
-            let save_end = if config.interrupt_save_full {
-                accumulated_content.len()
-            } else {
-                interrupt_cutoff
-                    .unwrap_or(0)
-                    .min(accumulated_content.len())
-            };
-
-            if save_end > 0 {
-                let save_content = &accumulated_content[..save_end];
-                if let Some(ref output_path) = output_file_path {
-                    logger
-                        .log(&format!(
-                            "Saving {} chars of {} output after interrupted turn",
-                            save_content.len(),
-                            if config.interrupt_save_full {
-                                "full"
-                            } else {
-                                "partial"
-                            }
-                        ))
-                        .await;
-                    if let Err(e) = fs::write(output_path, save_content).await {
-                        logger
-                            .log(&format!(
-                                "Failed to write interrupted output: {:?}",
-                                e
-                            ))
-                            .await;
-                    }
-                }
-            } else if output_file_path.is_some() {
-                logger
-                    .log("Interrupt before any output; no output file written")
-                    .await;
-            }
-            logger.log("Inference turn interrupted").await;
-            return Ok(());
         }
 
         // Only write the output file when we have a complete, non-empty
@@ -824,7 +853,6 @@ async fn run_inference(
                             .collect(),
                         tools_enabled: args["tools_enabled"].as_bool().unwrap_or(true),
                         enable_thinking: args["enable_thinking"].as_bool().unwrap_or(false),
-                        interrupt_save_full: false,
                         inference_retries: 3,
                         inference_retry_delay_ms: 500,
                     };
@@ -1022,15 +1050,25 @@ async fn send_ipc_command(cmd: Command) -> Result<String> {
 }
 
 async fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
-    fs::create_dir_all(dest).await?;
-    let mut entries = fs::read_dir(src).await?;
+    fs::create_dir_all(dest)
+        .await
+        .context(format!("Failed to create directory: {}", dest.display()))?;
+    let mut entries = fs::read_dir(src)
+        .await
+        .context(format!("Failed to read directory: {}", src.display()))?;
     while let Some(entry) = entries.next_entry().await? {
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
         if src_path.is_dir() {
             Box::pin(copy_dir(&src_path, &dest_path)).await?;
         } else {
-            fs::copy(&src_path, &dest_path).await?;
+            fs::copy(&src_path, &dest_path)
+                .await
+                .context(format!(
+                    "Failed to copy {} to {}",
+                    src_path.display(),
+                    dest_path.display()
+                ))?;
         }
     }
     Ok(())

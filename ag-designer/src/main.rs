@@ -772,7 +772,6 @@ impl eframe::App for SnarlApp {
                                 excluded_from_summary: Vec::new(),
                                 tools_enabled: true,
                                 enable_thinking: false,
-                                interrupt_save_full: false,
                                 inference_retries: 3,
                                 inference_retry_delay_ms: 500,
                             },

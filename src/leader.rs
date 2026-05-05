@@ -3,7 +3,7 @@ use crate::model_loader::load_models;
 use crate::agent::Agent;
 use crate::ipc::Command;
 use crate::utils::find_leader_socket;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
 use std::collections::HashMap;
 use mistralrs::{SamplingParams, TextMessageRole};
@@ -139,7 +139,6 @@ impl Leader {
                                 excluded_from_summary: vec![],
                                 tools_enabled: true,
                                 enable_thinking: false,
-                                interrupt_save_full: false,
                                 inference_retries: 3,
                                 inference_retry_delay_ms: 500,
                             },
@@ -173,7 +172,10 @@ impl Leader {
         // 4. IPC listener
         let pid = std::process::id();
         let pipe_path = PathBuf::from("/tmp/agentgraph").join(format!("ag-{}.sock", pid));
-        tokio::fs::create_dir_all(pipe_path.parent().unwrap()).await?;
+        let parent = pipe_path.parent().unwrap().to_path_buf();
+        tokio::fs::create_dir_all(&parent)
+            .await
+            .context(format!("Failed to create IPC socket dir: {}", parent.display()))?;
         let _ = tokio::fs::remove_file(&pipe_path).await;
         let listener = UnixListener::bind(&pipe_path)?;
         println!("Leader PID {} listening on {:?}", pid, pipe_path);

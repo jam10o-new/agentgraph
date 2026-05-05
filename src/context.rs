@@ -99,11 +99,18 @@ impl CompressionManager {
             return Ok(None);
         }
         let mut latest: Option<MetaSummary> = None;
-        let mut entries = fs::read_dir(&dir).await?;
+        let mut entries = fs::read_dir(&dir)
+            .await
+            .context(format!("Failed to read metasummary dir: {}", dir.display()))?;
         while let Some(entry) = entries.next_entry().await? {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                let content = fs::read_to_string(&p).await?;
+                let content = fs::read_to_string(&p)
+                    .await
+                    .context(format!(
+                        "Failed to read metasummary file: {}",
+                        p.display()
+                    ))?;
                 let ms: MetaSummary = serde_json::from_str(&content)?;
                 if latest
                     .as_ref()
@@ -118,9 +125,14 @@ impl CompressionManager {
     }
 
     async fn save_metasummary(&self, ms: &MetaSummary) -> Result<()> {
-        fs::create_dir_all(self.metasummary_dir()).await?;
+        let metadir = self.metasummary_dir();
+        fs::create_dir_all(&metadir)
+            .await
+            .context(format!("Failed to create metasummary dir: {}", metadir.display()))?;
         let path = self.metasummary_path(ms.turn_index);
-        fs::write(&path, serde_json::to_string_pretty(ms)?).await?;
+        fs::write(&path, serde_json::to_string_pretty(ms)?)
+            .await
+            .context(format!("Failed to write metasummary: {}", path.display()))?;
         Ok(())
     }
 
@@ -149,14 +161,24 @@ impl CompressionManager {
 
             let root_path = self.root_summary_path(turn.turn_index);
             if root_path.exists() {
-                let content = fs::read_to_string(&root_path).await?;
+                let content = fs::read_to_string(&root_path)
+                    .await
+                    .context(format!(
+                        "Failed to read root summary: {}",
+                        root_path.display()
+                    ))?;
                 let root: RootSummary = serde_json::from_str(&content)?;
                 summary_text.push_str(&format!("Summary: {}\n", root.micro_summary));
                 summary_text.push_str(&format!("Domains: {:?}\n", root.domains));
                 for domain in &root.domains {
                     let spec_path = self.specialized_summary_path(turn.turn_index, domain);
                     if spec_path.exists() {
-                        let spec_content = fs::read_to_string(&spec_path).await?;
+                        let spec_content = fs::read_to_string(&spec_path)
+                            .await
+                            .context(format!(
+                                "Failed to read specialized summary: {}",
+                                spec_path.display()
+                            ))?;
                         let spec: SpecializedSummary = serde_json::from_str(&spec_content)?;
                         summary_text.push_str(&format!(
                             "  [{}]: {}\n",
@@ -323,12 +345,22 @@ impl CompressionManager {
     ) -> Result<(TextMessageRole, String)> {
         let turn = &history[turn_idx];
         let cache_dir = self.turn_cache_dir(turn.turn_index);
-        fs::create_dir_all(&cache_dir).await?;
+        fs::create_dir_all(&cache_dir)
+            .await
+            .context(format!(
+                "Failed to create turn cache dir: {}",
+                cache_dir.display()
+            ))?;
 
         let root_path = self.root_summary_path(turn.turn_index);
 
         let mut root = if root_path.exists() {
-            let content = fs::read_to_string(&root_path).await?;
+        let content = fs::read_to_string(&root_path)
+            .await
+            .context(format!(
+                "Failed to read root summary: {}",
+                root_path.display()
+            ))?;
             let r: RootSummary = serde_json::from_str(&content)?;
 
             let should_resummarize = rand::random::<f64>() < self.resummarize_prob;
@@ -351,7 +383,15 @@ impl CompressionManager {
         };
 
         // Save updated root
-        fs::write(&root_path, serde_json::to_string_pretty(&root)?).await?;
+        {
+            let json = serde_json::to_string_pretty(&root)?;
+            fs::write(&root_path, &json)
+                .await
+                .context(format!(
+                    "Failed to write root summary: {}",
+                    root_path.display()
+                ))?;
+        }
 
         // 2.5) if root > actual turn, load only domains or actual turn
         if root.micro_summary.len() > turn.content.len() {
@@ -377,12 +417,26 @@ impl CompressionManager {
                     )
                     .await?;
                 root.domains.push(spec.domain.clone());
-                fs::write(&root_path, serde_json::to_string_pretty(&root)?).await?;
-                fs::write(
-                    self.specialized_summary_path(turn.turn_index, &spec.domain),
-                    serde_json::to_string_pretty(&spec)?,
-                )
-                .await?;
+                {
+                    let json = serde_json::to_string_pretty(&root)?;
+                    fs::write(&root_path, &json)
+                        .await
+                        .context(format!(
+                            "Failed to write root summary: {}",
+                            root_path.display()
+                        ))?;
+                }
+                {
+                    let spec_path =
+                        self.specialized_summary_path(turn.turn_index, &spec.domain);
+                    let json = serde_json::to_string_pretty(&spec)?;
+                    fs::write(&spec_path, &json)
+                        .await
+                        .context(format!(
+                            "Failed to write specialized summary: {}",
+                            spec_path.display()
+                        ))?;
+                }
                 return Ok((role_to_mistral(&turn.role), spec.extracted_information));
             }
         }
@@ -403,7 +457,12 @@ impl CompressionManager {
                 } else {
                     let p = self.specialized_summary_path(turn.turn_index, &domain);
                     if p.exists() {
-                        let content = fs::read_to_string(p).await?;
+                        let content = fs::read_to_string(&p)
+                            .await
+                            .context(format!(
+                                "Failed to read specialized summary: {}",
+                                p.display()
+                            ))?;
                         let spec: SpecializedSummary = serde_json::from_str(&content)?;
                         combined.push_str(&format!(
                             "{}: {}\n",
