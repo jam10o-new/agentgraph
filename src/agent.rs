@@ -6,8 +6,8 @@ use crate::ipc::Command;
 use crate::utils::AgentLogger;
 use anyhow::{Context, Result, anyhow};
 use mistralrs::{
-    Function, Model, MultimodalMessages, RequestBuilder, RequestLike, RequestMessage, Response,
-    SamplingParams, TextMessageRole, Tool, ToolCallResponse, ToolChoice, ToolType,
+    Function, Model, MultimodalMessages, RequestBuilder, Response, SamplingParams, TextMessageRole,
+    Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 use notify::{Event, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
@@ -480,7 +480,13 @@ async fn run_inference(
         .and_then(|o| PathBuf::from(o).parent().map(|p| p.to_path_buf()))
         .or_else(|| config.stream_output.as_ref().and_then(|s| PathBuf::from(s).parent().map(|p| p.to_path_buf())))
         .unwrap_or_else(|| PathBuf::from("."));
+    // Save for potential OOM recovery rebuild
+    let oom_checkpoint_base = checkpoint_base.clone();
+    let oom_compression_config = config.compression.clone();
     let comp_mgr = CompressionManager::new(checkpoint_base, &config.compression);
+    // Snapshot of uncompressed history so OOM recovery can re-compress
+    // with more aggressive checkpoint limits without losing turns.
+    let uncompressed_history: Vec<HistoryTurn> = history.clone();
     let mut history_mut = history;
     let compressed_context = comp_mgr
         .get_compressed_context(
@@ -494,14 +500,16 @@ async fn run_inference(
 
     // 4. Build Request
     let mut multimodal = MultimodalMessages::new().enable_thinking(config.enable_thinking);
-    for (role, content) in compressed_context {
-        multimodal = multimodal.add_message(role, content);
+    for (role, content) in &compressed_context {
+        multimodal = multimodal.add_message(role.clone(), content.as_str());
     }
-    {
+    // Drain volatile context and save for potential OOM rebuild
+    let volatile_drained: Vec<(TextMessageRole, String)> = {
         let mut v_ctx = volatile_context.lock().await;
-        for (role, content) in v_ctx.drain(..) {
-            multimodal = multimodal.add_message(role, content);
-        }
+        v_ctx.drain(..).collect()
+    };
+    for (role, content) in &volatile_drained {
+        multimodal = multimodal.add_message(role.clone(), content.as_str());
     }
 
     let mut images = Vec::new();
@@ -533,13 +541,15 @@ async fn run_inference(
         } else {
             latest_user_input
         };
+    // Save for potential OOM recovery recompression
+    let oom_latest_input = effective_user_text.clone();
 
     if !images.is_empty() {
         logger
             .log(&format!("Adding {} images to request", images.len()))
             .await;
         multimodal =
-            multimodal.add_image_message(TextMessageRole::User, &effective_user_text, images);
+            multimodal.add_image_message(TextMessageRole::User, &effective_user_text, images.clone());
     } else {
         multimodal = multimodal.add_message(TextMessageRole::User, &effective_user_text);
     }
@@ -717,11 +727,73 @@ async fn run_inference(
     let retry_limit = config.inference_retries;
     let retry_delay = Duration::from_millis(config.inference_retry_delay_ms);
 
+    // OOM recovery state: when the normal-strength context OOMs the GPU,
+    // we re-compress with a halved context_checkpoint_limit and retry the
+    // entire turn. This preserves more history than dropping everything.
+    let mut oom_recompression_done = false;
+    let mut oom_recovery_pending = false;
+    let oom_aggressive_limit = config.context_checkpoint_limit
+        .map(|l| (l / 2).max(1));
+
     loop {
+        // If the previous turn failed with OOM, recompress the original
+        // uncompressed history with tighter limits before rebuilding the
+        // request.
+        if oom_recovery_pending {
+            logger.log("Recompressing context with aggressive limits after OOM").await;
+            let oom_comp_mgr = CompressionManager::new(
+                oom_checkpoint_base.clone(),
+                &oom_compression_config,
+            );
+            let mut history_retry = uncompressed_history.clone();
+            let recompr_context = match oom_comp_mgr
+                .get_compressed_context(
+                    model.clone(),
+                    &mut history_retry,
+                    &oom_latest_input,
+                    sampling.clone(),
+                    oom_aggressive_limit,
+                )
+                .await
+            {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    logger.log(&format!("OOM recompression failed: {:?}", e)).await;
+                    break; // give up
+                }
+            };
+            // Rebuild the request from the re-compressed context
+            let mut new_multimodal =
+                MultimodalMessages::new().enable_thinking(config.enable_thinking);
+            for (role, content) in &recompr_context {
+                new_multimodal = new_multimodal.add_message(role.clone(), content.as_str());
+            }
+            for (role, content) in &volatile_drained {
+                new_multimodal = new_multimodal.add_message(role.clone(), content.as_str());
+            }
+            if !images.is_empty() {
+                new_multimodal = new_multimodal.add_image_message(
+                    TextMessageRole::User,
+                    &effective_user_text,
+                    images.clone(),
+                );
+            } else {
+                new_multimodal = new_multimodal
+                    .add_message(TextMessageRole::User, &effective_user_text);
+            }
+            request = RequestBuilder::from(new_multimodal)
+                .set_sampling(sampling.clone())
+                .set_tools(tools.clone())
+                .set_tool_choice(ToolChoice::Auto);
+            oom_recovery_pending = false;
+            oom_recompression_done = true;
+        }
+
         let base_request = request.clone();
         let mut accumulated_content = String::new();
         let mut current_tool_calls = Vec::new();
         let mut remaining_retries = retry_limit;
+        let mut oom_recompression_needed = false;
 
         // Retry loop: wraps the streaming inference call so that
         // recoverable errors (OOMs, timeouts) trigger a retry with
@@ -752,71 +824,14 @@ async fn run_inference(
                         ))
                         .await;
                     if remaining_retries > 0 {
-                        // On OOM-like errors, retry with aggressively reduced
-                        // context: drop all but system messages and latest
-                        // user turn. Broken inference is worse than slow.
+                        // On OOM-like errors, flag the outer loop to
+                        // re-compress with more aggressive checkpoint limits.
                         if config.enable_oom_recovery
                             && looks_like_oom(&err_str)
                             && accumulated_content.is_empty()
+                            && !oom_recompression_done
                         {
-                            logger
-                                .log("OOM detected — retrying with reduced context")
-                                .await;
-                            let messages = retry_request.take_messages();
-                            let msg_list = match messages {
-                                RequestMessage::Chat { messages, .. }
-                                | RequestMessage::MultimodalChat { messages, .. } => messages,
-                                _ => {
-                                    logger.log("OOM recovery: request is not chat-based").await;
-                                    continue;
-                                }
-                            };
-                            use either::Either;
-                            let mut reduced = MultimodalMessages::new();
-                            for msg in &msg_list {
-                                let role = msg
-                                    .get("role")
-                                    .and_then(|r| match r {
-                                        Either::Left(s) => Some(s.as_str()),
-                                        _ => None,
-                                    })
-                                    .unwrap_or("");
-                                let content = msg
-                                    .get("content")
-                                    .and_then(|c| match c {
-                                        Either::Left(s) => Some(s.as_str()),
-                                        _ => None,
-                                    })
-                                    .unwrap_or("");
-                                if role == "system" || role == "developer" {
-                                    reduced = reduced
-                                        .add_message(TextMessageRole::System, content);
-                                }
-                            }
-                            // Keep only the last user message
-                            if let Some(last_user) = msg_list.iter().rev().find(|msg| {
-                                msg.get("role")
-                                    .and_then(|r| match r {
-                                        Either::Left(s) => Some(s.as_str()),
-                                        _ => None,
-                                    })
-                                    .is_some_and(|r| r == "user")
-                            }) {
-                                if let Some(content) = last_user
-                                    .get("content")
-                                    .and_then(|c| match c {
-                                        Either::Left(s) => Some(s.as_str()),
-                                        _ => None,
-                                    })
-                                {
-                                    reduced = reduced
-                                        .add_message(TextMessageRole::User, content);
-                                }
-                            }
-                            retry_request = RequestBuilder::from(reduced)
-                                .set_sampling(sampling.clone())
-                                .set_tools(tools.clone())
-                                .set_tool_choice(ToolChoice::Auto);
+                            oom_recompression_needed = true;
                         }
                         let attempt = retry_limit - remaining_retries;
                         let delay = retry_delay * 2u32.pow(attempt as u32);
@@ -906,6 +921,13 @@ async fn run_inference(
                     let _ = fs::remove_file(&stream_path).await;
                 }
                 drop(stream_file.take());
+                // If OOM was the likely cause and we haven't tried
+                // aggressive compression yet, don't give up — recompress
+                // and retry the outer turn loop.
+                if oom_recompression_needed {
+                    oom_recovery_pending = true;
+                    break; // exit inner retry loop, trigger recompression in outer loop
+                }
                 return Err(anyhow!("{}", err_msg));
             }
 
