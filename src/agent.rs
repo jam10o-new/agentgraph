@@ -754,11 +754,19 @@ async fn run_inference(
                 }
             };
 
-            // Consume stream chunks.
+            // Consume stream chunks. Track whether we received a
+            // finish_reason so we can distinguish a completed response
+            // from a prematurely-closed channel.
+            let mut got_finish = false;
+            let mut stream_error: Option<String> = None;
+
             while let Some(chunk) = model_stream.next().await {
                 match chunk {
                     Response::Chunk(c) => {
                         if let Some(choice) = c.choices.first() {
+                            if choice.finish_reason.is_some() {
+                                got_finish = true;
+                            }
                             if let Some(ref content) = choice.delta.content {
                                 accumulated_content.push_str(content);
                                 if let Some(ref mut f) = stream_file {
@@ -778,8 +786,75 @@ async fn run_inference(
                             }
                         }
                     }
+                    Response::ModelError(msg, _) => {
+                        stream_error =
+                            Some(format!("Model error during streaming: {}", msg));
+                        break;
+                    }
+                    Response::InternalError(e) => {
+                        stream_error =
+                            Some(format!("Internal error during streaming: {}", e));
+                        break;
+                    }
+                    // Done, CompletionDone, etc. — stream is ending normally
                     _ => {}
                 }
+            }
+
+            // Check for errors or premature termination and retry if possible.
+            if let Some(ref err_msg) = stream_error {
+                logger
+                    .log(&format!(
+                        "{} (retries left: {})",
+                        err_msg, remaining_retries
+                    ))
+                    .await;
+                if remaining_retries > 0 {
+                    remaining_retries -= 1;
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+                // Final failure — remove incomplete stream file and bail
+                if let Some(ref stream_dir) = config.stream_output {
+                    let stream_path =
+                        PathBuf::from(stream_dir).join(format!("out-{}.txt", timestamp));
+                    let _ = fs::remove_file(&stream_path).await;
+                }
+                drop(stream_file.take());
+                return Err(anyhow!("{}", err_msg));
+            }
+
+            if !got_finish {
+                // Stream ended without receiving a finish_reason — the
+                // channel was likely closed mid-generation. Retry with
+                // the partial content as a prefill so the model can
+                // continue from where it left off.
+                if !accumulated_content.is_empty() {
+                    logger
+                        .log(&format!(
+                            "Stream ended prematurely with {} chars (retries left: {})",
+                            accumulated_content.len(),
+                            remaining_retries
+                        ))
+                        .await;
+                } else {
+                    logger
+                        .log(&format!(
+                            "Stream produced no content at all (retries left: {})",
+                            remaining_retries
+                        ))
+                        .await;
+                }
+                if remaining_retries > 0 {
+                    remaining_retries -= 1;
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+                // All retries exhausted — write whatever partial content
+                // we have as best-effort fallback.
+                logger
+                    .log("All retries exhausted on incomplete stream; writing partial output")
+                    .await;
             }
 
             // Streaming completed cleanly for this attempt
