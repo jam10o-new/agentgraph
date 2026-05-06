@@ -21,6 +21,9 @@ enum Commands {
         /// Path to the config file
         #[arg(short, long, default_value = "config.yaml")]
         config: String,
+        /// Path to a pending command file to process on startup
+        #[arg(long)]
+        pending_command: Option<String>,
     },
     /// Run a specific agent turn, optionally injecting a message
     Run {
@@ -74,6 +77,8 @@ enum Commands {
         #[arg(short, long)]
         prompt: Option<String>,
     },
+    /// Print the full version string (including git commit hash)
+    Version,
 }
 
 #[tokio::main]
@@ -82,24 +87,29 @@ async fn main() -> Result<()> {
 
     // Check if we are already in the background
     if std::env::var("AGENTGRAPH_BACKGROUND").is_ok() {
-        if let Commands::Leader { config } = cli.command {
-            let config = Config::load(config)?;
-            let leader = Leader::new(config).await?;
-            leader.run().await?;
+        if let Commands::Leader { config, pending_command } = cli.command {
+            let config_obj = Config::load(&config)?;
+            let config_path = std::path::absolute(&config)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&config));
+            let leader = Leader::new(config_obj, config_path.to_string_lossy().to_string()).await?;
+            leader.run(pending_command).await?;
             return Ok(());
         }
     }
 
     match cli.command {
-        Commands::Leader { config } => {
+        Commands::Leader { config, .. } => {
             if find_leader_socket().await.is_some() {
                 let config_obj = Config::load(&config)?;
                 let cmd = Command::UpdateConfig(config_obj);
                 send_command(cmd).await?;
             } else {
-                spawn_background_leader(&config)?;
+                spawn_background_leader(&config, None)?;
                 println!("Leader started in background. Logs: /tmp/agentgraph/leader.log");
             }
+        }
+        Commands::Version => {
+            println!("{}", agentgraph::version());
         }
         Commands::Status => {
             if find_leader_socket().await.is_none() {
@@ -154,7 +164,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn spawn_background_leader(config_path: &str) -> Result<()> {
+fn spawn_background_leader(config_path: &str, pending_command: Option<&str>) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log_dir = std::path::Path::new("/tmp/agentgraph");
     if !log_dir.exists() {
@@ -166,20 +176,23 @@ fn spawn_background_leader(config_path: &str) -> Result<()> {
         .append(true)
         .open(log_path)?;
 
-    std::process::Command::new(exe)
-        .arg("leader")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("leader")
         .arg("--config")
         .arg(config_path)
         .env("AGENTGRAPH_BACKGROUND", "1")
         .stdout(std::process::Stdio::from(log_file.try_clone()?))
-        .stderr(std::process::Stdio::from(log_file))
-        .spawn()?;
+        .stderr(std::process::Stdio::from(log_file));
+    if let Some(pc) = pending_command {
+        cmd.arg("--pending-command").arg(pc);
+    }
+    cmd.spawn()?;
     Ok(())
 }
 
 async fn ensure_leader() -> Result<()> {
     if find_leader_socket().await.is_none() {
-        spawn_background_leader("config.yaml")?;
+        spawn_background_leader("config.yaml", None)?;
         // Wait a bit for it to start
         for _ in 0..300 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -193,17 +206,49 @@ async fn ensure_leader() -> Result<()> {
 }
 
 async fn send_command(cmd: Command) -> Result<()> {
-    let socket_path = find_leader_socket().await.ok_or_else(|| anyhow!("Leader not found. Is it running?"))?;
-    let mut stream = UnixStream::connect(socket_path).await?;
-    let payload = serde_json::to_vec(&cmd)?;
-    stream.write_all(&payload).await?;
-    stream.flush().await?;
-    
-    // Shutdown writing so leader knows we're done sending
-    stream.shutdown().await?;
+    let max_retries = 2;
+    for attempt in 0..=max_retries {
+        let socket_path = find_leader_socket()
+            .await
+            .ok_or_else(|| anyhow!("Leader not found. Is it running?"))?;
+        let mut stream = UnixStream::connect(socket_path).await?;
+        let payload = serde_json::to_vec(&cmd)?;
+        stream.write_all(&payload).await?;
+        stream.flush().await?;
 
-    let mut resp = String::new();
-    stream.read_to_string(&mut resp).await?;
-    println!("{}", resp);
-    Ok(())
+        // Shutdown writing so leader knows we're done sending
+        stream.shutdown().await?;
+
+        let mut resp = String::new();
+        if stream.read_to_string(&mut resp).await.is_err() {
+            // Leader closed connection (possibly restarting).
+            // Wait and retry.
+            if attempt < max_retries {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                continue;
+            }
+            return Err(anyhow!("Leader connection lost and failed to recover"));
+        }
+
+        let resp = resp.trim().to_string();
+        if resp == "RESTARTING" {
+            // Leader is restarting with a new binary version.
+            // Wait for new leader and retry.
+            if attempt < max_retries {
+                for _ in 0..100 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if find_leader_socket().await.is_some() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            return Err(anyhow!("Leader restart timed out"));
+        }
+
+        println!("{}", resp);
+        return Ok(());
+    }
+
+    Err(anyhow!("Failed to send command after {} retries", max_retries))
 }

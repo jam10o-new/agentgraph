@@ -14,3 +14,12 @@ pub use leader::Leader;
 pub use agent::Agent;
 pub use utils::{find_leader_socket, AgentLogger};
 pub use ipc::Command;
+
+/// Full version string including git commit hash.
+/// Format: `<cargo-version>-<short-hash>` or `<cargo-version>-<short-hash>-dirty`.
+pub fn version() -> String {
+    let pkg_version = env!("CARGO_PKG_VERSION");
+    let hash = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
+    let dirty = option_env!("GIT_DIRTY").map(|_| "-dirty").unwrap_or("");
+    format!("{}-{}{}", pkg_version, hash, dirty)
+}
