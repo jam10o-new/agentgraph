@@ -737,8 +737,10 @@ async fn run_inference(
                         ))
                         .await;
                     if remaining_retries > 0 {
+                        let attempt = retry_limit - remaining_retries;
+                        let delay = retry_delay * 2u32.pow(attempt as u32);
                         remaining_retries -= 1;
-                        tokio::time::sleep(retry_delay).await;
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                     // Final failure — remove any incomplete stream file
@@ -810,8 +812,10 @@ async fn run_inference(
                     ))
                     .await;
                 if remaining_retries > 0 {
+                    let attempt = retry_limit - remaining_retries;
+                    let delay = retry_delay * 2u32.pow(attempt as u32);
                     remaining_retries -= 1;
-                    tokio::time::sleep(retry_delay).await;
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 // Final failure — remove incomplete stream file and bail
@@ -846,8 +850,10 @@ async fn run_inference(
                         .await;
                 }
                 if remaining_retries > 0 {
+                    let attempt = retry_limit - remaining_retries;
+                    let delay = retry_delay * 2u32.pow(attempt as u32);
                     remaining_retries -= 1;
-                    tokio::time::sleep(retry_delay).await;
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 // All retries exhausted — write whatever partial content
