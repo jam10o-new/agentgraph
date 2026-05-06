@@ -1,0 +1,5 @@
+# Use GCC 14 as the CUDA host compiler. GCC 16 headers use
+# C++23 deducing-this and __builtin_is_virtual_base_of which
+# CUDA's cudafe++ frontend (Clang 8-era) cannot parse.
+[env]
+NVCC_CCBIN = "/usr/bin/g++-14"
