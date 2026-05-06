@@ -83,6 +83,11 @@ pub struct AgentConfig {
     /// Whether this agent is allowed to use tools. Defaults to true.
     #[serde(default = "default_true")]
     pub tools_enabled: bool,
+    /// When true, tool call content is consumed (hidden from output file).
+    /// When false (default), tool call details are written to the output
+    /// file so downstream agents (e.g. a distillation harness) can see them.
+    #[serde(default)]
+    pub consume_tool_calls: bool,
     /// Enable extended thinking / chain-of-thought for models that support it
     /// (e.g. Qwen3.5). Defaults to false because thinking mode can interfere
     /// with streaming output reliability.

@@ -7,7 +7,7 @@ use crate::utils::AgentLogger;
 use anyhow::{Context, Result, anyhow};
 use mistralrs::{
     Function, Model, MultimodalMessages, RequestBuilder, Response, SamplingParams, TextMessageRole,
-    Tool, ToolChoice, ToolType,
+    Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 use notify::{Event, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
@@ -93,6 +93,9 @@ impl Agent {
         }
         if let Some(ref tool_dir) = self.config.tool_output {
             let _ = fs::create_dir_all(tool_dir).await;
+        } else if let Some(first_output) = self.config.output.first() {
+            let default_tool_dir = format!("{}/tool_output", first_output);
+            let _ = fs::create_dir_all(&default_tool_dir).await;
         }
         for sys_path in &self.config.system {
             let _ = fs::create_dir_all(sys_path).await;
@@ -243,6 +246,12 @@ async fn run_inference(
         if let Ok(mut entries) = fs::read_dir(sys_dir).await {
             let mut files = Vec::new();
             while let Some(entry) = entries.next_entry().await? {
+                let file_name = entry.file_name();
+                let name_str = file_name.to_string_lossy();
+                // Skip hidden files (e.g. tool definitions written by agentgraph)
+                if name_str.starts_with('.') {
+                    continue;
+                }
                 if entry.path().is_file() {
                     files.push(entry.path());
                 }
@@ -363,7 +372,15 @@ async fn run_inference(
         }
     }
     // Tool outputs are loaded as assistant history so the model sees its own prior tool results.
-    if let Some(ref tool_dir) = config.tool_output {
+    // When tool_output is not explicitly set, default to the "tool_output" subdirectory
+    // within the first output directory.
+    let effective_tool_dir = config.tool_output.clone().or_else(|| {
+        config
+            .output
+            .first()
+            .map(|o| format!("{}/tool_output", o))
+    });
+    if let Some(ref tool_dir) = effective_tool_dir {
         if let Ok(mut entries) = fs::read_dir(tool_dir).await {
             while let Some(entry) = entries.next_entry().await? {
                 let p = entry.path();
@@ -385,7 +402,7 @@ async fn run_inference(
                                     p_display
                                 )
                             })?,
-                        role: HistoryTurnRole::Assistant,
+                        role: HistoryTurnRole::Tool,
                         metadata_str: String::new(),
                         excluded: false,
                     });
@@ -635,6 +652,18 @@ async fn run_inference(
         vec![]
     };
 
+    // When not consuming tool calls (distillation mode), write the tool
+    // definitions to a well-known hidden file in the first system directory
+    // so downstream harnesses know what tools the model had access to.
+    if !config.consume_tool_calls && config.tools_enabled && !tools.is_empty() {
+        if let Some(ref sys_dir) = config.system.first() {
+            let tools_path = PathBuf::from(sys_dir).join(".agentgraph_tools.json");
+            if let Ok(json) = serde_json::to_string_pretty(&tools) {
+                let _ = fs::write(&tools_path, &json).await;
+            }
+        }
+    }
+
     let timestamp = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
@@ -760,12 +789,39 @@ async fn run_inference(
         // Only write the output file when we have a complete, non-empty
         // response. On error we cleaned up and returned above, so by the
         // time we reach this point the response is good.
-        if !accumulated_content.is_empty() {
+        //
+        // When consume_tool_calls is false, tool call JSON is appended
+        // so downstream agents (e.g. distillation harness) can see the
+        // raw structured output. Tool call deltas are deduplicated by ID
+        // (the last occurrence per ID carries the completed state).
+        let mut output_content = accumulated_content.clone();
+        if !config.consume_tool_calls && !current_tool_calls.is_empty() {
+            let mut seen_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut deduped: Vec<&ToolCallResponse> = Vec::new();
+            // Iterate in reverse so the first-seen (last-occurrence) wins
+            for tc in current_tool_calls.iter().rev() {
+                if seen_ids.insert(tc.id.clone()) {
+                    deduped.push(tc);
+                }
+            }
+            deduped.reverse(); // restore original order
+            if !output_content.is_empty() {
+                output_content.push_str("\n\n");
+            }
+            for tc in &deduped {
+                if let Ok(json) = serde_json::to_string(tc) {
+                    output_content.push_str(&json);
+                    output_content.push('\n');
+                }
+            }
+        }
+        if !output_content.is_empty() {
             if let Some(ref output_path) = output_file_path {
                 logger
                     .log(&format!("Turn complete, writing to: {:?}", output_path))
                     .await;
-                if let Err(e) = fs::write(output_path, &accumulated_content).await {
+                if let Err(e) = fs::write(output_path, &output_content).await {
                     logger
                         .log(&format!("Failed to write output file: {:?}", e))
                         .await;
@@ -852,6 +908,7 @@ async fn run_inference(
                             .map(|v| v.as_str().unwrap_or_default().to_string())
                             .collect(),
                         tools_enabled: args["tools_enabled"].as_bool().unwrap_or(true),
+                        consume_tool_calls: args["consume_tool_calls"].as_bool().unwrap_or(false),
                         enable_thinking: args["enable_thinking"].as_bool().unwrap_or(false),
                         inference_retries: 3,
                         inference_retry_delay_ms: 500,
@@ -1009,11 +1066,18 @@ async fn run_inference(
                 _ => format!("Unknown tool: {}", tc.function.name),
             };
 
-            // Persist tool result to the dedicated tool_output directory if configured,
-            // otherwise fall back to the main output directory.
-            let fallback_tool_dir = config.output.first().cloned().unwrap_or_else(|| "/tmp/agentgraph_tool_output".to_string());
-            let tool_dest_dir = config.tool_output.as_ref().unwrap_or(&fallback_tool_dir);
-            if let Err(e) = fs::create_dir_all(tool_dest_dir).await {
+            // Persist tool result to the dedicated tool_output directory if configured.
+            // When tool_output is not explicitly set, default to a "tool_output"
+            // subdirectory within the first output directory so tool results don't
+            // pollute the main output (which would confuse downstream agents).
+            let tool_dest_dir = config.tool_output.clone().unwrap_or_else(|| {
+                config
+                    .output
+                    .first()
+                    .map(|o| format!("{}/tool_output", o))
+                    .unwrap_or_else(|| "/tmp/agentgraph_tool_output".to_string())
+            });
+            if let Err(e) = fs::create_dir_all(&tool_dest_dir).await {
                 logger
                     .log(&format!("Failed to create tool output dir: {:?}", e))
                     .await;

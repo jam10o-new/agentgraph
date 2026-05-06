@@ -171,6 +171,7 @@ dependencies = [
  "chrono",
  "clap",
  "cpal",
+ "either",
  "flume",
  "futures",
  "hound",

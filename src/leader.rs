@@ -127,6 +127,7 @@ impl Leader {
                                 output: vec![],
                                 stream_output: None,
                                 tool_output: None,
+                                consume_tool_calls: false,
                                 system: vec![],
                                 model: first_model,
                                 history_limit: None,

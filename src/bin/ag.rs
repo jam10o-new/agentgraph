@@ -62,9 +62,14 @@ enum Commands {
     /// Optional streaming output directory
     #[arg(short, long)]
     stream_output: Option<String>,
-    /// Optional tool output directory
-    #[arg(long)]
-    tool_output: Option<String>,
+        /// Optional tool output directory
+        #[arg(long)]
+        tool_output: Option<String>,
+        /// When set, tool call content is hidden from output (consumed).
+        /// When not set (default), tool call details are written to the
+        /// output file for downstream agents to see.
+        #[arg(long, default_value_t = false)]
+        consume_tool_calls: bool,
         /// Extra system prompt
         #[arg(short, long)]
         prompt: Option<String>,
@@ -116,12 +121,13 @@ async fn main() -> Result<()> {
                 Commands::Run { agent, message } => Command::RunAgent(agent, message),
                 Commands::Stop { agent } => Command::StopAgent(agent),
                 Commands::Reload => Command::ReloadConfig,
-                Commands::Spawn { name, inputs, output, stream_output, tool_output, system, model, limit, prompt, .. } => {
+                Commands::Spawn { name, inputs, output, stream_output, tool_output, consume_tool_calls, system, model, limit, prompt, .. } => {
                     let config = AgentConfig {
                         inputs,
                         output: output.map(|s| vec![s]).unwrap_or_default(),
                         stream_output,
                         tool_output,
+                        consume_tool_calls,
                         system,
                         model,
                         history_limit: limit,

@@ -42,6 +42,7 @@ pub enum HistoryTurnRole {
     Assistant,
     System,
     Skill(String, String), // Name, Description
+    Tool,                  // Tool call result (function output)
 }
 
 #[derive(Debug, Clone)]
@@ -721,6 +722,7 @@ pub fn role_to_mistral(role: &HistoryTurnRole) -> TextMessageRole {
     match role {
         HistoryTurnRole::User => TextMessageRole::User,
         HistoryTurnRole::Assistant => TextMessageRole::Assistant,
+        HistoryTurnRole::Tool => TextMessageRole::Tool,
         HistoryTurnRole::System | HistoryTurnRole::Skill(_, _) => TextMessageRole::System,
     }
 }

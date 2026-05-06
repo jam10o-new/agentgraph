@@ -771,6 +771,7 @@ impl eframe::App for SnarlApp {
                                 context_checkpoint_limit: None,
                                 excluded_from_summary: Vec::new(),
                                 tools_enabled: true,
+                                consume_tool_calls: false,
                                 enable_thinking: false,
                                 inference_retries: 3,
                                 inference_retry_delay_ms: 500,

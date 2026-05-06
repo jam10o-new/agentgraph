@@ -830,6 +830,7 @@ mod tests {
                 output: vec![output_dir.to_string_lossy().to_string()],
                 stream_output: stream_dir.map(|p| p.to_string_lossy().to_string()),
                 tool_output: None,
+                consume_tool_calls: false,
                 system: vec![],
                 model: "primary".to_string(),
                 history_limit: None,
