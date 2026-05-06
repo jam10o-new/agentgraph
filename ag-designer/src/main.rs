@@ -81,6 +81,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         dtype,
                         builder,
                         chat_template,
+                        max_num_seqs: 32,
                     },
             } => {
                 ui.set_width(300.0);
@@ -742,6 +743,7 @@ impl eframe::App for SnarlApp {
                                 dtype: None,
                                 builder: "vision".to_string(),
                                 chat_template: None,
+                                max_num_seqs: 32,
                             },
                         },
                     );

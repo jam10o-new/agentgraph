@@ -83,6 +83,7 @@ pub async fn load_models(
                     b = b.with_dtype(d);
                 }
                 b = b.with_logging();
+                b = b.with_max_num_seqs(config.max_num_seqs);
                 if let Some(t) = chat_template_override {
                     b = b.with_chat_template(t);
                 }

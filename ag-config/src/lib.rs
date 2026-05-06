@@ -10,6 +10,15 @@ pub struct ModelConfig {
     pub dtype: Option<String>,
     pub builder: String,
     pub chat_template: Option<String>,
+    /// Maximum number of concurrent sequences. Lower values reduce KV cache
+    /// GPU memory proportionally. Default: 32. For sequential workloads
+    /// (agent turns, distillation pipelines), 1–4 is safe and memory-efficient.
+    #[serde(default = "default_max_num_seqs")]
+    pub max_num_seqs: usize,
+}
+
+fn default_max_num_seqs() -> usize {
+    32
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
