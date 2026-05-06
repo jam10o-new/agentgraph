@@ -7,7 +7,6 @@ fn main() {
         if output.status.success() {
             let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
             println!("cargo:rustc-env=GIT_COMMIT_HASH={}", hash);
-            println!("cargo:rerun-if-changed=.git/HEAD");
         }
     }
 
@@ -20,4 +19,8 @@ fn main() {
             println!("cargo:rustc-env=GIT_DIRTY=1");
         }
     }
+
+    // Re-run the build script whenever the git index changes
+    // (commits, adds, etc.) so the embedded hash stays current.
+    println!("cargo:rerun-if-changed=.git/index");
 }
