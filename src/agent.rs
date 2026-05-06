@@ -6,8 +6,8 @@ use crate::ipc::Command;
 use crate::utils::AgentLogger;
 use anyhow::{Context, Result, anyhow};
 use mistralrs::{
-    Function, Model, MultimodalMessages, RequestBuilder, Response, SamplingParams, TextMessageRole,
-    Tool, ToolCallResponse, ToolChoice, ToolType,
+    Function, Model, MultimodalMessages, RequestBuilder, RequestLike, RequestMessage, Response,
+    SamplingParams, TextMessageRole, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 use notify::{Event, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
@@ -227,6 +227,20 @@ fn format_file_metadata(path: &Path, metadata: &std::fs::Metadata) -> String {
         modified,
         size
     )
+}
+
+/// Heuristic to detect OOM-like errors from their string representation.
+/// Matches common patterns from CUDA, Metal, and general allocation failures.
+fn looks_like_oom(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("out of memory")
+        || lower.contains("oom")
+        || lower.contains("allocation failed")
+        || lower.contains("not enough memory")
+        || lower.contains("cuda error")
+        || lower.contains("metal error")
+        || lower.contains("cannot allocate")
+        || lower.contains("memory exhausted")
 }
 
 async fn run_inference(
@@ -696,8 +710,8 @@ async fn run_inference(
     };
 
     let mut request = RequestBuilder::from(multimodal)
-        .set_sampling(sampling)
-        .set_tools(tools)
+        .set_sampling(sampling.clone())
+        .set_tools(tools.clone())
         .set_tool_choice(ToolChoice::Auto);
 
     let retry_limit = config.inference_retries;
@@ -727,16 +741,83 @@ async fn run_inference(
                     .await;
             }
 
-            let mut model_stream = match model.stream_chat_request(retry_request).await {
+            let mut model_stream = match model.stream_chat_request(retry_request.clone()).await {
                 Ok(s) => s,
                 Err(e) => {
+                    let err_str = format!("{:?}", e);
                     logger
                         .log(&format!(
-                            "Inference error: {:?} (retries left: {})",
-                            e, remaining_retries
+                            "Inference error: {} (retries left: {})",
+                            err_str, remaining_retries
                         ))
                         .await;
                     if remaining_retries > 0 {
+                        // On OOM-like errors, retry with aggressively reduced
+                        // context: drop all but system messages and latest
+                        // user turn. Broken inference is worse than slow.
+                        if config.enable_oom_recovery
+                            && looks_like_oom(&err_str)
+                            && accumulated_content.is_empty()
+                        {
+                            logger
+                                .log("OOM detected — retrying with reduced context")
+                                .await;
+                            let messages = retry_request.take_messages();
+                            let msg_list = match messages {
+                                RequestMessage::Chat { messages, .. }
+                                | RequestMessage::MultimodalChat { messages, .. } => messages,
+                                _ => {
+                                    logger.log("OOM recovery: request is not chat-based").await;
+                                    continue;
+                                }
+                            };
+                            use either::Either;
+                            let mut reduced = MultimodalMessages::new();
+                            for msg in &msg_list {
+                                let role = msg
+                                    .get("role")
+                                    .and_then(|r| match r {
+                                        Either::Left(s) => Some(s.as_str()),
+                                        _ => None,
+                                    })
+                                    .unwrap_or("");
+                                let content = msg
+                                    .get("content")
+                                    .and_then(|c| match c {
+                                        Either::Left(s) => Some(s.as_str()),
+                                        _ => None,
+                                    })
+                                    .unwrap_or("");
+                                if role == "system" || role == "developer" {
+                                    reduced = reduced
+                                        .add_message(TextMessageRole::System, content);
+                                }
+                            }
+                            // Keep only the last user message
+                            if let Some(last_user) = msg_list.iter().rev().find(|msg| {
+                                msg.get("role")
+                                    .and_then(|r| match r {
+                                        Either::Left(s) => Some(s.as_str()),
+                                        _ => None,
+                                    })
+                                    .is_some_and(|r| r == "user")
+                            }) {
+                                if let Some(content) = last_user
+                                    .get("content")
+                                    .and_then(|c| match c {
+                                        Either::Left(s) => Some(s.as_str()),
+                                        _ => None,
+                                    })
+                                {
+                                    reduced = reduced
+                                        .add_message(TextMessageRole::User, content);
+                                }
+                            }
+                            retry_request = RequestBuilder::from(reduced)
+                                .set_sampling(sampling.clone())
+                                .set_tools(tools.clone())
+                                .set_tool_choice(ToolChoice::Auto);
+                        }
                         let attempt = retry_limit - remaining_retries;
                         let delay = retry_delay * 2u32.pow(attempt as u32);
                         remaining_retries -= 1;
@@ -992,6 +1073,7 @@ async fn run_inference(
                         consume_tool_calls: args["consume_tool_calls"].as_bool().unwrap_or(false),
                         enable_thinking: args["enable_thinking"].as_bool().unwrap_or(false),
                         inference_retries: 3,
+                        enable_oom_recovery: true,
                         inference_retry_delay_ms: 500,
                     };
                     send_ipc_command(Command::SpawnAgent { name, config })

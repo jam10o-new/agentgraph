@@ -88,6 +88,12 @@ pub struct AgentConfig {
     /// file so downstream agents (e.g. a distillation harness) can see them.
     #[serde(default)]
     pub consume_tool_calls: bool,
+    /// Whether to retry with reduced context when an OOM-like error is
+    /// detected. When true (default), the agent drops all but the most
+    /// recent conversation turn on the first OOM retry, keeping the
+    /// system prompt and latest user input only.
+    #[serde(default = "default_true")]
+    pub enable_oom_recovery: bool,
     /// Enable extended thinking / chain-of-thought for models that support it
     /// (e.g. Qwen3.5). Defaults to false because thinking mode can interfere
     /// with streaming output reliability.

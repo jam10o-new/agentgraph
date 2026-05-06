@@ -257,6 +257,7 @@ impl Leader {
                                 tools_enabled: true,
                                 enable_thinking: false,
                                 inference_retries: 3,
+                                enable_oom_recovery: true,
                                 inference_retry_delay_ms: 500,
                             },
                         );
