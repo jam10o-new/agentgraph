@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use either::Either;
 use mistralrs::{
-    ChatCompletionResponse, Model, RequestBuilder, SamplingParams, TextMessageRole, TextMessages,
+    ChatCompletionResponse, Constraint, Model, RequestBuilder, SamplingParams, TextMessageRole,
+    TextMessages,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -56,6 +57,24 @@ pub struct HistoryTurn {
 
 use ag_config::CompressionConfig;
 
+/// Maximum output tokens for all compression requests.
+/// Summaries should be concise — generous caps only bloat context.
+const ROOT_SUMMARY_MAX_TOKENS: usize = 256;
+const SPECIALIZED_SUMMARY_MAX_TOKENS: usize = 256;
+const METASUMMARY_MAX_TOKENS: usize = 1024;
+const SUFFICIENCY_CHECK_MAX_TOKENS: usize = 8;
+const DOMAIN_SELECTION_MAX_TOKENS: usize = 64;
+
+/// Clone a SamplingParams but enforce a conservative max_len suitable
+/// for compression requests.  The user's original sampling configuration
+/// (temperature, top_p, etc.) is preserved; only the output-length cap
+/// is overridden because summaries must be compact.
+fn compression_sampling(params: &SamplingParams, max_tokens: usize) -> SamplingParams {
+    let mut s = params.clone();
+    s.max_len = Some(max_tokens);
+    s
+}
+
 pub struct CompressionManager {
     pub base_path: PathBuf,
     pub threshold: f64,
@@ -81,9 +100,19 @@ impl CompressionManager {
         self.turn_cache_dir(turn_idx).join("root.json")
     }
 
+    /// Sanitize a domain name for use as a filename component.
+    /// Replaces non-alphanumeric characters (except `-` and `_`) with `_`.
+    /// Prevents path traversal and filesystem issues from LLM-generated names.
+    fn sanitize_domain(domain: &str) -> String {
+        domain
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect()
+    }
+
     fn specialized_summary_path(&self, turn_idx: usize, domain: &str) -> PathBuf {
         self.turn_cache_dir(turn_idx)
-            .join(format!("domain_{}.json", domain))
+            .join(format!("domain_{}.json", Self::sanitize_domain(domain)))
     }
 
     fn metasummary_dir(&self) -> PathBuf {
@@ -107,13 +136,14 @@ impl CompressionManager {
         while let Some(entry) = entries.next_entry().await? {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                let content = fs::read_to_string(&p)
-                    .await
-                    .context(format!(
-                        "Failed to read metasummary file: {}",
-                        p.display()
-                    ))?;
-                let ms: MetaSummary = serde_json::from_str(&content)?;
+                let content = match fs::read_to_string(&p).await {
+                    Ok(c) => c,
+                    Err(_) => continue, // skip unreadable files
+                };
+                let ms: MetaSummary = match serde_json::from_str(&content) {
+                    Ok(m) => m,
+                    Err(_) => continue, // skip malformed JSON
+                };
                 if latest
                     .as_ref()
                     .map(|l| ms.turn_index > l.turn_index)
@@ -207,7 +237,29 @@ impl CompressionManager {
             .add_message(TextMessageRole::System, system_prompt)
             .add_message(TextMessageRole::User, prompt);
 
-        let req = RequestBuilder::from(messages).set_sampling(sampling);
+        let req = RequestBuilder::from(messages)
+            .set_sampling(compression_sampling(
+                &sampling,
+                METASUMMARY_MAX_TOKENS,
+            ))
+            .set_constraint(Constraint::JsonSchema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Concise metasummary capturing all unique information"
+                    },
+                    "included_domains": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "included_turn_indices": {
+                        "type": "array",
+                        "items": {"type": "integer"}
+                    }
+                },
+                "required": ["content", "included_domains", "included_turn_indices"]
+            })));
         let resp: ChatCompletionResponse =
             send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content = resp.choices[0]
@@ -216,17 +268,23 @@ impl CompressionManager {
             .as_ref()
             .context("Empty metasummary")?;
 
-        let mut ms: MetaSummary = if let Some(start_json) = content.find('{') {
-            if let Some(end_json) = content.rfind('}') {
-                let json_str = &content[start_json..=end_json];
-                serde_json::from_str(json_str)
-                    .map_err(|e| anyhow!("JSON Parse Error: {}, content: {}", e, json_str))?
-            } else {
-                anyhow::bail!("No JSON end found in model response")
-            }
-        } else {
-            anyhow::bail!("No JSON start found in model response")
-        };
+        // With JsonSchema constraint, the output should already be pure JSON.
+        // Still parse with find/rfind fallback for models that don't support
+        // llguidance constrained decoding.
+        let mut ms: MetaSummary = serde_json::from_str(content)
+            .or_else(|_| {
+                if let Some(start_json) = content.find('{') {
+                    if let Some(end_json) = content.rfind('}') {
+                        let json_str = &content[start_json..=end_json];
+                        serde_json::from_str(json_str)
+                            .map_err(|e| anyhow!("JSON Parse Error: {}, content: {}", e, json_str))
+                    } else {
+                        anyhow::bail!("No JSON end found in model response")
+                    }
+                } else {
+                    anyhow::bail!("No JSON start found in model response")
+                }
+            })?;
 
         ms.generated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -439,13 +497,14 @@ impl CompressionManager {
             }
         }
 
-        // 3) if only root exists
-        if root.domains.is_empty() {
+        // Collect the compressed result first, then enforce a size cap
+        // so no summary is ever longer than its source material.
+        let result: (TextMessageRole, String) = if root.domains.is_empty() {
             if self
                 .is_summary_sufficient(model.clone(), &root, latest_turn, sampling.clone())
                 .await?
             {
-                return Ok((role_to_mistral(&turn.role), root.micro_summary.clone()));
+                (role_to_mistral(&turn.role), root.micro_summary.clone())
             } else {
                 let spec = self
                     .generate_specialized_summary(
@@ -476,41 +535,50 @@ impl CompressionManager {
                             spec_path.display()
                         ))?;
                 }
-                return Ok((role_to_mistral(&turn.role), spec.extracted_information));
+                (role_to_mistral(&turn.role), spec.extracted_information)
             }
-        }
-
-        // 4) selection logic for > 1 summary
-        let selected_domains = self
-            .select_relevant_domains(model.clone(), &root, latest_turn, sampling.clone())
-            .await?;
-        if selected_domains.is_empty()
-            || (selected_domains.len() == 1 && selected_domains[0] == "root")
-        {
-            Ok((role_to_mistral(&turn.role), root.micro_summary.clone()))
         } else {
-            let mut combined = String::new();
-            for domain in selected_domains {
-                if domain == "root" {
-                    combined.push_str(&format!("General: {}\n", root.micro_summary));
-                } else {
-                    let p = self.specialized_summary_path(turn.turn_index, &domain);
-                    if p.exists() {
-                        let content = fs::read_to_string(&p)
-                            .await
-                            .context(format!(
-                                "Failed to read specialized summary: {}",
-                                p.display()
-                            ))?;
-                        let spec: SpecializedSummary = serde_json::from_str(&content)?;
-                        combined.push_str(&format!(
-                            "{}: {}\n",
-                            spec.domain, spec.extracted_information
-                        ));
+            // Selection logic for > 1 summary
+            let selected_domains = self
+                .select_relevant_domains(model.clone(), &root, latest_turn, sampling.clone())
+                .await?;
+            if selected_domains.is_empty()
+                || (selected_domains.len() == 1 && selected_domains[0] == "root")
+            {
+                (role_to_mistral(&turn.role), root.micro_summary.clone())
+            } else {
+                let mut combined = String::new();
+                for domain in selected_domains {
+                    if domain == "root" {
+                        combined.push_str(&format!("General: {}\n", root.micro_summary));
+                    } else {
+                        let p = self.specialized_summary_path(turn.turn_index, &domain);
+                        if p.exists() {
+                            let content = fs::read_to_string(&p)
+                                .await
+                                .context(format!(
+                                    "Failed to read specialized summary: {}",
+                                    p.display()
+                                ))?;
+                            let spec: SpecializedSummary = serde_json::from_str(&content)?;
+                            combined.push_str(&format!(
+                                "{}: {}\n",
+                                spec.domain, spec.extracted_information
+                            ));
+                        }
                     }
                 }
+                (role_to_mistral(&turn.role), combined)
             }
-            Ok((role_to_mistral(&turn.role), combined))
+        };
+
+        // Safety cap: never return a compression result longer than the
+        // original turn content.  Broken inference is better than an
+        // infinite context-growth loop.
+        if result.1.len() > turn.content.len() {
+            Ok(turn_to_mistral(turn))
+        } else {
+            Ok(result)
         }
     }
 
@@ -553,7 +621,10 @@ impl CompressionManager {
             .add_message(TextMessageRole::System, system_prompt)
             .add_message(TextMessageRole::User, prompt);
 
-        let req = RequestBuilder::from(messages).set_sampling(sampling);
+        let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
+            &sampling,
+            ROOT_SUMMARY_MAX_TOKENS,
+        ));
         let resp: ChatCompletionResponse =
             send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content;
@@ -598,7 +669,10 @@ impl CompressionManager {
             root.micro_summary, latest_turn
         );
         let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
-        let req = RequestBuilder::from(messages).set_sampling(sampling);
+        let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
+            &sampling,
+            SUFFICIENCY_CHECK_MAX_TOKENS,
+        ));
         let resp: ChatCompletionResponse =
             send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content = resp.choices[0]
@@ -622,7 +696,10 @@ impl CompressionManager {
             turn.content, latest_turn
         );
         let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
-        let req = RequestBuilder::from(messages).set_sampling(sampling);
+        let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
+            &sampling,
+            SPECIALIZED_SUMMARY_MAX_TOKENS,
+        ));
         let resp: ChatCompletionResponse =
             send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let empty = &String::new();
@@ -651,7 +728,10 @@ impl CompressionManager {
             domains, latest_turn
         );
         let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
-        let req = RequestBuilder::from(messages).set_sampling(sampling);
+        let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
+            &sampling,
+            DOMAIN_SELECTION_MAX_TOKENS,
+        ));
         let resp: ChatCompletionResponse =
             send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content = resp.choices[0]
@@ -703,13 +783,22 @@ async fn send_chat_request_with_retry(
     model: &Model,
     req: RequestBuilder,
     max_retries: u32,
-    delay: Duration,
+    base_delay: Duration,
 ) -> Result<ChatCompletionResponse> {
     let mut remaining = max_retries;
     loop {
         match model.send_chat_request(req.clone()).await {
             Ok(resp) => return Ok(resp),
-            Err(_e) if remaining > 0 => {
+            Err(e) if remaining > 0 => {
+                let attempt = max_retries - remaining;
+                let delay = base_delay * 2u32.pow(attempt);
+                eprintln!(
+                    "compression: LLM request failed (attempt {}/{}, retrying in {:?}): {:?}",
+                    attempt + 1,
+                    max_retries + 1,
+                    delay,
+                    e
+                );
                 remaining -= 1;
                 tokio::time::sleep(delay).await;
             }
