@@ -793,6 +793,7 @@ async fn run_inference(
         let mut accumulated_content = String::new();
         let mut current_tool_calls = Vec::new();
         let mut remaining_retries = retry_limit;
+        let mut empty_retry_count: u32 = 0;
         let mut oom_recompression_needed = false;
 
         // Retry loop: wraps the streaming inference call so that
@@ -944,26 +945,40 @@ async fn run_inference(
                             remaining_retries
                         ))
                         .await;
+                    if remaining_retries > 0 {
+                        let attempt = retry_limit - remaining_retries;
+                        let delay = retry_delay * 2u32.pow(attempt as u32);
+                        remaining_retries -= 1;
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    // All retries exhausted — write whatever partial content
+                    // we have as best-effort fallback.
+                    logger
+                        .log("All retries exhausted on incomplete stream; writing partial output")
+                        .await;
                 } else {
+                    // Empty response — the model streamed nothing at all.
+                    // Common for Qwen3.5/Gemma models that emit empty
+                    // chunks before real tokens, or concurrent mistralrs
+                    // streams that return empty for non-active inferers.
+                    // Retry indefinitely with exponential backoff capped
+                    // at 60s so we don't spin forever on a real error.
+                    const MAX_EMPTY_RETRY_DELAY_MS: u64 = 60_000;
+                    let delay_ms = (retry_delay.as_millis() as u64)
+                        .saturating_mul(2u64.pow(empty_retry_count))
+                        .min(MAX_EMPTY_RETRY_DELAY_MS);
+                    empty_retry_count += 1;
                     logger
                         .log(&format!(
-                            "Stream produced no content at all (retries left: {})",
-                            remaining_retries
+                            "Empty response (attempt {}); retrying in {}ms",
+                            empty_retry_count,
+                            delay_ms
                         ))
                         .await;
-                }
-                if remaining_retries > 0 {
-                    let attempt = retry_limit - remaining_retries;
-                    let delay = retry_delay * 2u32.pow(attempt as u32);
-                    remaining_retries -= 1;
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     continue;
                 }
-                // All retries exhausted — write whatever partial content
-                // we have as best-effort fallback.
-                logger
-                    .log("All retries exhausted on incomplete stream; writing partial output")
-                    .await;
             }
 
             // Streaming completed cleanly for this attempt
