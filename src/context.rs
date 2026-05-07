@@ -179,7 +179,17 @@ impl CompressionManager {
         let mut included_domains = Vec::new();
         let mut included_turn_indices = Vec::new();
 
+        // Cap the metasummary prompt to avoid exceeding the model's context
+        // window. Each root summary is up to 256 chars, domain summaries
+        // similar — with 100+ turns this can blow past 262K tokens.
+        const METASUMMARY_PROMPT_CHAR_LIMIT: usize = 64_000;
+        let mut turns_truncated = false;
+
         for turn in turns {
+            if summary_text.len() >= METASUMMARY_PROMPT_CHAR_LIMIT {
+                turns_truncated = true;
+                break;
+            }
             // Never fold excluded turns into a metasummary
             if turn.excluded_from_compression {
                 continue;
@@ -228,9 +238,14 @@ impl CompressionManager {
         }
 
         let system_prompt = "You are a context archivist. Summarize a series of conversation summaries into a single metasummary. Deduplicate repeated information. Mention all domains/topics covered. Include the turn indices of important turns the model may want to reread. Output ONLY valid JSON with 'content' (string), 'included_domains' (array of strings), and 'included_turn_indices' (array of integers) fields.";
+        let truncation_note = if turns_truncated {
+            "\n(Note: older historical turns were truncated to stay within the context window.)\n"
+        } else {
+            ""
+        };
         let prompt = format!(
-            "Latest turn context: {}\n\nHistorical summaries to collate:\n{}\n\nProduce a concise metasummary that captures all unique information.",
-            latest_turn, summary_text
+            "Latest turn context: {}\n\nHistorical summaries to collate:{}\n{}\n\nProduce a concise metasummary that captures all unique information.",
+            latest_turn, truncation_note, summary_text
         );
 
         let messages = TextMessages::new()
@@ -259,7 +274,8 @@ impl CompressionManager {
                     }
                 },
                 "required": ["content", "included_domains", "included_turn_indices"]
-            })));
+            })))
+            .with_truncate_sequence(true);
         let resp: ChatCompletionResponse =
             send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content = resp.choices[0]
@@ -600,7 +616,11 @@ impl CompressionManager {
 
         let mut context_text = String::new();
         for t in window {
-            context_text.push_str(&format!("{}: {}\n", role_to_mistral(&t.role), t.content));
+            // Cap per-turn content in the summarization prompt to avoid
+            // blowing past the model's context window with huge agent outputs.
+            let preview: String = t.content.chars().take(4096).collect();
+            let truncated = if t.content.len() > 4096 { " [truncated]" } else { "" };
+            context_text.push_str(&format!("{}: {}{}\n", role_to_mistral(&t.role), preview, truncated));
         }
 
         let mut system_prompt = "You are a concise summarizer. Output ONLY valid JSON with 'title' and 'micro_summary' fields.".to_string();
@@ -624,7 +644,8 @@ impl CompressionManager {
         let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
             &sampling,
             ROOT_SUMMARY_MAX_TOKENS,
-        ));
+        ))
+        .with_truncate_sequence(true);
         let resp: ChatCompletionResponse =
             send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content;
@@ -672,7 +693,8 @@ impl CompressionManager {
         let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
             &sampling,
             SUFFICIENCY_CHECK_MAX_TOKENS,
-        ));
+        ))
+        .with_truncate_sequence(true);
         let resp: ChatCompletionResponse =
             send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content = resp.choices[0]
@@ -699,7 +721,8 @@ impl CompressionManager {
         let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
             &sampling,
             SPECIALIZED_SUMMARY_MAX_TOKENS,
-        ));
+        ))
+        .with_truncate_sequence(true);
         let resp: ChatCompletionResponse =
             send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let empty = &String::new();
@@ -731,7 +754,8 @@ impl CompressionManager {
         let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
             &sampling,
             DOMAIN_SELECTION_MAX_TOKENS,
-        ));
+        ))
+        .with_truncate_sequence(true);
         let resp: ChatCompletionResponse =
             send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
         let content = resp.choices[0]
