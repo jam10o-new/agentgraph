@@ -1,4 +1,4 @@
-use agentgraph::config::{Config, AgentConfig};
+use agentgraph::config::{Config, AgentConfig, SamplingConfig, CompressionConfig};
 use agentgraph::leader::Leader;
 use agentgraph::ipc::Command;
 use agentgraph::find_leader_socket;
@@ -50,32 +50,99 @@ enum Commands {
         /// Input directories (comma separated)
         #[arg(short, long, value_delimiter = ',')]
         inputs: Vec<String>,
-        /// Output directory
+        /// Output directory (accepts single value; use --outputs for multiple)
         #[arg(short, long)]
         output: Option<String>,
+        /// Additional output directories (comma separated)
+        #[arg(long, value_delimiter = ',')]
+        outputs: Vec<String>,
         /// System prompt directories (comma separated)
         #[arg(short, long, value_delimiter = ',')]
         system: Vec<String>,
         /// Model alias to use
         #[arg(short, long, default_value = "primary")]
         model: String,
-        /// History limit (latest N)
+        /// History limit (latest N turns)
         #[arg(short, long)]
         limit: Option<usize>,
-    /// Optional streaming output directory
-    #[arg(short, long)]
-    stream_output: Option<String>,
+        /// Optional streaming output directory
+        #[arg(long)]
+        stream_output: Option<String>,
         /// Optional tool output directory
         #[arg(long)]
         tool_output: Option<String>,
-        /// When set, tool call content is hidden from output (consumed).
-        /// When not set (default), tool call details are written to the
-        /// output file for downstream agents to see.
+        /// When set, tool call content is hidden from output (consumed)
         #[arg(long, default_value_t = false)]
         consume_tool_calls: bool,
-        /// Extra system prompt
+        /// Extra system prompt text
         #[arg(short, long)]
         prompt: Option<String>,
+
+        // ── Sampling ──────────────────────────────────────────────
+        /// Temperature (0.0–2.0)
+        #[arg(long)]
+        temperature: Option<f64>,
+        /// Top-p nucleus sampling
+        #[arg(long)]
+        top_p: Option<f64>,
+        /// Top-k sampling
+        #[arg(long)]
+        top_k: Option<usize>,
+        /// Min-p sampling
+        #[arg(long)]
+        min_p: Option<f64>,
+        /// Repetition penalty
+        #[arg(long)]
+        repetition_penalty: Option<f32>,
+        /// Frequency penalty
+        #[arg(long)]
+        frequency_penalty: Option<f32>,
+        /// Presence penalty
+        #[arg(long)]
+        presence_penalty: Option<f32>,
+        /// Maximum output tokens (None = model default)
+        #[arg(long)]
+        max_len: Option<usize>,
+
+        // ── Compression ───────────────────────────────────────────
+        /// Compression threshold (0.0–1.0, default 0.5)
+        #[arg(long)]
+        compression_threshold: Option<f64>,
+        /// Compression inverse probability (default 0.9)
+        #[arg(long)]
+        compression_inverse_prob: Option<f64>,
+        /// Compression resummarize probability (default 0.1)
+        #[arg(long)]
+        compression_resummarize_prob: Option<f64>,
+
+        // ── Other AgentConfig fields ──────────────────────────────
+        /// Context checkpoint limit (char count before metasummary)
+        #[arg(long)]
+        context_checkpoint_limit: Option<usize>,
+        /// Directories excluded from summarization (comma separated)
+        #[arg(long, value_delimiter = ',')]
+        excluded_from_summary: Vec<String>,
+        /// Allowed file extensions for input (comma separated)
+        #[arg(long, value_delimiter = ',')]
+        allowed_extensions: Vec<String>,
+        /// Enable realtime audio
+        #[arg(long)]
+        realtime_audio: bool,
+        /// Enable tool usage (default true)
+        #[arg(long, default_value_t = true)]
+        tools_enabled: bool,
+        /// Enable extended thinking / chain-of-thought
+        #[arg(long)]
+        enable_thinking: bool,
+        /// Number of inference retries on error (default 3)
+        #[arg(long)]
+        inference_retries: Option<u32>,
+        /// Delay between inference retries in ms (default 500)
+        #[arg(long)]
+        inference_retry_delay_ms: Option<u64>,
+        /// Enable OOM recovery via aggressive recompression (default true)
+        #[arg(long, default_value_t = true)]
+        enable_oom_recovery: bool,
     },
     /// Print the full version string (including git commit hash)
     Version,
@@ -131,28 +198,56 @@ async fn main() -> Result<()> {
                 Commands::Run { agent, message } => Command::RunAgent(agent, message),
                 Commands::Stop { agent } => Command::StopAgent(agent),
                 Commands::Reload => Command::ReloadConfig,
-                Commands::Spawn { name, inputs, output, stream_output, tool_output, consume_tool_calls, system, model, limit, prompt, .. } => {
+                Commands::Spawn {
+                    name, inputs, output, outputs,
+                    stream_output, tool_output, consume_tool_calls,
+                    system, model, limit, prompt,
+                    temperature, top_p, top_k, min_p,
+                    repetition_penalty, frequency_penalty, presence_penalty, max_len,
+                    compression_threshold, compression_inverse_prob, compression_resummarize_prob,
+                    context_checkpoint_limit, excluded_from_summary,
+                    allowed_extensions, realtime_audio,
+                    tools_enabled, enable_thinking,
+                    inference_retries, inference_retry_delay_ms,
+                    enable_oom_recovery,
+                    ..  // future-proof
+                } => {
+                    let mut output_dirs = output.map(|s| vec![s]).unwrap_or_default();
+                    output_dirs.extend(outputs);
                     let config = AgentConfig {
                         inputs,
-                        output: output.map(|s| vec![s]).unwrap_or_default(),
+                        output: output_dirs,
                         stream_output,
                         tool_output,
                         consume_tool_calls,
                         system,
                         model,
                         history_limit: limit,
-                        allowed_extensions: vec![],
-                        realtime_audio: false,
+                        realtime_audio,
+                        allowed_extensions,
                         prompt,
-                        sampling: Default::default(),
-                        compression: Default::default(),
-                        context_checkpoint_limit: None,
-                        excluded_from_summary: Vec::new(),
-                        tools_enabled: true,
-                        enable_thinking: false,
-                        inference_retries: 3,
-                        enable_oom_recovery: true,
-                        inference_retry_delay_ms: 500,
+                        sampling: SamplingConfig {
+                            temperature,
+                            top_p,
+                            top_k,
+                            min_p,
+                            repetition_penalty,
+                            frequency_penalty,
+                            presence_penalty,
+                            max_len,
+                        },
+                        compression: CompressionConfig {
+                            threshold: compression_threshold.unwrap_or(0.5),
+                            inverse_probability: compression_inverse_prob.unwrap_or(0.9),
+                            resummarize_probability: compression_resummarize_prob.unwrap_or(0.1),
+                        },
+                        context_checkpoint_limit,
+                        excluded_from_summary,
+                        tools_enabled,
+                        enable_thinking,
+                        inference_retries: inference_retries.unwrap_or(3),
+                        inference_retry_delay_ms: inference_retry_delay_ms.unwrap_or(500),
+                        enable_oom_recovery,
                     };
                     Command::SpawnAgent { name, config }
                 }
