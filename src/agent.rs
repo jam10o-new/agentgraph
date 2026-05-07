@@ -246,42 +246,67 @@ fn looks_like_oom(err_str: &str) -> bool {
         || lower.contains("memory exhausted")
 }
 
-/// Parsed output schema from a `.schema-{format}.{ext}` file in the
-/// system directory. The file content is a JSON schema used for
-/// llguidance constrained decoding.
+/// Parsed output schema from a `.schema-{format}.{ext}[@{constraint}]`
+/// file in the system directory. The `{ext}` is the output file extension.
+/// The optional `@{constraint}` suffix overrides the constraint type:
+///
+/// | Constraint | Meaning                |
+/// |------------|------------------------|
+/// | `json`     | `Constraint::JsonSchema` (default for .json) |
+/// | `lark`     | `Constraint::Lark`     |
+/// | `regex`    | `Constraint::Regex`    |
+/// | `llg`      | `Constraint::Llguidance` |
+///
+/// Examples:
+/// - `.schema-rating.json` → JsonSchema, output `rating_N.json`
+/// - `.schema-log.txt@regex` → Regex, output `log_N.txt`
+/// - `.schema-story.txt@lark` → Lark grammar, output `story_N.txt`
 #[derive(Clone)]
 struct OutputSchema {
     format_str: String,
     extension: String,
-    schema: serde_json::Value,
+    constraint: Constraint,
 }
 
-impl OutputSchema {
-    /// Try to parse a `.schema-*` filename. Returns `Some` with the
-    /// parsed format string and extension, or `None` if it doesn't match.
-    fn try_parse(filename: &str) -> Option<ParsedSchemaName> {
+/// Intermediate parse result before reading the file content.
+struct ParsedSchemaName {
+    format_str: String,
+    extension: String,
+    constraint_hint: Option<String>,
+}
+
+impl ParsedSchemaName {
+    fn try_parse(filename: &str) -> Option<Self> {
         let name = filename.strip_prefix(".schema-")?;
-        // Split on the LAST dot to get extension
+        // Split on the LAST dot to get the extension (and optional @constraint)
         let dot_pos = name.rfind('.')?;
-        let format_str = &name[..dot_pos];
-        let extension = &name[dot_pos + 1..];
-        if format_str.is_empty() || extension.is_empty() {
+        let format_and_ext = &name[..dot_pos];
+        let ext_and_hint = &name[dot_pos + 1..];
+
+        let (extension, constraint_hint) = if let Some(at_pos) = ext_and_hint.find('@') {
+            (
+                ext_and_hint[..at_pos].to_string(),
+                Some(ext_and_hint[at_pos + 1..].to_string()),
+            )
+        } else {
+            (ext_and_hint.to_string(), None)
+        };
+
+        if format_and_ext.is_empty() || extension.is_empty() {
             return None;
         }
         Some(ParsedSchemaName {
-            format_str: format_str.to_string(),
-            extension: extension.to_string(),
+            format_str: format_and_ext.to_string(),
+            extension,
+            constraint_hint,
         })
     }
+}
 
+impl OutputSchema {
     /// Build the output filename from the format string, replacing
     /// `{timestamp}` with the epoch millis and `{turn}` with the
     /// auto-incremented turn counter (based on existing files).
-    #[allow(dead_code)]
-    fn filename_pattern(&self) -> String {
-        format!(".schema-{}.{}", self.format_str, self.extension)
-    }
-
     fn build_filename(&self, output_dir: &str, timestamp: u128) -> String {
         let turn = count_matching_files(output_dir, &self.format_str, &self.extension);
         let name = self
@@ -290,12 +315,6 @@ impl OutputSchema {
             .replace("{turn}", &turn.to_string());
         format!("{}.{}", name, self.extension)
     }
-}
-
-/// Intermediate parse result before reading the file content.
-struct ParsedSchemaName {
-    format_str: String,
-    extension: String,
 }
 
 /// Count files in a directory whose names match the pattern after
@@ -349,17 +368,31 @@ async fn run_inference(
                 let file_name = entry.file_name();
                 let name_str = file_name.to_string_lossy();
                 // Check for schema files before the hidden-file skip
-                if let Some(schema) = OutputSchema::try_parse(&name_str) {
+                if let Some(parsed) = ParsedSchemaName::try_parse(&name_str) {
                     if let Ok(content) = fs::read_to_string(entry.path()).await {
-                        if let Ok(schema_value) = serde_json::from_str::<serde_json::Value>(&content) {
+                        let constraint_type = parsed.constraint_hint.as_deref()
+                            .unwrap_or_else(|| {
+                                // Default: JsonSchema for .json, nothing otherwise
+                                if parsed.extension == "json" { "json" } else { "" }
+                            });
+                        let constraint = match constraint_type {
+                            "json" => serde_json::from_str::<serde_json::Value>(&content)
+                                .map(Constraint::JsonSchema),
+                            "lark" => Ok(Constraint::Lark(content)),
+                            "regex" => Ok(Constraint::Regex(content)),
+                            "llg" => serde_json::from_str(&content)
+                                .map(Constraint::Llguidance),
+                            _ => continue, // unknown or no default, skip
+                        };
+                        if let Ok(c) = constraint {
                             logger.log(&format!(
-                                "Loaded output schema: .schema-{}.{} (llguidance constrained)",
-                                schema.format_str, schema.extension
+                                "Loaded output schema: .schema-{}.{}",
+                                parsed.format_str, parsed.extension
                             )).await;
                             output_schema = Some(OutputSchema {
-                                format_str: schema.format_str,
-                                extension: schema.extension,
-                                schema: schema_value,
+                                format_str: parsed.format_str,
+                                extension: parsed.extension,
+                                constraint: c,
                             });
                         }
                     }
@@ -831,7 +864,7 @@ async fn run_inference(
         .set_tools(tools.clone())
         .set_tool_choice(ToolChoice::Auto);
     if let Some(ref schema) = output_schema {
-        request = request.set_constraint(Constraint::JsonSchema(schema.schema.clone()));
+        request = request.set_constraint(schema.constraint.clone());
     }
 
     let retry_limit = config.inference_retries;
