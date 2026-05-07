@@ -962,21 +962,14 @@ async fn run_inference(
                     // Common for Qwen3.5/Gemma models that emit empty
                     // chunks before real tokens, or concurrent mistralrs
                     // streams that return empty for non-active inferers.
-                    // Retry indefinitely with exponential backoff capped
-                    // at 60s so we don't spin forever on a real error.
-                    const MAX_EMPTY_RETRY_DELAY_MS: u64 = 60_000;
-                    let delay_ms = (retry_delay.as_millis() as u64)
-                        .saturating_mul(2u64.pow(empty_retry_count))
-                        .min(MAX_EMPTY_RETRY_DELAY_MS);
+                    // Retry immediately — this is not an error condition.
                     empty_retry_count += 1;
                     logger
                         .log(&format!(
-                            "Empty response (attempt {}); retrying in {}ms",
+                            "Empty response (attempt {}); retrying immediately",
                             empty_retry_count,
-                            delay_ms
                         ))
                         .await;
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     continue;
                 }
             }
