@@ -691,6 +691,10 @@ async fn run_inference(
     }
 
     let tools = if config.tools_enabled {
+        if output_schema.is_some() {
+            logger.log("Tools disabled — schema constraint is active (tools conflict with llguidance)").await;
+            vec![]
+        } else {
         vec![
             Tool {
                 tp: ToolType::Function,
@@ -808,7 +812,8 @@ async fn run_inference(
                 },
             },
         ]
-    } else {
+    }
+} else {
         vec![]
     };
 
