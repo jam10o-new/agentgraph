@@ -171,6 +171,9 @@ impl Agent {
                 }
                 _ = inference_done_rx.recv() => {
                     inference_in_progress = false;
+                    // Yield so other agents get a chance to submit
+                    // requests to the engine queue before we retrigger.
+                    tokio::task::yield_now().await;
                     if retrigger_pending {
                         // New input arrived during the previous turn.
                         // Start a fresh inference immediately.
