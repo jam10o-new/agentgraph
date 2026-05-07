@@ -6,8 +6,8 @@ use crate::ipc::Command;
 use crate::utils::AgentLogger;
 use anyhow::{Context, Result, anyhow};
 use mistralrs::{
-    Function, Model, MultimodalMessages, RequestBuilder, Response, SamplingParams, TextMessageRole,
-    Tool, ToolCallResponse, ToolChoice, ToolType,
+    Constraint, Function, Model, MultimodalMessages, RequestBuilder, Response, SamplingParams,
+    TextMessageRole, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 use notify::{Event, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
@@ -246,6 +246,85 @@ fn looks_like_oom(err_str: &str) -> bool {
         || lower.contains("memory exhausted")
 }
 
+/// Parsed output schema from a `.schema-{format}.{ext}` file in the
+/// system directory. The file content is a JSON schema used for
+/// llguidance constrained decoding.
+#[derive(Clone)]
+struct OutputSchema {
+    format_str: String,
+    extension: String,
+    schema: serde_json::Value,
+}
+
+impl OutputSchema {
+    /// Try to parse a `.schema-*` filename. Returns `Some` with the
+    /// parsed format string and extension, or `None` if it doesn't match.
+    fn try_parse(filename: &str) -> Option<ParsedSchemaName> {
+        let name = filename.strip_prefix(".schema-")?;
+        // Split on the LAST dot to get extension
+        let dot_pos = name.rfind('.')?;
+        let format_str = &name[..dot_pos];
+        let extension = &name[dot_pos + 1..];
+        if format_str.is_empty() || extension.is_empty() {
+            return None;
+        }
+        Some(ParsedSchemaName {
+            format_str: format_str.to_string(),
+            extension: extension.to_string(),
+        })
+    }
+
+    /// Build the output filename from the format string, replacing
+    /// `{timestamp}` with the epoch millis and `{turn}` with the
+    /// auto-incremented turn counter (based on existing files).
+    #[allow(dead_code)]
+    fn filename_pattern(&self) -> String {
+        format!(".schema-{}.{}", self.format_str, self.extension)
+    }
+
+    fn build_filename(&self, output_dir: &str, timestamp: u128) -> String {
+        let turn = count_matching_files(output_dir, &self.format_str, &self.extension);
+        let name = self
+            .format_str
+            .replace("{timestamp}", &timestamp.to_string())
+            .replace("{turn}", &turn.to_string());
+        format!("{}.{}", name, self.extension)
+    }
+}
+
+/// Intermediate parse result before reading the file content.
+struct ParsedSchemaName {
+    format_str: String,
+    extension: String,
+}
+
+/// Count files in a directory whose names match the pattern after
+/// variable substitution (ignoring `{timestamp}` and `{turn}` — we
+/// count by prefix/suffix to determine the next turn number).
+fn count_matching_files(dir: &str, format_str: &str, extension: &str) -> usize {
+    let dir_path = std::path::Path::new(dir);
+    if !dir_path.exists() {
+        return 0;
+    }
+    // Build a prefix to match: everything before the first variable
+    let prefix = format_str
+        .split(&['{', '}'][..])
+        .next()
+        .unwrap_or("");
+    let suffix = format!(".{}", extension);
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir(dir_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(prefix) && name_str.ends_with(&suffix) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 async fn run_inference(
     _name: String,
     model: Arc<Model>,
@@ -259,12 +338,33 @@ async fn run_inference(
 
     // 1. Collate System Prompts
     let mut system_content = String::new();
+    // Schema-driven output: if a .schema-{format}.{ext} file exists in the
+    // system directory, use llguidance constrained decoding and a custom
+    // output filename pattern instead of the default out-{timestamp}.txt.
+    let mut output_schema: Option<OutputSchema> = None;
     for sys_dir in &config.system {
         if let Ok(mut entries) = fs::read_dir(sys_dir).await {
             let mut files = Vec::new();
             while let Some(entry) = entries.next_entry().await? {
                 let file_name = entry.file_name();
                 let name_str = file_name.to_string_lossy();
+                // Check for schema files before the hidden-file skip
+                if let Some(schema) = OutputSchema::try_parse(&name_str) {
+                    if let Ok(content) = fs::read_to_string(entry.path()).await {
+                        if let Ok(schema_value) = serde_json::from_str::<serde_json::Value>(&content) {
+                            logger.log(&format!(
+                                "Loaded output schema: .schema-{}.{} (llguidance constrained)",
+                                schema.format_str, schema.extension
+                            )).await;
+                            output_schema = Some(OutputSchema {
+                                format_str: schema.format_str,
+                                extension: schema.extension,
+                                schema: schema_value,
+                            });
+                        }
+                    }
+                    continue; // don't load as system prompt
+                }
                 // Skip hidden files (e.g. tool definitions written by agentgraph)
                 if name_str.starts_with('.') {
                     continue;
@@ -695,7 +795,11 @@ async fn run_inference(
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
     let output_file_path: Option<PathBuf> = config.output.first().map(|o| {
-        PathBuf::from(o).join(format!("out-{}.txt", timestamp))
+        if let Some(ref schema) = output_schema {
+            PathBuf::from(o).join(schema.build_filename(o, timestamp))
+        } else {
+            PathBuf::from(o).join(format!("out-{}.txt", timestamp))
+        }
     });
 
     let mut stream_file = if let Some(ref stream_dir) = config.stream_output {
@@ -726,6 +830,9 @@ async fn run_inference(
         .set_sampling(sampling.clone())
         .set_tools(tools.clone())
         .set_tool_choice(ToolChoice::Auto);
+    if let Some(ref schema) = output_schema {
+        request = request.set_constraint(Constraint::JsonSchema(schema.schema.clone()));
+    }
 
     let retry_limit = config.inference_retries;
     let retry_delay = Duration::from_millis(config.inference_retry_delay_ms);
@@ -990,7 +1097,9 @@ async fn run_inference(
         // raw structured output. Tool call deltas are deduplicated by ID
         // (the last occurrence per ID carries the completed state).
         let mut output_content = accumulated_content.clone();
-        if !config.consume_tool_calls && !current_tool_calls.is_empty() {
+        // Skip tool-call appending when using a schema — constrained
+        // output is expected to be the complete, valid response.
+        if !config.consume_tool_calls && !current_tool_calls.is_empty() && output_schema.is_none() {
             let mut seen_ids: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             let mut deduped: Vec<&ToolCallResponse> = Vec::new();
