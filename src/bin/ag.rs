@@ -1,11 +1,13 @@
 use agentgraph::config::{Config, AgentConfig, SamplingConfig, CompressionConfig};
 use agentgraph::leader::Leader;
 use agentgraph::ipc::Command;
-use agentgraph::find_leader_socket;
+use agentgraph::{is_leader_alive};
 use clap::{Parser, Subcommand};
 use anyhow::{Result, anyhow};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::UnixStream;
+use tokio::time::timeout;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -170,7 +172,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Leader { config, .. } => {
-            if find_leader_socket().await.is_some() {
+            let (alive, _) = is_leader_alive().await;
+            if alive {
                 let config_obj = Config::load(&config)?;
                 let cmd = Command::UpdateConfig(config_obj);
                 send_command(cmd).await?;
@@ -183,17 +186,19 @@ async fn main() -> Result<()> {
             println!("{}", agentgraph::version());
         }
         Commands::Status => {
-            if find_leader_socket().await.is_none() {
+            let (alive, _) = is_leader_alive().await;
+            if !alive {
                 println!("No leader is present.");
             } else {
                 send_command(Command::Status).await?;
             }
         }
         Commands::Shutdown => {
-            if find_leader_socket().await.is_some() {
-                send_command(Command::Shutdown).await?;
-            } else {
+            let (alive, _) = is_leader_alive().await;
+            if !alive {
                 println!("No leader is present.");
+            } else {
+                send_command(Command::Shutdown).await?;
             }
         }
         _ => {
@@ -292,27 +297,60 @@ fn spawn_background_leader(config_path: &str, pending_command: Option<&str>) -> 
 }
 
 async fn ensure_leader() -> Result<()> {
-    if find_leader_socket().await.is_none() {
+    let (alive, _) = is_leader_alive().await;
+    if !alive {
         spawn_background_leader("config.yaml", None)?;
-        // Wait a bit for it to start
-        for _ in 0..300 {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if find_leader_socket().await.is_some() {
+        // Wait for leader to become ready (up to 90 s for model loading)
+        for _ in 0..450 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let (a, _) = is_leader_alive().await;
+            if a {
                 return Ok(());
             }
         }
-        return Err(anyhow!("Failed to start leader in background within 60s"));
+        return Err(anyhow!(
+            "Failed to start leader in background within 90s. \
+             Check `/tmp/agentgraph/leader.log` for errors."
+        ));
     }
     Ok(())
 }
 
 async fn send_command(cmd: Command) -> Result<()> {
-    let max_retries = 2;
+    let max_retries = 3;
     for attempt in 0..=max_retries {
-        let socket_path = find_leader_socket()
-            .await
-            .ok_or_else(|| anyhow!("Leader not found. Is it running?"))?;
-        let mut stream = UnixStream::connect(socket_path).await?;
+        let (alive, socket_opt) = is_leader_alive().await;
+        let socket_path = match socket_opt {
+            Some(p) => p,
+            None => {
+                if alive {
+                    // Leader is alive by /proc scan but no socket — may be
+                    // starting up or under extreme load.  Retry.
+                    if attempt < max_retries {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "Leader process detected but IPC socket not found. \
+                         Check `/tmp/agentgraph/leader.log` and `/proc` for \
+                         running `ag` processes."
+                    ));
+                }
+                return Err(anyhow!("Leader not found. Is `ag leader` running?"));
+            }
+        };
+
+        let mut stream = match UnixStream::connect(&socket_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                if attempt < max_retries {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    continue;
+                }
+                return Err(anyhow!("Failed to connect to leader socket: {}", e));
+            }
+        };
+
         let payload = serde_json::to_vec(&cmd)?;
         stream.write_all(&payload).await?;
         stream.flush().await?;
@@ -321,14 +359,20 @@ async fn send_command(cmd: Command) -> Result<()> {
         stream.shutdown().await?;
 
         let mut resp = String::new();
-        if stream.read_to_string(&mut resp).await.is_err() {
-            // Leader closed connection (possibly restarting).
-            // Wait and retry.
-            if attempt < max_retries {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                continue;
+        // Timeout the read: if the leader is busy with inference it may
+        // take a while to respond.  30 s is generous for any IPC command.
+        match timeout(Duration::from_secs(30), stream.read_to_string(&mut resp)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => {
+                if attempt < max_retries {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    continue;
+                }
+                return Err(anyhow!(
+                    "Leader connection timed out (30s). The leader may be \
+                     under heavy inference load. Check `/tmp/agentgraph/leader.log`."
+                ));
             }
-            return Err(anyhow!("Leader connection lost and failed to recover"));
         }
 
         let resp = resp.trim().to_string();
@@ -337,14 +381,15 @@ async fn send_command(cmd: Command) -> Result<()> {
             // Wait for new leader and retry.
             if attempt < max_retries {
                 for _ in 0..100 {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    if find_leader_socket().await.is_some() {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let (a, _) = is_leader_alive().await;
+                    if a {
                         break;
                     }
                 }
                 continue;
             }
-            return Err(anyhow!("Leader restart timed out"));
+            return Err(anyhow!("Leader restart timed out after {} attempts", max_retries));
         }
 
         println!("{}", resp);

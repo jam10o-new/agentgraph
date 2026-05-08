@@ -2,7 +2,7 @@ use crate::config::{Config, AgentConfig};
 use crate::model_loader::load_models;
 use crate::agent::Agent;
 use crate::ipc::Command;
-use crate::utils::find_leader_socket;
+use crate::utils::{is_leader_alive, LEADER_PID_FILE};
 use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -126,18 +126,19 @@ impl Leader {
     }
 
     /// Prepare a leader restart with the new binary. Writes `cmd` to a
-    /// temporary file, removes our socket, and spawns the new leader.
+    /// temporary file and spawns the new leader.  The old socket is left
+    /// in place — `find_leader_socket()` handles stale cleanup via the
+    /// `/proc/{pid}` liveness check.  The PID file is removed so the new
+    /// leader can claim it.
     /// Does NOT exit — the caller should flush the IPC response and then
     /// call `std::process::exit(0)`.
     fn prepare_restart(&self, cmd: &Command) {
         let pending_dir = PathBuf::from("/tmp/agentgraph");
         let _ = std::fs::create_dir_all(&pending_dir);
 
-        // Remove our socket so find_leader_socket() won't see us
-        // as a living leader when the new process starts.
         let pid = std::process::id();
-        let socket_path = pending_dir.join(format!("ag-{}.sock", pid));
-        let _ = std::fs::remove_file(&socket_path);
+        // Remove PID file so the new leader can write a fresh one
+        let _ = std::fs::remove_file(LEADER_PID_FILE);
 
         let pending_path = pending_dir.join(format!(
             "pending_command_{}.json",
@@ -209,8 +210,24 @@ impl Leader {
 
     pub async fn run(self, pending_command_path: Option<String>) -> Result<()> {
         // 1. Ensure Leader Uniqueness
-        if let Some(socket) = find_leader_socket().await {
-            return Err(anyhow!("Another leader is already running (socket: {:?})", socket));
+        let (alive, socket) = is_leader_alive().await;
+        if alive {
+            return Err(anyhow!(
+                "Another leader is already running (detected via {:?}). \
+                 Socket: {:?}",
+                if socket.is_some() { "socket" } else { "process scan" },
+                socket
+            ));
+        }
+
+        // Write PID file for multi-tier process detection
+        let pid = std::process::id();
+        let pid_file = std::path::Path::new(LEADER_PID_FILE);
+        if let Some(parent) = pid_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(pid_file, pid.to_string()) {
+            eprintln!("Warning: failed to write leader PID file: {}", e);
         }
 
         // 2. Initial agents from config
@@ -433,6 +450,7 @@ Command::RunAgent(name, message, quiet) => {
 
         tokio::signal::ctrl_c().await?;
         println!("Shutting down...");
+        let _ = std::fs::remove_file(LEADER_PID_FILE);
         Ok(())
     }
 }

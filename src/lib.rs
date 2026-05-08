@@ -12,7 +12,7 @@ pub mod api;
 pub use config::Config;
 pub use leader::Leader;
 pub use agent::Agent;
-pub use utils::{find_leader_socket, AgentLogger};
+pub use utils::{find_leader_socket, is_leader_alive, AgentLogger, LEADER_PID_FILE};
 pub use ipc::Command;
 
 /// Full version string including git commit hash.
