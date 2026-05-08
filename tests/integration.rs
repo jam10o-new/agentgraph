@@ -14,7 +14,9 @@ async fn cleanup_sockets() {
 
 #[tokio::test]
 async fn test_leader_uniqueness_and_status() {
-    // 0. Aggressive cleanup before start
+    // 0. Remove leftover socket/PID files so the test starts clean.
+    //    Degraded leaders from other projects are harmless — the
+    //    test waits for its own leader to become Ready.
     cleanup_sockets().await;
 
     // 1. Create a dummy config

@@ -2,7 +2,7 @@ use crate::config::{Config, AgentConfig};
 use crate::model_loader::load_models;
 use crate::agent::Agent;
 use crate::ipc::Command;
-use crate::utils::{is_leader_alive, LEADER_PID_FILE};
+use crate::utils::{is_leader_alive, LeaderStatus, LEADER_PID_FILE};
 use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -210,14 +210,23 @@ impl Leader {
 
     pub async fn run(self, pending_command_path: Option<String>) -> Result<()> {
         // 1. Ensure Leader Uniqueness
-        let (alive, socket) = is_leader_alive().await;
-        if alive {
-            return Err(anyhow!(
-                "Another leader is already running (detected via {:?}). \
-                 Socket: {:?}",
-                if socket.is_some() { "socket" } else { "process scan" },
-                socket
-            ));
+        let status = is_leader_alive().await;
+        match status {
+            LeaderStatus::Ready { socket, pid } => {
+                return Err(anyhow!(
+                    "Another leader is already running (PID {}, socket: {:?})",
+                    pid, socket
+                ));
+            }
+            LeaderStatus::Degraded { pid } => {
+                return Err(anyhow!(
+                    "Another leader process is running (PID {}) but has no IPC socket. \
+                     The existing leader may be in a degraded state. \
+                     Check `/tmp/agentgraph/leader.log`. Kill PID {} manually if needed.",
+                    pid, pid
+                ));
+            }
+            LeaderStatus::NotRunning => {}
         }
 
         // Write PID file for multi-tier process detection
@@ -314,7 +323,7 @@ impl Leader {
             }
         }
 
-        // 5. IPC listener
+        // 5. IPC listener (self-healing: watchdog recreates socket if deleted)
         let pid = std::process::id();
         let pipe_path = PathBuf::from("/tmp/agentgraph").join(format!("ag-{}.sock", pid));
         let parent = pipe_path.parent().unwrap().to_path_buf();
@@ -322,22 +331,55 @@ impl Leader {
             .await
             .context(format!("Failed to create IPC socket dir: {}", parent.display()))?;
         let _ = tokio::fs::remove_file(&pipe_path).await;
-        let listener = UnixListener::bind(&pipe_path)?;
+        let initial_listener = UnixListener::bind(&pipe_path)?;
         println!("Leader PID {} listening on {:?}", pid, pipe_path);
+
+        // Shared listener that the watchdog can replace when the
+        // socket file is deleted externally (e.g. by cleanup scripts).
+        // Because connections are one-shot (no persistent IPC), dropping
+        // the old listener is safe — already-accepted handlers run in
+        // their own spawned tasks.
+        let listener_ref: Arc<Mutex<Option<UnixListener>>> =
+            Arc::new(Mutex::new(Some(initial_listener)));
+        let pipe_path_clone = pipe_path.clone();
 
         let agents = self.agents.clone();
         let model_opt = self.model.clone();
         let config_mutex = self.config.clone();
         let leader_for_ipc = Arc::new(self);
 
-        tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
+        // Accept loop — polls the shared listener; handles None (during
+        // socket recovery) by sleeping briefly and retrying.
+        tokio::spawn({
+            let listener_ref = listener_ref.clone();
+            async move {
+                loop {
+                    let accept_result = {
+                        let mut guard = listener_ref.lock().await;
+                        match guard.as_mut() {
+                            Some(listener) => listener.accept().await,
+                            None => {
+                                drop(guard);
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                continue;
+                            }
+                        }
+                    };
+
+                    let (mut stream, _) = match accept_result {
+                        Ok(v) => v,
+                        Err(_) => {
+                            // Listener likely closed during swap — retry
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+
                     let agents = agents.clone();
                     let model_opt = model_opt.clone();
                     let config_mutex = config_mutex.clone();
                     let leader = leader_for_ipc.clone();
-                    
+
                     tokio::spawn(async move {
                         let mut buf = Vec::new();
                         if let Ok(_) = stream.read_to_end(&mut buf).await {
@@ -444,6 +486,42 @@ Command::RunAgent(name, message, quiet) => {
                             }
                         }
                     });
+                }
+            }
+        });
+
+        // 6. Socket watchdog — periodically checks that the socket file
+        //    still exists on disk.  If it was deleted externally (cleanup
+        //    scripts, filesystem issues), rebind to recreate it.
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if !pipe_path_clone.exists() {
+                    // Take the old listener (closes fd), remove any
+                    // leftover socket inode, then rebind.
+                    let old = listener_ref.lock().await.take();
+                    drop(old);
+                    let _ = tokio::fs::remove_file(&pipe_path_clone).await;
+                    match UnixListener::bind(&pipe_path_clone) {
+                        Ok(new_listener) => {
+                            *listener_ref.lock().await = Some(new_listener);
+                            println!(
+                                "Socket recreated at {:?} (was deleted externally)",
+                                pipe_path_clone
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to recreate socket {:?}: {}",
+                                pipe_path_clone, e
+                            );
+                        }
+                    }
+                }
+                // Also ensure the PID file exists
+                let pid_file = std::path::Path::new(LEADER_PID_FILE);
+                if !pid_file.exists() {
+                    let _ = std::fs::write(pid_file, pid.to_string());
                 }
             }
         });

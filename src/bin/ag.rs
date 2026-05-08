@@ -1,7 +1,7 @@
 use agentgraph::config::{Config, AgentConfig, SamplingConfig, CompressionConfig};
 use agentgraph::leader::Leader;
 use agentgraph::ipc::Command;
-use agentgraph::{is_leader_alive};
+use agentgraph::{is_leader_alive, LeaderStatus};
 use clap::{Parser, Subcommand};
 use anyhow::{Result, anyhow};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -172,33 +172,64 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Leader { config, .. } => {
-            let (alive, _) = is_leader_alive().await;
-            if alive {
-                let config_obj = Config::load(&config)?;
-                let cmd = Command::UpdateConfig(config_obj);
-                send_command(cmd).await?;
-            } else {
-                spawn_background_leader(&config, None)?;
-                println!("Leader started in background. Logs: /tmp/agentgraph/leader.log");
+            match is_leader_alive().await {
+                LeaderStatus::Ready { .. } => {
+                    let config_obj = Config::load(&config)?;
+                    let cmd = Command::UpdateConfig(config_obj);
+                    send_command(cmd).await?;
+                }
+                LeaderStatus::Degraded { pid } => {
+                    eprintln!(
+                        "Leader process is running (PID {}) but has no IPC socket. \
+                         It may be loading models or in a degraded state. \
+                         Check /tmp/agentgraph/leader.log.",
+                        pid
+                    );
+                    std::process::exit(1);
+                }
+                LeaderStatus::NotRunning => {
+                    spawn_background_leader(&config, None)?;
+                    println!("Leader started in background. Logs: /tmp/agentgraph/leader.log");
+                }
             }
         }
         Commands::Version => {
             println!("{}", agentgraph::version());
         }
         Commands::Status => {
-            let (alive, _) = is_leader_alive().await;
-            if !alive {
-                println!("No leader is present.");
-            } else {
-                send_command(Command::Status).await?;
+            match is_leader_alive().await {
+                LeaderStatus::Ready { .. } => {
+                    send_command(Command::Status).await?;
+                }
+                LeaderStatus::Degraded { pid } => {
+                    println!(
+                        "Leader process detected (PID {}) but no IPC socket available. \
+                         It may still be loading models or is in a degraded state. \
+                         Check `/tmp/agentgraph/leader.log`.",
+                        pid
+                    );
+                }
+                LeaderStatus::NotRunning => {
+                    println!("No leader is present.");
+                }
             }
         }
         Commands::Shutdown => {
-            let (alive, _) = is_leader_alive().await;
-            if !alive {
-                println!("No leader is present.");
-            } else {
-                send_command(Command::Shutdown).await?;
+            match is_leader_alive().await {
+                LeaderStatus::Ready { .. } => {
+                    send_command(Command::Shutdown).await?;
+                }
+                LeaderStatus::Degraded { pid } => {
+                    eprintln!(
+                        "Leader process (PID {}) has no socket — cannot send shutdown. \
+                         Kill it manually with `kill {}` if needed.",
+                        pid, pid
+                    );
+                    std::process::exit(1);
+                }
+                LeaderStatus::NotRunning => {
+                    println!("No leader is present.");
+                }
             }
         }
         _ => {
@@ -297,46 +328,58 @@ fn spawn_background_leader(config_path: &str, pending_command: Option<&str>) -> 
 }
 
 async fn ensure_leader() -> Result<()> {
-    let (alive, _) = is_leader_alive().await;
-    if !alive {
-        spawn_background_leader("config.yaml", None)?;
-        // Wait for leader to become ready (up to 90 s for model loading)
-        for _ in 0..450 {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let (a, _) = is_leader_alive().await;
-            if a {
-                return Ok(());
-            }
+    match is_leader_alive().await {
+        LeaderStatus::Ready { .. } => return Ok(()),
+        LeaderStatus::Degraded { pid } => {
+            return Err(anyhow!(
+                "A leader process (PID {}) is running but has no IPC socket. \
+                 It may be loading models. Check `/tmp/agentgraph/leader.log`.",
+                pid
+            ));
         }
-        return Err(anyhow!(
-            "Failed to start leader in background within 90s. \
-             Check `/tmp/agentgraph/leader.log` for errors."
-        ));
+        LeaderStatus::NotRunning => {}
     }
-    Ok(())
+
+    spawn_background_leader("config.yaml", None)?;
+    // Wait for leader to become ready (up to 90 s for model loading)
+    for _ in 0..450 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        match is_leader_alive().await {
+            LeaderStatus::Ready { .. } => return Ok(()),
+            LeaderStatus::Degraded { .. } => {
+                // Process exists but no socket yet — keep waiting
+            }
+            LeaderStatus::NotRunning => {}
+        }
+    }
+    Err(anyhow!(
+        "Failed to start leader within 90s. \
+         Check `/tmp/agentgraph/leader.log` for errors."
+    ))
 }
 
 async fn send_command(cmd: Command) -> Result<()> {
     let max_retries = 3;
     for attempt in 0..=max_retries {
-        let (alive, socket_opt) = is_leader_alive().await;
-        let socket_path = match socket_opt {
-            Some(p) => p,
-            None => {
-                if alive {
-                    // Leader is alive by /proc scan but no socket — may be
-                    // starting up or under extreme load.  Retry.
-                    if attempt < max_retries {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
-                    return Err(anyhow!(
-                        "Leader process detected but IPC socket not found. \
-                         Check `/tmp/agentgraph/leader.log` and `/proc` for \
-                         running `ag` processes."
-                    ));
+        let status = is_leader_alive().await;
+        let socket_path = match status {
+            LeaderStatus::Ready { socket, .. } => socket,
+            LeaderStatus::Degraded { pid } => {
+                if attempt < max_retries {
+                    // Leader process exists but no socket yet — may still
+                    // be loading models.  Retry.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
                 }
-                return Err(anyhow!("Leader not found. Is `ag leader` running?"));
+                return Err(anyhow!(
+                    "Leader process (PID {}) is running but has no IPC socket. \
+                     It may still be loading models or is in a degraded state. \
+                     Check `/tmp/agentgraph/leader.log`.",
+                    pid
+                ));
+            }
+            LeaderStatus::NotRunning => {
+                return Err(anyhow!("No leader process found. Start one with `ag leader`."));
             }
         };
 
@@ -382,9 +425,12 @@ async fn send_command(cmd: Command) -> Result<()> {
             if attempt < max_retries {
                 for _ in 0..100 {
                     tokio::time::sleep(Duration::from_millis(200)).await;
-                    let (a, _) = is_leader_alive().await;
-                    if a {
-                        break;
+                    match is_leader_alive().await {
+                        LeaderStatus::Ready { .. } => break,
+                        LeaderStatus::Degraded { .. } => {
+                            // Process present, keep waiting for socket
+                        }
+                        LeaderStatus::NotRunning => {}
                     }
                 }
                 continue;

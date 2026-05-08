@@ -63,10 +63,9 @@ pub fn find_leader_by_pidfile() -> Option<PathBuf> {
 }
 
 /// Tier-3: /proc scan for any `ag` process (last resort, slow).
-/// Only returns a result if the matching process has a socket file
-/// in /tmp/agentgraph, confirming it's OUR leader not an unrelated
-/// `ag` binary from another workspace.
-pub fn find_leader_by_proc_scan() -> Option<PathBuf> {
+/// Returns the PID of the first matching process, regardless of whether
+/// it has a socket.  Callers check socket existence separately.
+pub fn find_leader_by_proc_scan() -> Option<u32> {
     let proc_dir = std::path::Path::new("/proc");
     if !proc_dir.exists() {
         return None;
@@ -76,6 +75,7 @@ pub fn find_leader_by_proc_scan() -> Option<PathBuf> {
         Err(_) => return None,
     };
 
+    let our_pid = std::process::id();
     let agentgraph_dir = std::path::Path::new(AGENTGRAPH_DIR);
 
     for entry in entries.flatten() {
@@ -84,18 +84,24 @@ pub fn find_leader_by_proc_scan() -> Option<PathBuf> {
         if !name_str.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
+        // Skip our own process — `ag status` shouldn't detect itself
+        if let Ok(pid) = name_str.parse::<u32>() {
+            if pid == our_pid {
+                continue;
+            }
+        }
         let comm_path = entry.path().join("comm");
         if let Ok(comm) = std::fs::read_to_string(&comm_path) {
             if comm.trim() == "ag" {
                 if let Ok(pid) = name_str.parse::<u32>() {
-                    // Only count it if the socket file exists AND the
-                    // process is alive — confirms this is our leader.
-                    let socket_path = agentgraph_dir.join(format!("ag-{}.sock", pid));
-                    if socket_path.exists() && pid_is_alive(pid) {
-                        return Some(socket_path);
-                    } else if socket_path.exists() {
-                        // Stale socket — clean it up
-                        let _ = std::fs::remove_file(&socket_path);
+                    if pid_is_alive(pid) {
+                        return Some(pid);
+                    } else {
+                        // Dead process — clean up any leftover socket
+                        let socket_path = agentgraph_dir.join(format!("ag-{}.sock", pid));
+                        if socket_path.exists() {
+                            let _ = std::fs::remove_file(&socket_path);
+                        }
                     }
                 }
             }
@@ -104,28 +110,78 @@ pub fn find_leader_by_proc_scan() -> Option<PathBuf> {
     None
 }
 
-/// Is the leader alive? Triages through socket → pidfile → /proc scan.
-/// Returns `(true, Option<socket_path>)` — socket_path is set if a
-/// usable socket was found (for IPC).
-pub async fn is_leader_alive() -> (bool, Option<PathBuf>) {
-    // Tier 1: socket-based (fastest, returns usable socket path)
+/// Determine leader status via socket → pidfile → /proc scan.
+pub async fn is_leader_alive() -> LeaderStatus {
+    // Tier 1: socket-based (fastest, returns usable socket)
     if let Some(socket) = find_leader_socket().await {
-        return (true, Some(socket));
+        // Extract PID from socket filename
+        let socket_name = socket.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if let Some(pid_str) = socket_name.strip_prefix("ag-").and_then(|s| s.strip_suffix(".sock")) {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                return LeaderStatus::Ready { socket, pid };
+            }
+        }
+        // If we can't parse the PID from the socket name, still usable
+        return LeaderStatus::Ready { socket, pid: 0 };
     }
+
     // Tier 2: PID file fallback
     if let Some(socket) = find_leader_by_pidfile() {
-        return (true, Some(socket));
+        // Try to get PID from the file
+        if let Ok(content) = std::fs::read_to_string(LEADER_PID_FILE) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                if socket.exists() {
+                    return LeaderStatus::Ready { socket, pid };
+                }
+                if pid_is_alive(pid) {
+                    return LeaderStatus::Degraded { pid };
+                }
+            }
+        }
     }
-    // Tier 3: /proc scan (slow but reliable under stress)
-    if let Some(socket) = find_leader_by_proc_scan() {
-        return (true, Some(socket));
+
+    // Tier 3: /proc scan (slow but reliable)
+    if let Some(pid) = find_leader_by_proc_scan() {
+        let socket_path = std::path::Path::new(AGENTGRAPH_DIR)
+            .join(format!("ag-{}.sock", pid));
+        if socket_path.exists() {
+            return LeaderStatus::Ready { socket: socket_path, pid };
+        }
+        return LeaderStatus::Degraded { pid };
     }
-    (false, None)
+
+    LeaderStatus::NotRunning
 }
 
-/// Check if a process with the given PID is alive on this system.
+/// Result of leader detection, distinguishing ready vs degraded states.
+#[derive(Debug)]
+pub enum LeaderStatus {
+    /// Leader is running and its IPC socket is available.
+    Ready { socket: PathBuf, pid: u32 },
+    /// A leader process was found via /proc scan but has no socket.
+    /// The process may still be loading models, or the socket was lost.
+    Degraded { pid: u32 },
+    /// No leader process detected by any method.
+    NotRunning,
+}
+
+/// Check if a process with the given PID is actually alive (not a zombie).
+/// Reads `/proc/{pid}/status` to distinguish running/sleeping from zombie.
 fn pid_is_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+    let status_path = format!("/proc/{}/status", pid);
+    if let Ok(content) = std::fs::read_to_string(&status_path) {
+        for line in content.lines() {
+            if line.starts_with("State:") {
+                // State line format: "State:\tS (sleeping)" or "State:\tZ (zombie)"
+                // A zombie has already exited; its parent hasn't reaped it.
+                return !line.contains('Z') && !line.contains('z');
+            }
+        }
+    }
+    // Can't read status → assume dead
+    false
 }
 
 pub struct AgentLogger {
