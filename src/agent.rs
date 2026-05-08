@@ -454,6 +454,7 @@ async fn run_inference(
                 excluded_from_compression: false,
                 file_key: String::new(),
                 file_path: String::new(),
+                content_hash: String::new(),
             });
         } else {
             combined_history.push(HistoryTurn {
@@ -463,6 +464,7 @@ async fn run_inference(
                 excluded_from_compression: false,
                 file_key: String::new(),
                 file_path: String::new(),
+                content_hash: String::new(),
             });
         }
     }
@@ -603,11 +605,10 @@ async fn run_inference(
                 };
             let file_key = {
                 let path_str = entry.path.to_string_lossy();
-                let nanos = entry.created.duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                let combined = format!("{}:{}", path_str, nanos);
-                format!("{:016x}", xxh3_64(combined.as_bytes()))
+                format!("{:016x}", xxh3_64(path_str.as_bytes()))
+            };
+            let content_hash = {
+                format!("{:016x}", xxh3_64(final_content.as_bytes()))
             };
             combined_history.push(HistoryTurn {
                 role: entry.role.clone(),
@@ -616,6 +617,7 @@ async fn run_inference(
                 excluded_from_compression: entry.excluded,
                 file_key,
                 file_path: entry.path.to_string_lossy().to_string(),
+                content_hash,
             });
             turn_idx += 1;
         }

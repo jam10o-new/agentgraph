@@ -53,10 +53,14 @@ pub struct HistoryTurn {
     pub content: String,
     pub turn_index: usize,
     pub excluded_from_compression: bool,
-    /// Stable file identity: xxh3 of file path + mtime nanos as hex.
+    /// Stable file identity: xxh3 of file path. All versions of the same
+    /// file share this key so we can detect when a summary is stale.
     pub file_key: String,
-    /// Human-readable file path for diagnostics.
+    /// Human-readable file path for diagnostics and version preamble.
     pub file_path: String,
+    /// xxh3 hash of the file content at the time this turn was built.
+    /// Compared against the summary's stored content_hash to detect drift.
+    pub content_hash: String,
 }
 
 use ag_config::CompressionConfig;
@@ -132,14 +136,16 @@ impl CompressionManager {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_key TEXT NOT NULL UNIQUE,
+                file_key TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
                 file_path TEXT NOT NULL,
                 role TEXT NOT NULL,
                 turn_order INTEGER NOT NULL,
                 root_title TEXT,
                 root_micro_summary TEXT,
                 generated_at INTEGER NOT NULL,
-                content_len INTEGER NOT NULL DEFAULT 0
+                content_len INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(file_key, content_hash)
             );
 
             CREATE TABLE IF NOT EXISTS domains (
@@ -175,6 +181,65 @@ impl CompressionManager {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
+        // Schema version check: auto-migrate by dropping and recreating
+        // when the schema layout changes. The DB is a cache — losing it
+        // is acceptable (summaries are regenerated on demand).
+        let current_version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        const SCHEMA_VERSION: i64 = 2;
+        if current_version < SCHEMA_VERSION {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS domain_summaries;
+                 DROP TABLE IF EXISTS summaries;
+                 DROP TABLE IF EXISTS domains;
+                 DROP TABLE IF EXISTS metasummaries;",
+            )?;
+            // Re-create with latest schema
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_key TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    turn_order INTEGER NOT NULL,
+                    root_title TEXT,
+                    root_micro_summary TEXT,
+                    generated_at INTEGER NOT NULL,
+                    content_len INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(file_key, content_hash)
+                );
+                CREATE TABLE IF NOT EXISTS domains (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    centroid_embedding BLOB,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS domain_summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    summary_id INTEGER NOT NULL REFERENCES summaries(id),
+                    domain_id INTEGER NOT NULL REFERENCES domains(id),
+                    extracted_information TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    UNIQUE(summary_id, domain_id)
+                );
+                CREATE TABLE IF NOT EXISTS metasummaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    generated_at INTEGER NOT NULL
+                );",
+            )?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+
+        // Recreate indices (idempotent)
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_summaries_file_key ON summaries(file_key);
+             CREATE INDEX IF NOT EXISTS idx_summaries_turn ON summaries(turn_order);
+             CREATE INDEX IF NOT EXISTS idx_domain_summaries_domain ON domain_summaries(domain_id);
+             CREATE INDEX IF NOT EXISTS idx_metasummaries_turn ON metasummaries(turn_index);",
+        )
+        .context("Failed to create indices")?;
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             threshold: compression.threshold,
@@ -468,13 +533,31 @@ impl CompressionManager {
         let file_key = &turn.file_key;
         let role_mistral = role_to_mistral(&turn.role);
 
-        // Check for existing summary
+        // Check for existing summary — find the latest version for this file_key
         let (existing_title, existing_micro, existing_id) = {
             let db = self.db.lock().unwrap();
             db.query_row(
-                "SELECT root_title, root_micro_summary, id FROM summaries WHERE file_key = ?1",
+                "SELECT root_title, root_micro_summary, id, content_hash FROM summaries
+                 WHERE file_key = ?1 ORDER BY generated_at DESC LIMIT 1",
                 [file_key],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+                |row| {
+                    let title: String = row.get(0)?;
+                    let micro: String = row.get(1)?;
+                    let id: i64 = row.get(2)?;
+                    let stored_hash: String = row.get(3)?;
+                    // If the stored content_hash differs from current, inject preamble
+                    let annotated = if stored_hash != turn.content_hash && !stored_hash.is_empty() {
+                        format!(
+                            "[⚠ Summary from older file version of {} (modified since). \
+                             The current file content differs from what was summarized. \
+                             Original summary follows:]\n{}",
+                            turn.file_path, micro
+                        )
+                    } else {
+                        micro
+                    };
+                    Ok((title, annotated, id))
+                },
             )
             .map(|(t, m, id)| (t, m, id))
             .ok()
@@ -494,10 +577,11 @@ impl CompressionManager {
                     let db = self.db.lock().unwrap();
                     db.execute(
                         "UPDATE summaries SET root_title = ?1, root_micro_summary = ?2,
-                         generated_at = ?3, content_len = ?4 WHERE id = ?5",
+                         content_hash = ?3, generated_at = ?4, content_len = ?5 WHERE id = ?6",
                         rusqlite::params![
                             root.title,
                             root.micro_summary,
+                            turn.content_hash,
                             std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
@@ -582,11 +666,12 @@ impl CompressionManager {
             .unwrap()
             .as_secs();
         db.execute(
-            "INSERT OR REPLACE INTO summaries (file_key, file_path, role, turn_order,
+            "INSERT OR REPLACE INTO summaries (file_key, content_hash, file_path, role, turn_order,
              root_title, root_micro_summary, generated_at, content_len)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 turn.file_key,
+                turn.content_hash,
                 turn.file_path,
                 role_label(&turn.role),
                 turn.turn_index as i64,
@@ -1141,7 +1226,8 @@ impl CompressionManager {
     fn load_summary_from_db(&self, file_key: &str) -> Option<(String, String)> {
         let db = self.db.lock().unwrap();
         db.query_row(
-            "SELECT root_title, root_micro_summary FROM summaries WHERE file_key = ?1",
+            "SELECT root_title, root_micro_summary FROM summaries
+             WHERE file_key = ?1 ORDER BY generated_at DESC LIMIT 1",
             [file_key],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
@@ -1153,7 +1239,7 @@ impl CompressionManager {
         let db = self.db.lock().unwrap();
         let summary_id: i64 = db
             .query_row(
-                "SELECT id FROM summaries WHERE file_key = ?1",
+                "SELECT id FROM summaries WHERE file_key = ?1 ORDER BY generated_at DESC LIMIT 1",
                 [file_key],
                 |row| row.get(0),
             )
