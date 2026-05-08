@@ -85,6 +85,12 @@ pub struct AgentConfig {
     /// 0 or None disables checkpointing.
     #[serde(default)]
     pub context_checkpoint_limit: Option<usize>,
+    /// Path to the SQLite database used for compression summaries, embeddings,
+    /// and domain clustering. Defaults to `<first_output_dir>/.agent_context/compression.db`
+    /// when not set. The database is shared across agent turns for persistent
+    /// long-term memory via vector retrieval.
+    #[serde(default)]
+    pub compression_db_path: Option<String>,
     /// Input directories whose files should never be compressed or folded into metasummaries.
     /// Useful for mutable/ephemeral inputs that must always reach the model verbatim.
     #[serde(default)]

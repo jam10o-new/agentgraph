@@ -17,6 +17,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc};
+use xxhash_rust::xxh3::xxh3_64;
 
 macro_rules! json_schema_obj {
     ($($json:tt)+) => {
@@ -451,6 +452,8 @@ async fn run_inference(
                 content: body,
                 turn_index: 0,
                 excluded_from_compression: false,
+                file_key: String::new(),
+                file_path: String::new(),
             });
         } else {
             combined_history.push(HistoryTurn {
@@ -458,6 +461,8 @@ async fn run_inference(
                 content: system_content,
                 turn_index: 0,
                 excluded_from_compression: false,
+                file_key: String::new(),
+                file_path: String::new(),
             });
         }
     }
@@ -596,11 +601,21 @@ async fn run_inference(
                 } else {
                     content
                 };
+            let file_key = {
+                let path_str = entry.path.to_string_lossy();
+                let nanos = entry.created.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let combined = format!("{}:{}", path_str, nanos);
+                format!("{:016x}", xxh3_64(combined.as_bytes()))
+            };
             combined_history.push(HistoryTurn {
                 role: entry.role.clone(),
                 content: final_content,
                 turn_index: turn_idx,
                 excluded_from_compression: entry.excluded,
+                file_key,
+                file_path: entry.path.to_string_lossy().to_string(),
             });
             turn_idx += 1;
         }
@@ -635,9 +650,11 @@ async fn run_inference(
         .or_else(|| config.stream_output.as_ref().and_then(|s| PathBuf::from(s).parent().map(|p| p.to_path_buf())))
         .unwrap_or_else(|| PathBuf::from("."));
     // Save for potential OOM recovery rebuild
-    let oom_checkpoint_base = checkpoint_base.clone();
+    let oom_db_path = config.compression_db_path.as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| checkpoint_base.join(".agent_context").join("compression.db"));
     let oom_compression_config = config.compression.clone();
-    let comp_mgr = CompressionManager::new(checkpoint_base, &config.compression);
+    let comp_mgr = CompressionManager::new(&oom_db_path, &config.compression)?;
     // Snapshot of uncompressed history so OOM recovery can re-compress
     // with more aggressive checkpoint limits without losing turns.
     let uncompressed_history: Vec<HistoryTurn> = history.clone();
@@ -909,9 +926,9 @@ async fn run_inference(
         if oom_recovery_pending {
             logger.log("Recompressing context with aggressive limits after OOM").await;
             let oom_comp_mgr = CompressionManager::new(
-                oom_checkpoint_base.clone(),
+                &oom_db_path,
                 &oom_compression_config,
-            );
+            )?;
             let mut history_retry = uncompressed_history.clone();
             let recompr_context = match oom_comp_mgr
                 .get_compressed_context(
@@ -1276,6 +1293,7 @@ async fn run_inference(
                         inference_retries: 3,
                         enable_oom_recovery: true,
                         inference_retry_delay_ms: 500,
+                        compression_db_path: None,
                     };
                     send_ipc_command(Command::SpawnAgent { name, config })
                         .await

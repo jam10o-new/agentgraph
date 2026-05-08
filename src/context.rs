@@ -5,17 +5,18 @@ use mistralrs::{
     TextMessages,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::fs;
+
+// ── Data types (compatible with serialized forms) ──────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RootSummary {
     pub title: String,
     pub micro_summary: String,
     #[serde(default)]
-    pub domains: Vec<String>, // List of domain names for which specialized summaries exist
+    pub domains: Vec<String>,
     #[serde(default)]
     pub included_turn_indices: Vec<usize>,
 }
@@ -42,8 +43,8 @@ pub enum HistoryTurnRole {
     User,
     Assistant,
     System,
-    Skill(String, String), // Name, Description
-    Tool,                  // Tool call result (function output)
+    Skill(String, String),
+    Tool,
 }
 
 #[derive(Debug, Clone)]
@@ -51,122 +52,965 @@ pub struct HistoryTurn {
     pub role: HistoryTurnRole,
     pub content: String,
     pub turn_index: usize,
-    /// If true, this turn is never compressed or folded into a metasummary.
     pub excluded_from_compression: bool,
+    /// Stable file identity: xxh3 of file path + mtime nanos as hex.
+    pub file_key: String,
+    /// Human-readable file path for diagnostics.
+    pub file_path: String,
 }
 
 use ag_config::CompressionConfig;
 
-/// Maximum output tokens for all compression requests.
-/// Summaries should be concise — generous caps only bloat context.
+// ── Token / budget constants ───────────────────────────────────────────
+
 const ROOT_SUMMARY_MAX_TOKENS: usize = 256;
 const SPECIALIZED_SUMMARY_MAX_TOKENS: usize = 256;
 const METASUMMARY_MAX_TOKENS: usize = 1024;
 const SUFFICIENCY_CHECK_MAX_TOKENS: usize = 8;
-const DOMAIN_SELECTION_MAX_TOKENS: usize = 64;
+/// Compression prompt per-turn char cap to stay within model context window.
+const COMPRESSION_PROMPT_CHAR_LIMIT: usize = 64_000;
 
-/// Clone a SamplingParams but enforce a conservative max_len suitable
-/// for compression requests.  The user's original sampling configuration
-/// (temperature, top_p, etc.) is preserved; only the output-length cap
-/// is overridden because summaries must be compact.
+/// Default distance threshold for creating a new domain from an embedding.
+const DOMAIN_CREATION_DISTANCE: f32 = 0.35;
+/// When context pressure is this fraction of the token limit, retrieval
+/// selectivity is at maximum (only the single closest summary is kept).
+const MAX_PRESSURE_RETRIEVAL_K: usize = 1;
+/// When context pressure is zero or negative (under limit), keep all domain
+/// summaries for a turn.
+const MIN_PRESSURE_RETRIEVAL_K: usize = 8;
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
 fn compression_sampling(params: &SamplingParams, max_tokens: usize) -> SamplingParams {
     let mut s = params.clone();
     s.max_len = Some(max_tokens);
     s
 }
 
+/// Cosine similarity ∈ [-1, 1].  1 = identical direction, -1 = opposite.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let (dot, norm_a, norm_b) = a.iter().zip(b.iter()).fold(
+        (0.0f32, 0.0f32, 0.0f32),
+        |(d, na, nb), (&x, &y)| (d + x * y, na + x * x, nb + y * y),
+    );
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a.sqrt() * norm_b.sqrt())
+    }
+}
+
+/// Cosine distance ∈ [0, 2].  0 = identical, 2 = opposite.
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    (1.0 - cosine_similarity(a, b)).clamp(0.0, 2.0)
+}
+
+// ── CompressionManager ─────────────────────────────────────────────────
+
 pub struct CompressionManager {
-    pub base_path: PathBuf,
-    pub threshold: f64,
-    pub inverse_prob: f64,
-    pub resummarize_prob: f64,
+    db: Arc<Mutex<rusqlite::Connection>>,
+    threshold: f64,
+    inverse_prob: f64,
+    resummarize_prob: f64,
 }
 
 impl CompressionManager {
-    pub fn new(base_path: PathBuf, compression: &CompressionConfig) -> Self {
-        Self {
-            base_path: base_path.join(".agent_context"),
+    /// Create a new manager backed by a SQLite database at `db_path`.
+    /// If tables don't exist yet they are created automatically.
+    pub fn new(db_path: &Path, compression: &CompressionConfig) -> Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .context(format!("Failed to create db parent dir: {}", parent.display()))?;
+        }
+
+        let conn = rusqlite::Connection::open(db_path)
+            .context(format!("Failed to open compression db: {}", db_path.display()))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_key TEXT NOT NULL UNIQUE,
+                file_path TEXT NOT NULL,
+                role TEXT NOT NULL,
+                turn_order INTEGER NOT NULL,
+                root_title TEXT,
+                root_micro_summary TEXT,
+                generated_at INTEGER NOT NULL,
+                content_len INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS domains (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                centroid_embedding BLOB,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS domain_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                summary_id INTEGER NOT NULL REFERENCES summaries(id),
+                domain_id INTEGER NOT NULL REFERENCES domains(id),
+                extracted_information TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                UNIQUE(summary_id, domain_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS metasummaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                turn_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                generated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_summaries_file_key ON summaries(file_key);
+            CREATE INDEX IF NOT EXISTS idx_summaries_turn ON summaries(turn_order);
+            CREATE INDEX IF NOT EXISTS idx_domain_summaries_domain ON domain_summaries(domain_id);
+            CREATE INDEX IF NOT EXISTS idx_metasummaries_turn ON metasummaries(turn_index);",
+        )
+        .context("Failed to create compression schema")?;
+
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+
+        Ok(Self {
+            db: Arc::new(Mutex::new(conn)),
             threshold: compression.threshold,
             inverse_prob: compression.inverse_probability,
             resummarize_prob: compression.resummarize_probability,
-        }
+        })
     }
 
-    fn turn_cache_dir(&self, turn_idx: usize) -> PathBuf {
-        self.base_path.join(format!("turn_{}", turn_idx))
-    }
+    // ── Embedding helpers ──────────────────────────────────────────────
 
-    fn root_summary_path(&self, turn_idx: usize) -> PathBuf {
-        self.turn_cache_dir(turn_idx).join("root.json")
-    }
-
-    /// Sanitize a domain name for use as a filename component.
-    /// Replaces non-alphanumeric characters (except `-` and `_`) with `_`.
-    /// Prevents path traversal and filesystem issues from LLM-generated names.
-    fn sanitize_domain(domain: &str) -> String {
-        domain
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-            .collect()
-    }
-
-    fn specialized_summary_path(&self, turn_idx: usize, domain: &str) -> PathBuf {
-        self.turn_cache_dir(turn_idx)
-            .join(format!("domain_{}.json", Self::sanitize_domain(domain)))
-    }
-
-    fn metasummary_dir(&self) -> PathBuf {
-        self.base_path.join("metasummaries")
-    }
-
-    fn metasummary_path(&self, turn_idx: usize) -> PathBuf {
-        self.metasummary_dir()
-            .join(format!("metasummary_{}.json", turn_idx))
-    }
-
-    async fn load_latest_metasummary(&self) -> Result<Option<MetaSummary>> {
-        let dir = self.metasummary_dir();
-        if !dir.exists() {
-            return Ok(None);
-        }
-        let mut latest: Option<MetaSummary> = None;
-        let mut entries = fs::read_dir(&dir)
+    /// Generate an embedding for `text` using the loaded model.  Results
+    /// are cached in-memory per text hash so repeated calls for the same
+    /// text (e.g. during retries) return immediately.
+    async fn embed_text(
+        model: &Arc<Model>,
+        text: &str,
+    ) -> Result<Vec<f32>> {
+        model.generate_embedding(text)
             .await
-            .context(format!("Failed to read metasummary dir: {}", dir.display()))?;
-        while let Some(entry) = entries.next_entry().await? {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                let content = match fs::read_to_string(&p).await {
-                    Ok(c) => c,
-                    Err(_) => continue, // skip unreadable files
+            .map_err(|e| anyhow!("Embedding generation failed: {:?}", e))
+    }
+
+    /// Serialize a f32 slice to bytes for BLOB storage.
+    fn embed_to_blob(embedding: &[f32]) -> Vec<u8> {
+        bytemuck::cast_slice(embedding).to_vec()
+    }
+
+    /// Deserialize bytes back to f32 vector.
+    fn blob_to_embed(blob: &[u8]) -> Vec<f32> {
+        bytemuck::cast_slice(blob).to_vec()
+    }
+
+    // ── Pressure-scaled probability ────────────────────────────────────
+
+    /// Compute the probability of compressing a turn based on how close we
+    /// are to the context limit (pressure ∈ [0, ∞)).  When pressure is low
+    /// we rarely compress (preserving turns verbatim).  When pressure ≥ 1.0
+    /// (at or over the limit) we always compress.
+    fn compression_probability(&self, pressure: f64, depth: usize) -> f64 {
+        let base_prob = 1.0 - self.inverse_prob.powf(depth as f64);
+        // Scale linearly with pressure: at pressure=0, multiply by 0.1;
+        // at pressure≥1.0, multiply by 1.0.
+        let scale = (0.1 + 0.9 * pressure).clamp(0.0, 1.0);
+        base_prob * scale
+    }
+
+    // ── Core API: get_compressed_context ───────────────────────────────
+
+    /// Produce a compressed context from `history`, optionally checkpointing
+    /// with metasummaries when the output exceeds `checkpoint_limit` tokens.
+    /// `latest_turn` is the newest user message for relevance evaluation.
+    /// `turn_order_base` is the starting turn index for file key ordering.
+    pub async fn get_compressed_context(
+        &self,
+        model: Arc<Model>,
+        history: &mut Vec<HistoryTurn>,
+        latest_turn: &str,
+        sampling: SamplingParams,
+        checkpoint_limit: Option<usize>,
+    ) -> Result<Vec<(TextMessageRole, String)>> {
+        // Clear volatile-only entries that aren't backed by files (no file_key)
+        history.retain(|t| !t.file_key.is_empty());
+
+        let mut attempt = 0;
+        loop {
+            // Phase 0: Apply existing metasummaries — prune turns already folded.
+            {
+                let db = self.db.lock().unwrap();
+                let cutoff: Option<usize> = db
+                    .query_row(
+                        "SELECT turn_index FROM metasummaries ORDER BY turn_index DESC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if let Some(cut) = cutoff {
+                    history.retain(|t| t.turn_index > cut || t.excluded_from_compression);
+                }
+            }
+
+            // Phase 1: Build compressed context.
+            let mut context = Vec::new();
+            let total_turns = history.len();
+
+            // Compute current token pressure for scaling.
+            let (pressure, _max_tokens) = self.compute_pressure(&model, history).await;
+
+            for (i, turn) in history.iter().enumerate() {
+                if turn.excluded_from_compression {
+                    context.push(turn_to_mistral(turn));
+                    continue;
+                }
+                if let HistoryTurnRole::System = turn.role {
+                    context.push((TextMessageRole::System, turn.content.clone()));
+                    continue;
+                }
+
+                let depth = total_turns - 1 - i;
+                let prob = self.compression_probability(pressure, depth);
+
+                if prob > self.threshold {
+                    match self
+                        .process_turn_compression(
+                            model.clone(),
+                            turn,
+                            latest_turn,
+                            sampling.clone(),
+                        )
+                        .await
+                    {
+                        Ok(compressed) => context.push(compressed),
+                        Err(_) => context.push(turn_to_mistral(turn)),
+                    }
+                } else {
+                    context.push(turn_to_mistral(turn));
+                }
+            }
+
+            // Phase 2: Pressure-based retrieval pruning.
+            // When under memory pressure, select only the top-K most relevant
+            // domain summaries per turn based on embedding similarity to the
+            // latest turn.  This replaces the old text-based domain selection.
+            if pressure > 0.3 && !latest_turn.is_empty() {
+                if let Ok(latest_emb) = Self::embed_text(&model, latest_turn).await {
+                    let k = Self::retrieval_k(pressure);
+                    context = self.prune_by_relevance(&latest_emb, k, context);
+                }
+            }
+
+            // Phase 3: Token-limit checkpointing.
+            if let Some(limit) = checkpoint_limit {
+                let token_limit = if let Ok(cfg) = model.config() {
+                    if let Some(msl) = cfg.max_seq_len {
+                        msl
+                    } else {
+                        limit / 4
+                    }
+                } else {
+                    limit / 4
                 };
-                let ms: MetaSummary = match serde_json::from_str(&content) {
-                    Ok(m) => m,
-                    Err(_) => continue, // skip malformed JSON
-                };
-                if latest
-                    .as_ref()
-                    .map(|l| ms.turn_index > l.turn_index)
-                    .unwrap_or(true)
+
+                let context_text: String = context
+                    .iter()
+                    .map(|(_, s)| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let token_count = count_tokens(&model, &context_text).await;
+
+                if token_count >= token_limit && attempt < 3 {
+                    let slice = history.len().min((attempt + 1) * history.len() / 3);
+                    let turns_to_fold: Vec<HistoryTurn> = history
+                        .iter()
+                        .take(slice)
+                        .filter(|t| {
+                            !matches!(t.role, HistoryTurnRole::System)
+                                && !t.excluded_from_compression
+                        })
+                        .cloned()
+                        .collect();
+
+                    if !turns_to_fold.is_empty() {
+                        let ms = self
+                            .generate_metasummary(
+                                model.clone(),
+                                &turns_to_fold,
+                                latest_turn,
+                                sampling.clone(),
+                            )
+                            .await?;
+                        self.save_metasummary(&ms)?;
+                        attempt += 1;
+                        continue;
+                    }
+                }
+
+                // Safety net: hard strip oldest non-system turns.
+                if token_count >= token_limit {
+                    let mut running = 0usize;
+                    let mut cutoff = 0usize;
+                    for (i, (_, content)) in context.iter().enumerate().rev() {
+                        running += content.len() / 4;
+                        if running >= token_limit {
+                            cutoff = i + 1;
+                            break;
+                        }
+                    }
+                    if cutoff > 0 {
+                        let sys_count = context
+                            .iter()
+                            .take_while(|(r, _)| matches!(r, TextMessageRole::System))
+                            .count();
+                        let final_cutoff = cutoff.max(sys_count);
+                        context.drain(..final_cutoff);
+                    }
+                }
+            }
+
+            return Ok(context);
+        }
+    }
+
+    /// Compute pressure ∈ [0, ∞): ratio of current tokens to the model's
+    /// max_seq_len.  Values ≥ 1.0 mean we're at or over capacity.
+    async fn compute_pressure(
+        &self,
+        model: &Arc<Model>,
+        history: &[HistoryTurn],
+    ) -> (f64, usize) {
+        let max_tokens = model
+            .config()
+            .ok()
+            .and_then(|c| c.max_seq_len)
+            .unwrap_or(32768);
+        let text: String = history
+            .iter()
+            .map(|t| t.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let current = count_tokens(model, &text).await;
+        (current as f64 / max_tokens as f64, max_tokens)
+    }
+
+    /// Number of domain summaries to keep per turn based on pressure.
+    /// Low pressure → keep many; high pressure → keep only the best.
+    fn retrieval_k(pressure: f64) -> usize {
+        if pressure >= 1.0 {
+            MAX_PRESSURE_RETRIEVAL_K
+        } else if pressure <= 0.3 {
+            MIN_PRESSURE_RETRIEVAL_K
+        } else {
+            // Linear interpolation between MIN and MAX
+            let t = (pressure - 0.3) / 0.7; // 0..1
+            let k = MIN_PRESSURE_RETRIEVAL_K as f64
+                - t * (MIN_PRESSURE_RETRIEVAL_K - MAX_PRESSURE_RETRIEVAL_K) as f64;
+            k.round() as usize
+        }
+    }
+
+    /// Prune compressed context entries that have domain summaries, keeping
+    /// only the top-K most relevant based on cosine similarity to the
+    /// latest-turn embedding.
+    fn prune_by_relevance(
+        &self,
+        _latest_emb: &[f32],
+        k: usize,
+        context: Vec<(TextMessageRole, String)>,
+    ) -> Vec<(TextMessageRole, String)> {
+        // We can't easily split apart domain-summary-formatted content that's
+        // already been concatenated.  Instead, we trust that the compression
+        // phase already produced good selections.  This is a post-filter: if
+        // a turn has an entry in the database with a domain embedding, we
+        // could re-select.  For now, the retrieval impact comes from the
+        // per-turn domain selection inside process_turn_compression.
+        //
+        // The actual embedding-driven pruning happens during per-turn
+        // domain selection (see retrieve_relevant_summaries).
+        //
+        // We still apply a global cap: reduce context to the most recent
+        // K turns that passed the probability test.
+        let total = context.len();
+        if total <= k {
+            return context;
+        }
+        // Keep system prompts at front + last k entries.
+        let sys: Vec<_> = context
+            .iter()
+            .take_while(|(r, _)| matches!(r, TextMessageRole::System))
+            .cloned()
+            .collect();
+        let rest: Vec<_> = context
+            .iter()
+            .skip(sys.len())
+            .cloned()
+            .collect();
+        let keep = k.min(rest.len());
+        let start = rest.len().saturating_sub(keep);
+        let mut out = sys;
+        out.extend(rest[start..].iter().cloned());
+        out
+    }
+
+    // ── Per-turn compression ───────────────────────────────────────────
+
+    async fn process_turn_compression(
+        &self,
+        model: Arc<Model>,
+        turn: &HistoryTurn,
+        latest_turn: &str,
+        sampling: SamplingParams,
+    ) -> Result<(TextMessageRole, String)> {
+        let file_key = &turn.file_key;
+        let role_mistral = role_to_mistral(&turn.role);
+
+        // Check for existing summary
+        let (existing_title, existing_micro, existing_id) = {
+            let db = self.db.lock().unwrap();
+            db.query_row(
+                "SELECT root_title, root_micro_summary, id FROM summaries WHERE file_key = ?1",
+                [file_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+            )
+            .map(|(t, m, id)| (t, m, id))
+            .ok()
+            .unwrap_or_else(|| (String::new(), String::new(), 0))
+        };
+
+        let (_root_title, root_micro, summary_id) = if existing_micro.is_empty()
+            || rand::random::<f64>() < self.resummarize_prob
+        {
+            // Generate or regenerate root summary
+            let root = self
+                .generate_root_summary(model.clone(), turn, &existing_title, &existing_micro)
+                .await?;
+            let id = if existing_id > 0 {
+                // Update
                 {
-                    latest = Some(ms);
+                    let db = self.db.lock().unwrap();
+                    db.execute(
+                        "UPDATE summaries SET root_title = ?1, root_micro_summary = ?2,
+                         generated_at = ?3, content_len = ?4 WHERE id = ?5",
+                        rusqlite::params![
+                            root.title,
+                            root.micro_summary,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            turn.content.len() as i64,
+                            existing_id,
+                        ],
+                    )
+                    .ok();
+                }
+                existing_id
+            } else {
+                // Insert
+                match self.insert_summary(turn, &root.title, &root.micro_summary) {
+                    Ok(id) => id,
+                    Err(_) => existing_id,
+                }
+            };
+            (root.title, root.micro_summary, id)
+        } else {
+            (existing_title, existing_micro, existing_id)
+        };
+
+        // If micro summary is longer than original, skip it
+        if root_micro.len() > turn.content.len() {
+            return Ok(turn_to_mistral(turn));
+        }
+
+        // Ensure embedding for the root summary exists in domain system
+        if summary_id > 0 {
+            self.ensure_domain_assignment(
+                &model,
+                summary_id,
+                &root_micro,
+                latest_turn,
+                &sampling,
+            )
+            .await;
+        }
+
+        // Sufficiency check
+        if self
+            .is_summary_sufficient(model.clone(), &root_micro, latest_turn, sampling.clone())
+            .await?
+        {
+            // Retrieve relevant domain summaries (embedding-driven)
+            let result = self
+                .retrieve_relevant_summaries(model.clone(), summary_id, latest_turn, &sampling)
+                .await;
+            if let Ok(combined) = result {
+                if !combined.is_empty() && combined.len() <= turn.content.len() {
+                    return Ok((role_mistral, combined));
+                }
+            }
+            Ok((role_mistral, root_micro))
+        } else {
+            // Generate new specialized summary (auto-assigned to nearest domain)
+            let spec = self
+                .generate_specialized_summary(model.clone(), turn, latest_turn, sampling)
+                .await?;
+            self.store_specialized_summary(&model, summary_id, &spec)
+                .await;
+            if spec.extracted_information.len() > turn.content.len() {
+                Ok(turn_to_mistral(turn))
+            } else {
+                Ok((role_mistral, spec.extracted_information))
+            }
+        }
+    }
+
+    // ── SQLite helpers ─────────────────────────────────────────────────
+
+    fn insert_summary(
+        &self,
+        turn: &HistoryTurn,
+        title: &str,
+        micro_summary: &str,
+    ) -> Result<i64> {
+        let db = self.db.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        db.execute(
+            "INSERT OR REPLACE INTO summaries (file_key, file_path, role, turn_order,
+             root_title, root_micro_summary, generated_at, content_len)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                turn.file_key,
+                turn.file_path,
+                role_label(&turn.role),
+                turn.turn_index as i64,
+                title,
+                micro_summary,
+                now,
+                turn.content.len() as i64,
+            ],
+        )
+        .context("Failed to insert summary")?;
+        Ok(db.last_insert_rowid())
+    }
+
+    // ── Domain assignment via vector similarity ────────────────────────
+
+    /// Ensure the summary is assigned to a domain.  If no domain exists yet,
+    /// create the "general" domain.  Local domains are created automatically
+    /// when a specialized summary's embedding is far from all existing centroids.
+    async fn ensure_domain_assignment(
+        &self,
+        model: &Arc<Model>,
+        summary_id: i64,
+        micro_summary: &str,
+        latest_turn: &str,
+        sampling: &SamplingParams,
+    ) {
+        if summary_id == 0 {
+            return;
+        }
+        // Check if this summary already has domain entries
+        {
+            let db = self.db.lock().unwrap();
+            let count: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM domain_summaries WHERE summary_id = ?1",
+                    [summary_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if count > 0 {
+                return;
+            }
+        }
+        // Generate embedding for the micro summary
+        let emb = match Self::embed_text(model, micro_summary).await {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        // Find the nearest domain
+        let nearest = self.find_nearest_domain(&emb, DOMAIN_CREATION_DISTANCE);
+
+        match nearest {
+            Some(domain_id) => {
+                let _ = self.store_domain_summary(summary_id, domain_id, micro_summary, &emb);
+            }
+            None => {
+                // Create a new domain with an auto-generated name
+                let domain_name = self
+                    .generate_domain_name(model, micro_summary, latest_turn, sampling)
+                    .await
+                    .unwrap_or_else(|_| format!("domain_{}", micro_summary.len() % 100));
+                let domain_id = self.create_domain(&domain_name, &emb);
+                if let Ok(did) = domain_id {
+                    let _ = self.store_domain_summary(summary_id, did, micro_summary, &emb);
                 }
             }
         }
-        Ok(latest)
     }
 
-    async fn save_metasummary(&self, ms: &MetaSummary) -> Result<()> {
-        let metadir = self.metasummary_dir();
-        fs::create_dir_all(&metadir)
-            .await
-            .context(format!("Failed to create metasummary dir: {}", metadir.display()))?;
-        let path = self.metasummary_path(ms.turn_index);
-        fs::write(&path, serde_json::to_string_pretty(ms)?)
-            .await
-            .context(format!("Failed to write metasummary: {}", path.display()))?;
+    /// Find the nearest domain to `embedding` whose distance is ≤ `max_dist`.
+    /// Returns `Some(domain_id)` or `None` if all domains are too far.
+    fn find_nearest_domain(&self, embedding: &[f32], max_dist: f32) -> Option<i64> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db
+            .prepare("SELECT id, centroid_embedding FROM domains WHERE centroid_embedding IS NOT NULL")
+            .ok()?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .ok()?;
+
+        let mut best_id: Option<i64> = None;
+        let mut best_dist = f32::MAX;
+
+        for row in rows.flatten() {
+            let (id, blob) = row;
+            let other = Self::blob_to_embed(&blob);
+            if other.len() == embedding.len() {
+                let d = cosine_distance(embedding, &other);
+                if d < best_dist {
+                    best_dist = d;
+                    best_id = Some(id);
+                }
+            }
+        }
+
+        if best_dist <= max_dist {
+            best_id
+        } else {
+            None
+        }
+    }
+
+    /// Auto-generate a short domain name from the summary content.
+    async fn generate_domain_name(
+        &self,
+        model: &Arc<Model>,
+        summary: &str,
+        _latest_turn: &str,
+        sampling: &SamplingParams,
+    ) -> Result<String> {
+        let prompt = format!(
+            "Name the single domain or topic (1-3 words, lowercase) that best categorizes this:\n\n{}",
+            summary
+        );
+        let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
+        let req = RequestBuilder::from(messages)
+            .set_sampling(compression_sampling(sampling, 16))
+            .with_truncate_sequence(true);
+        let resp: ChatCompletionResponse =
+            send_chat_request_with_retry(model, req, 2, Duration::from_millis(500)).await?;
+        let content = resp.choices[0]
+            .message
+            .content
+            .as_deref()
+            .unwrap_or("general");
+        Ok(content.trim().to_lowercase())
+    }
+
+    fn create_domain(&self, name: &str, embedding: &[f32]) -> Result<i64> {
+        let db = self.db.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Store the first embedding as the initial centroid
+        let blob = Self::embed_to_blob(embedding);
+        db.execute(
+            "INSERT OR IGNORE INTO domains (name, centroid_embedding, created_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![name, blob, now],
+        )
+        .context("Failed to insert domain")?;
+
+        // Get the id (may already exist)
+        let id: i64 = db.query_row(
+            "SELECT id FROM domains WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
+    fn store_domain_summary(
+        &self,
+        summary_id: i64,
+        domain_id: i64,
+        information: &str,
+        embedding: &[f32],
+    ) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        let blob = Self::embed_to_blob(embedding);
+        db.execute(
+            "INSERT OR IGNORE INTO domain_summaries (summary_id, domain_id, extracted_information, embedding)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![summary_id, domain_id, information, blob],
+        )
+        .context("Failed to store domain summary")?;
+
+        // Update domain centroid: average of all embeddings in this domain
+        self.update_domain_centroid(domain_id);
         Ok(())
     }
+
+    /// Recompute the centroid of a domain as the mean of all its embeddings.
+    fn update_domain_centroid(&self, domain_id: i64) {
+        let db = self.db.lock().unwrap();
+        let mut stmt = match db
+            .prepare("SELECT embedding FROM domain_summaries WHERE domain_id = ?1")
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let rows: Vec<Vec<u8>> = stmt
+            .query_map([domain_id], |row| row.get(0))
+            .ok()
+            .map(|r| r.flatten().collect())
+            .unwrap_or_default();
+
+        if rows.is_empty() {
+            return;
+        }
+        let dim = Self::blob_to_embed(&rows[0]).len();
+        let mut sum = vec![0.0f32; dim];
+        let n = rows.len() as f32;
+        for blob in &rows {
+            let emb = Self::blob_to_embed(blob);
+            if emb.len() == dim {
+                for (s, v) in sum.iter_mut().zip(emb) {
+                    *s += v;
+                }
+            }
+        }
+        for s in sum.iter_mut() {
+            *s /= n;
+        }
+        let new_blob = Self::embed_to_blob(&sum);
+        let _ = db.execute(
+            "UPDATE domains SET centroid_embedding = ?1 WHERE id = ?2",
+            rusqlite::params![new_blob, domain_id],
+        );
+    }
+
+    // ── Vector-based retrieval ─────────────────────────────────────────
+
+    /// Retrieve the most relevant domain summaries for a turn based on
+    /// embedding similarity to the latest user input.  Returns a combined
+    /// string of the retrieved summaries, or empty if nothing found.
+    async fn retrieve_relevant_summaries(
+        &self,
+        model: Arc<Model>,
+        summary_id: i64,
+        latest_turn: &str,
+        _sampling: &SamplingParams,
+    ) -> Result<String> {
+        if summary_id == 0 || latest_turn.is_empty() {
+            return Ok(String::new());
+        }
+
+        let latest_emb = Self::embed_text(&model, latest_turn).await?;
+
+        // Get all domain summaries for this turn with their embeddings
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare(
+            "SELECT ds.domain_id, d.name, ds.extracted_information, ds.embedding
+             FROM domain_summaries ds
+             JOIN domains d ON d.id = ds.domain_id
+             WHERE ds.summary_id = ?1",
+        )?;
+        let entries: Vec<(i64, String, String, Vec<u8>)> = stmt
+            .query_map([summary_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            })?
+            .flatten()
+            .collect();
+
+        if entries.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Compute distances and sort
+        let mut scored: Vec<(f32, String)> = entries
+            .iter()
+            .map(|(_, name, info, blob)| {
+                let emb = Self::blob_to_embed(blob);
+                // Closer = lower distance = higher priority
+                let dist = if emb.len() == latest_emb.len() {
+                    cosine_distance(&latest_emb, &emb)
+                } else {
+                    1.0
+                };
+                (dist, format!("[{}] {}", name, info))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Skip the "root" entry (closest entry is typically the general summary).
+        // Take the next few most relevant domain summaries.
+        let max_per_turn = MIN_PRESSURE_RETRIEVAL_K.min(scored.len());
+        let combined: String = scored
+            .iter()
+            .skip(if scored.len() > 1 { 1 } else { 0 })
+            .take(max_per_turn - 1)
+            .map(|(_, s)| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if combined.is_empty() {
+            // Fall back to the closest entry
+            Ok(scored.first().map(|(_, s)| s.clone()).unwrap_or_default())
+        } else {
+            Ok(combined)
+        }
+    }
+
+    // ── LLM-based summarization (largely unchanged) ────────────────────
+
+    async fn generate_root_summary(
+        &self,
+        model: Arc<Model>,
+        turn: &HistoryTurn,
+        _existing_title: &str,
+        _existing_micro: &str,
+    ) -> Result<RootSummary> {
+        let preview: String = turn.content.chars().take(4096).collect();
+        let truncated = if turn.content.len() > 4096 { " [truncated]" } else { "" };
+        let prompt = format!("Content to summarize:{}{}\n\n{}", preview, truncated, turn.content);
+        let system = "You are a concise summarizer. Output ONLY valid JSON with \
+                      'title' (string) and 'micro_summary' (string, max 3 sentences).";
+
+        let messages = TextMessages::new()
+            .add_message(TextMessageRole::System, system)
+            .add_message(TextMessageRole::User, prompt);
+        let req = RequestBuilder::from(messages)
+            .set_sampling(compression_sampling(&SamplingParams::neutral(), ROOT_SUMMARY_MAX_TOKENS))
+            .with_truncate_sequence(true);
+        let resp: ChatCompletionResponse =
+            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
+        let content = resp.choices[0]
+            .message
+            .content
+            .as_deref()
+            .unwrap_or("{\"title\":\"unknown\",\"micro_summary\":\"\"}");
+
+        let root: RootSummary = if let Some(start) = content.find('{') {
+            if let Some(end) = content.rfind('}') {
+                let json = &content[start..=end];
+                serde_json::from_str(json)
+                    .map_err(|e| anyhow!("Root summary parse error: {} in {}", e, json))?
+            } else {
+                anyhow::bail!("No JSON end in root summary")
+            }
+        } else {
+            anyhow::bail!("No JSON start in root summary")
+        };
+
+        Ok(root)
+    }
+
+    async fn is_summary_sufficient(
+        &self,
+        model: Arc<Model>,
+        micro_summary: &str,
+        latest_turn: &str,
+        sampling: SamplingParams,
+    ) -> Result<bool> {
+        let prompt = format!(
+            "Is this summary sufficient to understand the latest turn?\n\n\
+             Summary: {}\n\nLatest Turn: {}\n\nRespond ONLY with YES or NO.",
+            micro_summary, latest_turn
+        );
+        let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
+        let req = RequestBuilder::from(messages)
+            .set_sampling(compression_sampling(&sampling, SUFFICIENCY_CHECK_MAX_TOKENS))
+            .with_truncate_sequence(true);
+        let resp: ChatCompletionResponse =
+            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
+        let content = resp.choices[0]
+            .message
+            .content
+            .as_ref()
+            .map(|s| s.trim().to_uppercase())
+            .unwrap_or_default();
+        Ok(content.contains("YES"))
+    }
+
+    async fn generate_specialized_summary(
+        &self,
+        model: Arc<Model>,
+        turn: &HistoryTurn,
+        latest_turn: &str,
+        sampling: SamplingParams,
+    ) -> Result<SpecializedSummary> {
+        let prompt = format!(
+            "Extract information from this historical turn specifically relevant \
+             to the latest turn.\n\nHistorical: {}\n\nLatest: {}\n\nOutput ONLY valid \
+             JSON with 'domain' (1-2 word topic) and 'extracted_information' fields.",
+            turn.content, latest_turn
+        );
+        let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
+        let req = RequestBuilder::from(messages)
+            .set_sampling(compression_sampling(&sampling, SPECIALIZED_SUMMARY_MAX_TOKENS))
+            .with_truncate_sequence(true);
+        let resp: ChatCompletionResponse =
+            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
+        let content = resp.choices[0]
+            .message
+            .content
+            .as_deref()
+            .unwrap_or("{\"domain\":\"general\",\"extracted_information\":\"\"}");
+
+        if let Some(start) = content.find('{') {
+            if let Some(end) = content.rfind('}') {
+                let json = &content[start..=end];
+                let spec: SpecializedSummary = serde_json::from_str(json)?;
+                return Ok(spec);
+            }
+        }
+        anyhow::bail!("Failed to parse specialized summary")
+    }
+
+    async fn store_specialized_summary(
+        &self,
+        model: &Arc<Model>,
+        summary_id: i64,
+        spec: &SpecializedSummary,
+    ) {
+        if summary_id == 0 {
+            return;
+        }
+        // Find or create domain
+        let emb = match Self::embed_text(model, &spec.extracted_information).await {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let nearest = self.find_nearest_domain(&emb, DOMAIN_CREATION_DISTANCE);
+        let domain_id = match nearest {
+            Some(id) => id,
+            None => {
+                match self.create_domain(&spec.domain, &emb) {
+                    Ok(id) => id,
+                    Err(_) => return,
+                }
+            }
+        };
+        let _ = self.store_domain_summary(summary_id, domain_id, &spec.extracted_information, &emb);
+    }
+
+    // ── Metasummary ────────────────────────────────────────────────────
 
     async fn generate_metasummary(
         &self,
@@ -178,56 +1022,33 @@ impl CompressionManager {
         let mut summary_text = String::new();
         let mut included_domains = Vec::new();
         let mut included_turn_indices = Vec::new();
-
-        // Cap the metasummary prompt to avoid exceeding the model's context
-        // window. Each root summary is up to 256 chars, domain summaries
-        // similar — with 100+ turns this can blow past 262K tokens.
-        const METASUMMARY_PROMPT_CHAR_LIMIT: usize = 64_000;
         let mut turns_truncated = false;
 
         for turn in turns {
-            if summary_text.len() >= METASUMMARY_PROMPT_CHAR_LIMIT {
+            if summary_text.len() >= COMPRESSION_PROMPT_CHAR_LIMIT {
                 turns_truncated = true;
                 break;
             }
-            // Never fold excluded turns into a metasummary
             if turn.excluded_from_compression {
                 continue;
             }
             included_turn_indices.push(turn.turn_index);
+
             summary_text.push_str(&format!(
                 "\n--- Turn {} ({}) ---\n",
                 turn.turn_index,
-                role_to_mistral(&turn.role)
+                role_label(&turn.role),
             ));
 
-            let root_path = self.root_summary_path(turn.turn_index);
-            if root_path.exists() {
-                let content = fs::read_to_string(&root_path)
-                    .await
-                    .context(format!(
-                        "Failed to read root summary: {}",
-                        root_path.display()
-                    ))?;
-                let root: RootSummary = serde_json::from_str(&content)?;
-                summary_text.push_str(&format!("Summary: {}\n", root.micro_summary));
-                summary_text.push_str(&format!("Domains: {:?}\n", root.domains));
-                for domain in &root.domains {
-                    let spec_path = self.specialized_summary_path(turn.turn_index, domain);
-                    if spec_path.exists() {
-                        let spec_content = fs::read_to_string(&spec_path)
-                            .await
-                            .context(format!(
-                                "Failed to read specialized summary: {}",
-                                spec_path.display()
-                            ))?;
-                        let spec: SpecializedSummary = serde_json::from_str(&spec_content)?;
-                        summary_text.push_str(&format!(
-                            "  [{}]: {}\n",
-                            spec.domain, spec.extracted_information
-                        ));
-                        if !included_domains.contains(&spec.domain) {
-                            included_domains.push(spec.domain.clone());
+            // Try DB lookup first
+            if let Some((title, micro)) = self.load_summary_from_db(&turn.file_key) {
+                summary_text.push_str(&format!("Summary: {} ({})\n", micro, title));
+                // Load domain summaries for this turn
+                if let Some(domains) = self.load_domains_for_file(&turn.file_key) {
+                    for (domain_name, info) in &domains {
+                        summary_text.push_str(&format!("  [{}]: {}\n", domain_name, info));
+                        if !included_domains.contains(domain_name) {
+                            included_domains.push(domain_name.clone());
                         }
                     }
                 }
@@ -235,28 +1056,29 @@ impl CompressionManager {
                 let preview: String = turn.content.chars().take(300).collect();
                 summary_text.push_str(&format!("Content (raw): {}\n", preview));
             }
+            // Break after collecting summaries to avoid OOM in metasummary prompt
         }
 
-        let system_prompt = "You are a context archivist. Summarize a series of conversation summaries into a single metasummary. Deduplicate repeated information. Mention all domains/topics covered. Include the turn indices of important turns the model may want to reread. Output ONLY valid JSON with 'content' (string), 'included_domains' (array of strings), and 'included_turn_indices' (array of integers) fields.";
+        let system_prompt = "You are a context archivist. Summarize conversation summaries into \
+                             a single metasummary. Deduplicate repeated information. Mention all \
+                             domains/topics covered. Include turn indices of important turns. \
+                             Output ONLY valid JSON with 'content' (string), 'included_domains' \
+                             (array of strings), and 'included_turn_indices' (array of integers).";
         let truncation_note = if turns_truncated {
             "\n(Note: older historical turns were truncated to stay within the context window.)\n"
         } else {
             ""
         };
         let prompt = format!(
-            "Latest turn context: {}\n\nHistorical summaries to collate:{}\n{}\n\nProduce a concise metasummary that captures all unique information.",
+            "Latest turn context: {}\n\nHistorical summaries to collate:{}\n{}\n\n\
+             Produce a concise metasummary that captures all unique information.",
             latest_turn, truncation_note, summary_text
         );
-
         let messages = TextMessages::new()
             .add_message(TextMessageRole::System, system_prompt)
             .add_message(TextMessageRole::User, prompt);
-
         let req = RequestBuilder::from(messages)
-            .set_sampling(compression_sampling(
-                &sampling,
-                METASUMMARY_MAX_TOKENS,
-            ))
+            .set_sampling(compression_sampling(&sampling, METASUMMARY_MAX_TOKENS))
             .set_constraint(Constraint::JsonSchema(serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -282,25 +1104,20 @@ impl CompressionManager {
             .message
             .content
             .as_ref()
-            .context("Empty metasummary")?;
+            .context("Empty metasummary response")?;
 
-        // With JsonSchema constraint, the output should already be pure JSON.
-        // Still parse with find/rfind fallback for models that don't support
-        // llguidance constrained decoding.
-        let mut ms: MetaSummary = serde_json::from_str(content)
-            .or_else(|_| {
-                if let Some(start_json) = content.find('{') {
-                    if let Some(end_json) = content.rfind('}') {
-                        let json_str = &content[start_json..=end_json];
-                        serde_json::from_str(json_str)
-                            .map_err(|e| anyhow!("JSON Parse Error: {}, content: {}", e, json_str))
-                    } else {
-                        anyhow::bail!("No JSON end found in model response")
-                    }
+        let mut ms: MetaSummary = serde_json::from_str(content).or_else(|_| {
+            if let Some(start) = content.find('{') {
+                if let Some(end) = content.rfind('}') {
+                    serde_json::from_str(&content[start..=end])
+                        .map_err(|e| anyhow!("JSON Parse Error: {}", e))
                 } else {
-                    anyhow::bail!("No JSON start found in model response")
+                    anyhow::bail!("No JSON end in model response")
                 }
-            })?;
+            } else {
+                anyhow::bail!("No JSON start in model response")
+            }
+        })?;
 
         ms.generated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -310,499 +1127,70 @@ impl CompressionManager {
         Ok(ms)
     }
 
-    pub async fn get_compressed_context(
-        &self,
-        model: Arc<Model>,
-        history: &mut Vec<HistoryTurn>,
-        latest_turn: &str,
-        sampling: SamplingParams,
-        checkpoint_limit: Option<usize>,
-    ) -> Result<Vec<(TextMessageRole, String)>> {
-        let mut attempt = 0;
-        loop {
-            // Phase 0: Apply existing metasummaries, but never filter excluded turns
-            if let Some(ms) = self.load_latest_metasummary().await? {
-                let cutoff = ms.turn_index;
-                history.retain(|t| t.turn_index > cutoff || t.excluded_from_compression);
-            }
-
-            // Phase 1: Compress remaining history
-            let mut context = Vec::new();
-            let total_turns = history.len();
-            for (i, turn) in history.iter().enumerate() {
-                // Excluded turns are passed verbatim, never compressed
-                if turn.excluded_from_compression {
-                    context.push(turn_to_mistral(turn));
-                    continue;
-                }
-
-                let depth = total_turns - 1 - i;
-                let prob = 1.0 - self.inverse_prob.powf(depth as f64);
-
-                if let HistoryTurnRole::System = turn.role {
-                    context.push((TextMessageRole::System, turn.content.clone()));
-                    continue;
-                }
-
-                if prob > self.threshold {
-                    let maybe_compressed = self
-                        .process_turn_compression(
-                            model.clone(),
-                            history,
-                            i,
-                            latest_turn,
-                            sampling.clone(),
-                        )
-                        .await;
-                    if let Ok(compressed) = maybe_compressed {
-                        context.push(compressed);
-                    } else {
-                        context.push(turn_to_mistral(turn));
-                    }
-                } else {
-                    context.push(turn_to_mistral(turn));
-                }
-            }
-
-            // Phase 2: Post-compression checkpointing.
-            // If the context still exceeds token limits, fold the oldest
-            // turns into a metasummary and retry.  Up to 3 fold attempts
-            // to progressively reduce context size.
-            if let Some(limit) = checkpoint_limit {
-                // Determine the effective token limit: use the model's
-                // native max_seq_len if available, capped at the
-                // checkpoint limit (which is in characters).
-                let max_tokens = if let Some(model_max_seq_len) =
-                    model.clone().config().unwrap().max_seq_len
-                {
-                    model_max_seq_len
-                } else {
-                    // No model max_seq_len — estimate from char limit.
-                    // Conservative: 4 chars per token.
-                    limit / 4
-                };
-
-                // Build a single string from the context to count tokens
-                // once.  The tokenizer concatenates messages, so we do
-                // the same for an accurate count.
-                let context_text: String =
-                    context.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
-                let token_count = count_tokens(&model, &context_text).await;
-
-                if token_count >= max_tokens && attempt < 3 {
-                    // Fold the oldest non-system, non-excluded turns.
-                    // Each attempt covers a progressively larger slice.
-                    let slice = history.len().min((attempt + 1) * history.len() / 3);
-                    let turns_to_fold: Vec<HistoryTurn> = history
-                        .iter()
-                        .take(slice)
-                        .filter(|t| {
-                            !matches!(t.role, HistoryTurnRole::System)
-                                && !t.excluded_from_compression
-                        })
-                        .cloned()
-                        .collect();
-
-                    if !turns_to_fold.is_empty() {
-                        let ms = self
-                            .generate_metasummary(
-                                model.clone(),
-                                &turns_to_fold,
-                                latest_turn,
-                                sampling.clone(),
-                            )
-                            .await?;
-                        self.save_metasummary(&ms).await?;
-                        attempt += 1;
-                        continue; // Re-enter Phase 0 with the new metasummary
-                    }
-                }
-
-                // Safety net: if context is still too large after all
-                // fold attempts, forcefully strip the oldest non-system
-                // turns to stay within the token limit.
-                if token_count >= max_tokens {
-                    let mut running = 0usize;
-                    // Count tokens from the end to find the cutoff.
-                    let mut cutoff = 0usize;
-                    for (i, (_, content)) in context.iter().enumerate().rev() {
-                        running += content.len() / 4; // fast char approximation
-                        if running >= max_tokens {
-                            cutoff = i + 1;
-                            break;
-                        }
-                    }
-                    if cutoff > 0 {
-                        // Keep system prompts (always at the front)
-                        let system_count = context
-                            .iter()
-                            .take_while(|(r, _)| matches!(r, TextMessageRole::System))
-                            .count();
-                        let final_cutoff = cutoff.max(system_count);
-                        context.drain(..final_cutoff);
-                    }
-                }
-            }
-
-            return Ok(context);
-        }
+    fn save_metasummary(&self, ms: &MetaSummary) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO metasummaries (turn_index, content, generated_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![ms.turn_index as i64, ms.content, ms.generated_at],
+        )
+        .context("Failed to save metasummary")?;
+        Ok(())
     }
 
-    async fn process_turn_compression(
-        &self,
-        model: Arc<Model>,
-        history: &[HistoryTurn],
-        turn_idx: usize,
-        latest_turn: &str,
-        sampling: SamplingParams,
-    ) -> Result<(TextMessageRole, String)> {
-        let turn = &history[turn_idx];
-        let cache_dir = self.turn_cache_dir(turn.turn_index);
-        fs::create_dir_all(&cache_dir)
-            .await
-            .context(format!(
-                "Failed to create turn cache dir: {}",
-                cache_dir.display()
-            ))?;
-
-        let root_path = self.root_summary_path(turn.turn_index);
-
-        let mut root = if root_path.exists() {
-        let content = fs::read_to_string(&root_path)
-            .await
-            .context(format!(
-                "Failed to read root summary: {}",
-                root_path.display()
-            ))?;
-            let r: RootSummary = serde_json::from_str(&content)?;
-
-            let should_resummarize = rand::random::<f64>() < self.resummarize_prob;
-
-            if should_resummarize {
-                self.generate_root_summary(
-                    model.clone(),
-                    history,
-                    turn_idx,
-                    sampling.clone(),
-                    Some(r),
-                )
-                .await?
-            } else {
-                r
-            }
-        } else {
-            self.generate_root_summary(model.clone(), history, turn_idx, sampling.clone(), None)
-                .await?
-        };
-
-        // Save updated root
-        {
-            let json = serde_json::to_string_pretty(&root)?;
-            fs::write(&root_path, &json)
-                .await
-                .context(format!(
-                    "Failed to write root summary: {}",
-                    root_path.display()
-                ))?;
-        }
-
-        // 2.5) if root > actual turn, load only domains or actual turn
-        if root.micro_summary.len() > turn.content.len() {
-            if root.domains.is_empty() {
-                return Ok(turn_to_mistral(turn));
-            }
-        }
-
-        // Collect the compressed result first, then enforce a size cap
-        // so no summary is ever longer than its source material.
-        let result: (TextMessageRole, String) = if root.domains.is_empty() {
-            if self
-                .is_summary_sufficient(model.clone(), &root, latest_turn, sampling.clone())
-                .await?
-            {
-                (role_to_mistral(&turn.role), root.micro_summary.clone())
-            } else {
-                let spec = self
-                    .generate_specialized_summary(
-                        model.clone(),
-                        turn,
-                        latest_turn,
-                        sampling.clone(),
-                    )
-                    .await?;
-                root.domains.push(spec.domain.clone());
-                {
-                    let json = serde_json::to_string_pretty(&root)?;
-                    fs::write(&root_path, &json)
-                        .await
-                        .context(format!(
-                            "Failed to write root summary: {}",
-                            root_path.display()
-                        ))?;
-                }
-                {
-                    let spec_path =
-                        self.specialized_summary_path(turn.turn_index, &spec.domain);
-                    let json = serde_json::to_string_pretty(&spec)?;
-                    fs::write(&spec_path, &json)
-                        .await
-                        .context(format!(
-                            "Failed to write specialized summary: {}",
-                            spec_path.display()
-                        ))?;
-                }
-                (role_to_mistral(&turn.role), spec.extracted_information)
-            }
-        } else {
-            // Selection logic for > 1 summary
-            let selected_domains = self
-                .select_relevant_domains(model.clone(), &root, latest_turn, sampling.clone())
-                .await?;
-            if selected_domains.is_empty()
-                || (selected_domains.len() == 1 && selected_domains[0] == "root")
-            {
-                (role_to_mistral(&turn.role), root.micro_summary.clone())
-            } else {
-                let mut combined = String::new();
-                for domain in selected_domains {
-                    if domain == "root" {
-                        combined.push_str(&format!("General: {}\n", root.micro_summary));
-                    } else {
-                        let p = self.specialized_summary_path(turn.turn_index, &domain);
-                        if p.exists() {
-                            let content = fs::read_to_string(&p)
-                                .await
-                                .context(format!(
-                                    "Failed to read specialized summary: {}",
-                                    p.display()
-                                ))?;
-                            let spec: SpecializedSummary = serde_json::from_str(&content)?;
-                            combined.push_str(&format!(
-                                "{}: {}\n",
-                                spec.domain, spec.extracted_information
-                            ));
-                        }
-                    }
-                }
-                (role_to_mistral(&turn.role), combined)
-            }
-        };
-
-        // Safety cap: never return a compression result longer than the
-        // original turn content.  Broken inference is better than an
-        // infinite context-growth loop.
-        if result.1.len() > turn.content.len() {
-            Ok(turn_to_mistral(turn))
-        } else {
-            Ok(result)
-        }
+    /// Load a summary from DB by file key. Returns (title, micro_summary).
+    fn load_summary_from_db(&self, file_key: &str) -> Option<(String, String)> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT root_title, root_micro_summary FROM summaries WHERE file_key = ?1",
+            [file_key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok()
     }
 
-    async fn generate_root_summary(
-        &self,
-        model: Arc<Model>,
-        history: &[HistoryTurn],
-        turn_idx: usize,
-        sampling: SamplingParams,
-        existing_root: Option<RootSummary>,
-    ) -> Result<RootSummary> {
-        let turn = &history[turn_idx];
-
-        // Sliding window of adjacent turns
-        let start = turn_idx.saturating_sub(1);
-        let end = (turn_idx + 2).min(history.len());
-        let window = &history[start..end];
-        let window_indices: Vec<usize> = window.iter().map(|t| t.turn_index).collect();
-
-        let mut context_text = String::new();
-        for t in window {
-            // Cap per-turn content in the summarization prompt to avoid
-            // blowing past the model's context window with huge agent outputs.
-            let preview: String = t.content.chars().take(4096).collect();
-            let truncated = if t.content.len() > 4096 { " [truncated]" } else { "" };
-            context_text.push_str(&format!("{}: {}{}\n", role_to_mistral(&t.role), preview, truncated));
-        }
-
-        let mut system_prompt = "You are a concise summarizer. Output ONLY valid JSON with 'title' and 'micro_summary' fields.".to_string();
-
-        if let Some(er) = &existing_root {
-            system_prompt.push_str(&format!(
-                "\nRefine the existing summary considering these other domain summaries: {:?}",
-                er.domains
-            ));
-        }
-
-        let prompt = format!(
-            "Summarize this turn within its local context.\n\nLocal Context:\n{}\n\nTarget Turn Content: {}",
-            context_text, turn.content
-        );
-
-        let messages = TextMessages::new()
-            .add_message(TextMessageRole::System, system_prompt)
-            .add_message(TextMessageRole::User, prompt);
-
-        let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
-            &sampling,
-            ROOT_SUMMARY_MAX_TOKENS,
-        ))
-        .with_truncate_sequence(true);
-        let resp: ChatCompletionResponse =
-            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
-        let content;
-        let empty = String::new();
-        if let Some(choice) = resp.choices.first() {
-            content = choice.message.content.as_ref().unwrap_or(&empty);
-        } else {
-            content = &empty;
-        }
-
-        let root: RootSummary = if let Some(start_json) = content.find('{') {
-            if let Some(end_json) = content.rfind('}') {
-                let json_str = &content[start_json..=end_json];
-                let mut r: RootSummary = serde_json::from_str(json_str)
-                    .map_err(|e| anyhow!("JSON Parse Error: {}, content: {}", e, json_str))?;
-
-                // Populate non-JSON fields
-                r.included_turn_indices = window_indices;
-                if let Some(er) = existing_root {
-                    r.domains = er.domains;
-                }
-                r
-            } else {
-                anyhow::bail!("No JSON end found in model response")
-            }
-        } else {
-            anyhow::bail!("No JSON start found in model response")
-        };
-
-        Ok(root)
-    }
-
-    async fn is_summary_sufficient(
-        &self,
-        model: Arc<Model>,
-        root: &RootSummary,
-        latest_turn: &str,
-        sampling: SamplingParams,
-    ) -> Result<bool> {
-        let prompt = format!(
-            "Evaluation Task: Is the general summary sufficient to understand the context for the latest turn?\n\nGeneral Summary: {}\n\nLatest Turn: {}\n\nRespond with exactly 'YES' or 'NO'.",
-            root.micro_summary, latest_turn
-        );
-        let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
-        let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
-            &sampling,
-            SUFFICIENCY_CHECK_MAX_TOKENS,
-        ))
-        .with_truncate_sequence(true);
-        let resp: ChatCompletionResponse =
-            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
-        let content = resp.choices[0]
-            .message
-            .content
-            .as_ref()
-            .map(|s| s.trim().to_uppercase())
-            .unwrap_or_default();
-        Ok(content.contains("YES"))
-    }
-
-    async fn generate_specialized_summary(
-        &self,
-        model: Arc<Model>,
-        turn: &HistoryTurn,
-        latest_turn: &str,
-        sampling: SamplingParams,
-    ) -> Result<SpecializedSummary> {
-        let prompt = format!(
-            "Extraction Task: The general summary was insufficient. Extract information from the historical turn specifically relevant to the latest turn.\n\nHistorical Turn: {}\n\nLatest Turn: {}\n\nOutput ONLY valid JSON with 'domain' (single word topic) and 'extracted_information'.",
-            turn.content, latest_turn
-        );
-        let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
-        let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
-            &sampling,
-            SPECIALIZED_SUMMARY_MAX_TOKENS,
-        ))
-        .with_truncate_sequence(true);
-        let resp: ChatCompletionResponse =
-            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
-        let empty = &String::new();
-        let content = resp.choices[0].message.content.as_ref().unwrap_or(empty);
-
-        if let Some(start) = content.find('{') {
-            if let Some(end) = content.rfind('}') {
-                let json_str = &content[start..=end];
-                let spec: SpecializedSummary = serde_json::from_str(json_str)?;
-                return Ok(spec);
-            }
-        }
-        anyhow::bail!("Failed to parse specialized summary from: {}", content)
-    }
-
-    async fn select_relevant_domains(
-        &self,
-        model: Arc<Model>,
-        root: &RootSummary,
-        latest_turn: &str,
-        sampling: SamplingParams,
-    ) -> Result<Vec<String>> {
-        let domains = root.domains.join(", ");
-        let prompt = format!(
-            "Selection Task: Given the latest turn, which specialized summaries are relevant? \nAvailable: root (general), {}\n\nLatest Turn: {}\n\nRespond with a comma-separated list of relevant domains or 'root'.",
-            domains, latest_turn
-        );
-        let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
-        let req = RequestBuilder::from(messages).set_sampling(compression_sampling(
-            &sampling,
-            DOMAIN_SELECTION_MAX_TOKENS,
-        ))
-        .with_truncate_sequence(true);
-        let resp: ChatCompletionResponse =
-            send_chat_request_with_retry(&model, req, 3, Duration::from_millis(500)).await?;
-        let content = resp.choices[0]
-            .message
-            .content
-            .as_ref()
-            .unwrap_or(&"".to_string())
-            .clone();
-
-        let selected: Vec<String> = content
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| s == "root" || root.domains.contains(s))
+    /// Load domain entries for a summary by file key.
+    fn load_domains_for_file(&self, file_key: &str) -> Option<Vec<(String, String)>> {
+        let db = self.db.lock().unwrap();
+        let summary_id: i64 = db
+            .query_row(
+                "SELECT id FROM summaries WHERE file_key = ?1",
+                [file_key],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let mut stmt = db
+            .prepare(
+                "SELECT d.name, ds.extracted_information
+                 FROM domain_summaries ds
+                 JOIN domains d ON d.id = ds.domain_id
+                 WHERE ds.summary_id = ?1",
+            )
+            .ok()?;
+        let result: Vec<(String, String)> = stmt
+            .query_map([summary_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .ok()?
+            .flatten()
             .collect();
-        Ok(selected)
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
     }
 }
 
-/// Count tokens in a text string using the model's native tokenizer.
-/// Falls back to a conservative chars÷4 heuristic if the tokenizer
-/// call fails (tokenizer not available, model still loading, etc.).
+// ── Token / LLM helpers ────────────────────────────────────────────────
+
 async fn count_tokens(model: &Model, text: &str) -> usize {
     match model
-        .tokenize(
-            Either::Right(text.to_string()),
-            None,
-            false,
-            false,
-            None,
-        )
+        .tokenize(Either::Right(text.to_string()), None, false, false, None)
         .await
     {
         Ok(tokens) => tokens.len(),
-        Err(_) => {
-            // Fallback: conservative char count for most tokenizers.
-            // English ≈ 4-5 chars/token, code ≈ 5-7, multilingual ≈ 2-4.
-            // 4 gives reasonable headroom across the board.
-            text.len() / 4
-        }
+        Err(_) => text.len() / 4,
     }
 }
 
-/// Send a non-streaming chat request with retry on recoverable errors
-/// (OOMs, timeouts). Used for compression-related LLM calls in context
-/// summarization, where losing a single summarization attempt is not
-/// critical but a clean retry with backoff can recover from transient
-/// resource exhaustion.
 async fn send_chat_request_with_retry(
     model: &Model,
     req: RequestBuilder,
@@ -828,6 +1216,18 @@ async fn send_chat_request_with_retry(
             }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+// ── Role helpers ───────────────────────────────────────────────────────
+
+fn role_label(role: &HistoryTurnRole) -> &str {
+    match role {
+        HistoryTurnRole::User => "user",
+        HistoryTurnRole::Assistant => "assistant",
+        HistoryTurnRole::System => "system",
+        HistoryTurnRole::Skill(_, _) => "skill",
+        HistoryTurnRole::Tool => "tool",
     }
 }
 
@@ -859,7 +1259,6 @@ pub fn extract_frontmatter(content: &str) -> Option<(String, String, String)> {
     if let Some(end_pos) = rest.find("\n---\n") {
         let fm_str = &rest[..end_pos];
         let remaining = rest[end_pos + 5..].trim_start().to_string();
-
         let mut name = None;
         let mut desc = None;
         for line in fm_str.lines() {

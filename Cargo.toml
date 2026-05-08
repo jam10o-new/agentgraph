@@ -37,6 +37,7 @@ bitflags = "2.11.0"
 serde_yaml = "0.9.34"
 ag-config = { path = "ag-config" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 hound = "3.5.1"
 axum = "0.8"
