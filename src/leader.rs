@@ -11,11 +11,12 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{SystemTime, Duration};
 
 pub struct AgentEntry {
     pub handle: tokio::task::JoinHandle<()>,
     pub volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
+    pub output_forwarder: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
     pub trigger_path: PathBuf,
 }
 
@@ -79,13 +80,20 @@ impl Leader {
         };
 
         let config = self.config.lock().await.clone();
-        let agent = Agent::new(
+        let mut agent = Agent::new(
             name.clone(),
             agent_config.clone(),
             config,
             model.clone(),
             sampling,
         );
+
+        // Shared output forwarder: the leader installs a sender when it
+        // wants to capture output (e.g. `ag run --quiet`). The agent
+        // sends its inference result through it after each turn.
+        let forwarder: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>> =
+            Arc::new(Mutex::new(None));
+        agent.output_forwarder = forwarder.clone();
         
         // We use the first input directory as the "trigger" path for manual runs
         let trigger_path = PathBuf::from(agent_config.inputs.first().cloned().unwrap_or_else(|| ".".into()));
@@ -101,6 +109,7 @@ impl Leader {
         agents.insert(name, AgentEntry {
             handle,
             volatile_context,
+            output_forwarder: forwarder,
             trigger_path,
         });
         Ok(())
@@ -169,7 +178,7 @@ impl Leader {
                     eprintln!("Pending command spawn error: {}", e);
                 }
             }
-            Command::RunAgent(name, message) => {
+            Command::RunAgent(name, message, _quiet) => {
                 let agents_map = self.agents.lock().await;
                 if let Some(entry) = agents_map.get(&name) {
                     if let Some(msg) = message {
@@ -351,21 +360,46 @@ impl Leader {
                                             let _ = stream.write_all(b"Agent Spawned").await;
                                         }
                                     }
-                                    Command::RunAgent(name, message) => {
-                                        let agents_map = agents.lock().await;
-                                        if let Some(entry) = agents_map.get(&name) {
-                                            if let Some(msg) = message {
-                                                entry.volatile_context.lock().await.push((TextMessageRole::User, msg));
-                                            }
-                                            // Trigger by touching a dummy file in the first input dir
-                                            let trigger_file = entry.trigger_path.join(format!(".trigger-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()));
-                                            let _ = tokio::fs::write(&trigger_file, b"").await;
-                                            let _ = tokio::fs::remove_file(&trigger_file).await;
-                                            let _ = stream.write_all(format!("Triggered agent {}", name).as_bytes()).await;
-                                        } else {
-                                            let _ = stream.write_all(format!("Agent {} not found", name).as_bytes()).await;
-                                        }
-                                    }
+Command::RunAgent(name, message, quiet) => {
+    let forwarder_opt = {
+        let agents_map = agents.lock().await;
+        if let Some(entry) = agents_map.get(&name) {
+            if let Some(msg) = message {
+                entry.volatile_context.lock().await.push((TextMessageRole::User, msg));
+            }
+            Some((entry.output_forwarder.clone(), entry.trigger_path.clone()))
+        } else {
+            None
+        }
+    };
+
+    match forwarder_opt {
+        Some((forwarder, trigger_path)) => {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            forwarder.lock().await.replace(tx);
+
+            let trigger_file = trigger_path.join(format!(".trigger-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()));
+            let _ = tokio::fs::write(&trigger_file, b"").await;
+            let _ = tokio::fs::remove_file(&trigger_file).await;
+
+            if !quiet {
+                let _ = stream.write_all(format!("Triggered agent {}\n", name).as_bytes()).await;
+            }
+
+            let output = tokio::time::timeout(
+                Duration::from_secs(120),
+                rx.recv(),
+            ).await.ok().flatten().unwrap_or_default();
+
+            forwarder.lock().await.take();
+
+            let _ = stream.write_all(output.as_bytes()).await;
+        }
+        None => {
+            let _ = stream.write_all(format!("Agent {} not found", name).as_bytes()).await;
+        }
+    }
+}
                                     Command::StopAgent(name) => {
                                         let mut agents_map = agents.lock().await;
                                         if let Some(e) = agents_map.remove(&name) {

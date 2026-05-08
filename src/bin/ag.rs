@@ -31,6 +31,10 @@ enum Commands {
         agent: String,
         /// Optional message to inject into volatile context
         message: Option<String>,
+        /// Suppress all non-output logging; emit ONLY the model's
+        /// response on stdout (suitable for piping to execution).
+        #[arg(long)]
+        quiet: bool,
     },
     /// Stop a specific agent
     Stop {
@@ -195,7 +199,7 @@ async fn main() -> Result<()> {
         _ => {
             ensure_leader().await?;
             let cmd = match cli.command {
-                Commands::Run { agent, message } => Command::RunAgent(agent, message),
+                Commands::Run { agent, message, quiet } => Command::RunAgent(agent, message, quiet),
                 Commands::Stop { agent } => Command::StopAgent(agent),
                 Commands::Reload => Command::ReloadConfig,
                 Commands::Spawn {

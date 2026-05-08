@@ -35,6 +35,7 @@ pub async fn find_leader_socket() -> Option<PathBuf> {
 pub struct AgentLogger {
     pub name: String,
     pub log_dir: PathBuf,
+    pub quiet: bool,
 }
 
 impl AgentLogger {
@@ -42,6 +43,7 @@ impl AgentLogger {
         Self {
             name: name.to_string(),
             log_dir: PathBuf::from("logs"),
+            quiet: false,
         }
     }
 
@@ -60,7 +62,8 @@ impl AgentLogger {
             let _ = file.write_all(line.as_bytes()).await;
         }
         
-        // Also print to stdout for convenience in tests/CLI
-        println!("Agent {}: {}", self.name, message);
+        if !self.quiet {
+            println!("Agent {}: {}", self.name, message);
+        }
     }
 }

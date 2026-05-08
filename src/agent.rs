@@ -38,6 +38,7 @@ pub struct Agent {
     pub model: Arc<Model>,
     pub sampling: SamplingParams,
     pub volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
+    pub output_forwarder: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
     pub logger: AgentLogger,
 }
 
@@ -56,6 +57,7 @@ impl Agent {
             model,
             sampling,
             volatile_context: Arc::new(Mutex::new(Vec::new())),
+            output_forwarder: Arc::new(Mutex::new(None)),
             logger: AgentLogger::new(&name),
         }
     }
@@ -156,6 +158,7 @@ impl Agent {
                     let agent_name = name.clone();
                     let log_name = name.clone();
                     let volatile_context = self.volatile_context.clone();
+                    let forwarder = self.output_forwarder.clone();
                     let logger = AgentLogger::new(&name);
                     let done_tx = inference_done_tx.clone();
 
@@ -163,8 +166,15 @@ impl Agent {
                     retrigger_pending = false;
                     tokio::spawn(async move {
                         let result = run_inference(agent_name, model, config, global_config, sampling, volatile_context, logger).await;
-                        if let Err(e) = result {
-                            eprintln!("Inference error for agent {}: {:?}", log_name, e);
+                        match result {
+                            Ok(content) => {
+                                if let Some(tx) = forwarder.lock().await.take() {
+                                    let _ = tx.send(content);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Inference error for agent {}: {:?}", log_name, e);
+                            }
                         }
                         let _ = done_tx.send(()).await;
                     });
@@ -188,14 +198,22 @@ impl Agent {
                         let agent_name = name.clone();
                         let log_name = name.clone();
                         let volatile_context = self.volatile_context.clone();
+                        let forwarder = self.output_forwarder.clone();
                         let logger = AgentLogger::new(&name);
                         let done_tx = inference_done_tx.clone();
 
                         inference_in_progress = true;
                         tokio::spawn(async move {
                             let result = run_inference(agent_name, model, config, global_config, sampling, volatile_context, logger).await;
-                            if let Err(e) = result {
-                                eprintln!("Inference error for agent {}: {:?}", log_name, e);
+                            match result {
+                                Ok(content) => {
+                                    if let Some(tx) = forwarder.lock().await.take() {
+                                        let _ = tx.send(content);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Inference error for agent {}: {:?}", log_name, e);
+                                }
                             }
                             let _ = done_tx.send(()).await;
                         });
@@ -352,7 +370,7 @@ async fn run_inference(
     sampling: SamplingParams,
     volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
     logger: AgentLogger,
-) -> Result<()> {
+) -> Result<String> {
     logger.log("Starting inference turn").await;
 
     // 1. Collate System Prompts
@@ -883,6 +901,7 @@ async fn run_inference(
     let oom_aggressive_limit = config.context_checkpoint_limit
         .map(|l| (l / 2).max(1));
 
+    let mut final_output = String::new();
     loop {
         // If the previous turn failed with OOM, recompress the original
         // uncompressed history with tighter limits before rebuilding the
@@ -1175,6 +1194,8 @@ async fn run_inference(
                 .await;
         }
 
+        final_output = output_content.clone();
+
         if current_tool_calls.is_empty() {
             break;
         }
@@ -1440,7 +1461,7 @@ async fn run_inference(
     }
 
     logger.log("Inference turn complete").await;
-    Ok(())
+    Ok(final_output)
 }
 
 async fn send_ipc_command(cmd: Command) -> Result<String> {
