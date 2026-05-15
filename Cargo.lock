@@ -131,6 +131,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "ag-api-http"
+version = "0.1.0"
+dependencies = [
+ "ag-config",
+ "agentgraph",
+ "anyhow",
+ "axum",
+ "clap",
+ "http-body-util",
+ "mistralrs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tower-http",
+ "uuid 1.22.0",
+]
+
+[[package]]
+name = "ag-api-telegram"
+version = "0.1.0"
+dependencies = [
+ "ag-config",
+ "agentgraph",
+ "anyhow",
+ "clap",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ag-config"
 version = "0.1.0"
 dependencies = [
@@ -164,7 +199,6 @@ version = "0.1.0"
 dependencies = [
  "ag-config",
  "anyhow",
- "axum",
  "base64 0.22.1",
  "bitflags 2.11.0",
  "bytemuck",
@@ -187,11 +221,9 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
- "tokio-stream",
- "tower",
- "tower-http",
  "uuid 1.22.0",
  "walkdir",
+ "which",
  "xxhash-rust",
 ]
 
@@ -8461,7 +8493,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]

@@ -35,8 +35,15 @@ struct TelegramConfig {
     bot_token: String,
     #[serde(default = "default_agent")]
     default_agent: String,
+    /// Per-user agent overrides. Key is the Telegram user ID (as string).
     #[serde(default)]
     user_agents: HashMap<String, String>,
+    /// Per-group agent overrides. Key is the Telegram group ID (as string, typically negative).
+    #[serde(default)]
+    group_agents: HashMap<String, String>,
+    /// Per-channel agent overrides. Key is the Telegram channel ID.
+    #[serde(default)]
+    channel_agents: HashMap<String, String>,
     #[serde(default)]
     allowed_users: Vec<i64>,
 }
@@ -95,19 +102,20 @@ async fn send_chat_action(client: &reqwest::Client, token: &str, chat_id: i64, a
 
 async fn handle_command(
     state: &BotState, client: &reqwest::Client,
-    chat_id: i64, cmd: &str,
+    chat_id: i64, chat_type: &str, cmd: &str,
 ) {
     let token = &state.tg.bot_token;
 
     let response = match cmd.split_whitespace().next().unwrap_or("") {
         "/start" => format!(
             "🤖 AgentGraph bot ready.\nAgent: `{}`\nType /help for commands.",
-            state.agent_for(chat_id).await
+            state.agent_for(chat_id, chat_type).await
         ),
         "/help" => concat!(
             "**Commands**\n",
             "/tree — Show conversation tree\n",
             "/system — Read system directory\n",
+            "/system add <text> — Add to system dir\n",
             "/reset — Reset conversation\n",
             "/config — Show agent config\n",
             "/help — This help",
@@ -144,8 +152,8 @@ async fn handle_command(
             "Conversation reset. Start fresh!".into()
         },
         "/config" => {
-            let agent = state.agent_for(chat_id).await;
-            format!("**Session config**\nChat ID: `{chat_id}`\nAgent: `{agent}`")
+            let agent = state.agent_for(chat_id, chat_type).await;
+            format!("**Session config**\nChat ID: `{chat_id}`\nType: `{chat_type}`\nAgent: `{agent}`")
         },
         "/system" => {
             let hist = state.chats.lock().await
@@ -185,18 +193,57 @@ async fn handle_command(
                 "Failed to reach leader.".into()
             }
         },
-        _ => "Unknown command. Type /help for available commands.".into(),
+        _ => {
+            // /system add <text>
+            if cmd.starts_with("/system add ") {
+                let content = cmd.strip_prefix("/system add ").unwrap_or("");
+                if content.is_empty() {
+                    "Usage: /system add <text>".into()
+                } else {
+                    // Write to session tree system dir via IPC
+                    match ipc_send(&state.socket_path, &Command::SessionSetupDirs {
+                        session_id: format!("tg-{chat_id}"),
+                        system_msgs: vec![content.to_string()],
+                    }).await {
+                        Ok(resp) if resp.ok => "System directory updated.".into(),
+                        Ok(resp) => resp.error.unwrap_or_else(|| "error".into()),
+                        Err(e) => format!("IPC error: {e}"),
+                    }
+                }
+            } else {
+                "Unknown command. Type /help for available commands.".into()
+            }
+        },
     };
 
     send_message(client, token, chat_id, &response).await;
 }
 
 impl BotState {
-    async fn agent_for(&self, chat_id: i64) -> String {
-        let user_id = chat_id.to_string();
-        self.tg.user_agents.get(&user_id)
-            .cloned()
-            .unwrap_or_else(|| self.tg.default_agent.clone())
+    /// Resolve which agent to use for a chat, respecting per-user, per-group,
+    /// and per-channel overrides (in that priority order). Falls back to
+    /// `default_agent`.
+    async fn agent_for(&self, chat_id: i64, chat_type: &str) -> String {
+        let id_str = chat_id.to_string();
+        // Check user override
+        if let Some(agent) = self.tg.user_agents.get(&id_str) {
+            return agent.clone();
+        }
+        // Check group/channel override based on chat type
+        match chat_type {
+            "group" | "supergroup" => {
+                if let Some(agent) = self.tg.group_agents.get(&id_str) {
+                    return agent.clone();
+                }
+            }
+            "channel" => {
+                if let Some(agent) = self.tg.channel_agents.get(&id_str) {
+                    return agent.clone();
+                }
+            }
+            _ => {}
+        }
+        self.tg.default_agent.clone()
     }
 }
 
@@ -271,6 +318,7 @@ async fn main() {
                 };
 
                 let chat_id = msg["chat"]["id"].as_i64().unwrap_or(0);
+                let chat_type = msg["chat"]["type"].as_str().unwrap_or("private");
                 let text = msg["text"].as_str().unwrap_or("");
                 let user_id = msg["from"]["id"].as_i64().unwrap_or(0);
 
@@ -282,12 +330,12 @@ async fn main() {
 
                 // Commands
                 if text.starts_with('/') {
-                    handle_command(&state, &client, chat_id, text).await;
+                    handle_command(&state, &client, chat_id, chat_type, text).await;
                     continue;
                 }
 
                 // Chat message → session inference
-                let agent = state.agent_for(chat_id).await;
+                let agent = state.agent_for(chat_id, chat_type).await;
 
                 // Update local history
                 let steps = {
