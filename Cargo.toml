@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "ag-designer", "ag-config"]
+members = [".", "ag-designer", "ag-config", "ag-api-http", "ag-api-telegram"]
 
 [package]
 name = "agentgraph"
@@ -40,11 +40,8 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 hound = "3.5.1"
-axum = "0.8"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-tower = { version = "0.5", features = ["util"] }
-tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
+which = "7"
 
 [features]
 default = ["cuda", "cudnn", "flash-attn"]

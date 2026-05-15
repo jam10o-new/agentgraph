@@ -13,4 +13,101 @@ pub enum Command {
     Shutdown,
     SpawnAgent { name: String, config: AgentConfig },
     UpdateConfig(crate::config::Config),
+
+    // ── Session-tree commands (used by API frontends via IPC) ──────────
+
+    /// Create a new session tree for a given identifier.
+    SessionCreate { session_id: String },
+
+    /// Delete a session tree.
+    SessionDelete { session_id: String },
+
+    /// List all active session IDs.
+    SessionList,
+
+    /// Walk conversation steps through a tree, creating nodes.
+    SessionBuild {
+        session_id: String,
+        steps: Vec<SessionStep>,
+    },
+
+    /// Create per-request stream/tools/system dirs and populate system messages.
+    SessionSetupDirs {
+        session_id: String,
+        system_msgs: Vec<String>,
+    },
+
+    /// Create a fresh response directory for the given hash position.
+    SessionCreateResponseDir {
+        session_id: String,
+        current_hash: String,
+    },
+
+    /// Cache an assistant response in the tree so future requests can reuse it.
+    SessionCacheResponse {
+        session_id: String,
+        parent_hash: String,
+        content: String,
+        response_dir: String,
+    },
+
+    /// High-level command: run a chat turn within a session. The leader handles
+    /// all session management, agent spawning, inference, and caching internally.
+    /// Returns the assistant's response text (or starts streaming via stream_path).
+    SessionChat {
+        session_id: String,
+        steps: Vec<SessionStep>,
+        model: String,
+        stream: bool,
+    },
+}
+
+/// Response from a SessionChat command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionChatResponse {
+    pub ok: bool,
+    pub content: Option<String>,
+    pub stream_path: Option<String>,
+    pub error: Option<String>,
+}
+
+/// One step in a conversation sent over IPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStep {
+    pub role: String,
+    pub content: String,
+}
+
+/// Structured response returned by session commands over IPC.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IpcResponse {
+    pub ok: bool,
+    pub data: Option<String>,
+    pub error: Option<String>,
+}
+
+impl IpcResponse {
+    pub fn ok_json<T: Serialize>(v: &T) -> Self {
+        Self {
+            ok: true,
+            data: Some(serde_json::to_string(v).unwrap_or_default()),
+            error: None,
+        }
+    }
+
+    pub fn ok_str(s: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            data: Some(s.into()),
+            error: None,
+        }
+    }
+
+    pub fn err(s: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            data: None,
+            error: Some(s.into()),
+        }
+    }
 }

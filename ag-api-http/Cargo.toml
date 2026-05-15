@@ -1,0 +1,27 @@
+[package]
+name = "ag-api-http"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ag-api-http"
+path = "src/main.rs"
+
+[dependencies]
+agentgraph = { path = ".." }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-stream = "0.1"
+serde = "1"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+tempfile = "3"
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs" }
+clap = { version = "4", features = ["derive"] }
+ag-config = { path = "../ag-config" }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

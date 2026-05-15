@@ -81,7 +81,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         dtype,
                         builder,
                         chat_template,
-                        max_num_seqs: 32,
+                        ..
                     },
             } => {
                 ui.set_width(300.0);
@@ -232,10 +232,13 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         columns[1].vertical(|ui| {
                             ui.label(egui::RichText::new("Output").strong());
                             ui.horizontal(|ui| {
-                                ui.text_edit_singleline(output);
+                                let mut out_str = output.first().cloned().unwrap_or_default();
+                                if ui.text_edit_singleline(&mut out_str).changed() {
+                                    *output = if out_str.is_empty() { vec![] } else { vec![out_str] };
+                                }
                                 if ui.button("📁").clicked() {
                                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                        *output = path.display().to_string();
+                                        *output = vec![path.display().to_string()];
                                     }
                                 }
                             });
@@ -480,7 +483,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
                     } = dest_node_mut
                     {
                         if to.id.input > dest_config.inputs.len() {
-                            dest_config.inputs.push(output_path);
+                            dest_config.inputs.extend(output_path);
                             let new_in_pin = InPinId {
                                 node: to.id.node,
                                 input: dest_config.inputs.len(),
@@ -525,6 +528,8 @@ impl SnarlApp {
             models: HashMap::new(),
             agents: HashMap::new(),
             shutdown_on_idle: self.shutdown_on_idle,
+            model_idle_secs: None,
+            plugins: HashMap::new(),
         };
 
         let mut node_to_model_alias: HashMap<NodeId, String> = HashMap::new();
@@ -587,7 +592,7 @@ impl SnarlApp {
                             ..
                         } = remote_node
                         {
-                            resolved_inputs.push(remote_config.output.clone());
+                            resolved_inputs.extend(remote_config.output.clone());
                             found_remote = true;
                             break;
                         }
@@ -687,7 +692,7 @@ impl SnarlApp {
                 // Input connections
                 for (i, input_path) in a.inputs.iter().enumerate() {
                     for (other_name, other_a) in &config.agents {
-                        if other_a.output == Some(*input_path) {
+                        if other_a.output.iter().any(|o| o == input_path) {
                             let other_id = agent_name_to_id[other_name];
                             self.snarl.connect(
                                 OutPinId {
@@ -755,7 +760,7 @@ impl eframe::App for SnarlApp {
                             name: String::new(),
                             config: AgentConfig {
                                 inputs: Vec::new(),
-                                output: Some(String::new()),
+                                output: Vec::new(),
                                 stream_output: None,
                                 tool_output: None,
                                 system: Vec::new(),
@@ -778,6 +783,7 @@ impl eframe::App for SnarlApp {
                                 inference_retries: 3,
                                 enable_oom_recovery: true,
                                 inference_retry_delay_ms: 500,
+                                compression_db_path: None,
                             },
                         },
                     );

@@ -1,7 +1,8 @@
 use crate::config::{Config, AgentConfig};
 use crate::model_loader::load_models;
 use crate::agent::Agent;
-use crate::ipc::Command;
+use crate::ipc::{Command, IpcResponse, SessionStep};
+use crate::remote_session::{RemoteSessionState, ConversationStep};
 use crate::utils::{is_leader_alive, LeaderStatus, LEADER_PID_FILE};
 use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
@@ -43,6 +44,8 @@ pub struct Leader {
     pub model: Option<Arc<mistralrs::Model>>,
     pub agents: Arc<Mutex<HashMap<String, AgentEntry>>>,
     pub model_access: ModelAccess,
+    /// Shared session-tree state accessible via IPC by API frontends.
+    pub sessions: Arc<RemoteSessionState>,
 }
 
 impl Leader {
@@ -66,6 +69,7 @@ impl Leader {
             model, 
             agents: Arc::new(Mutex::new(HashMap::new())),
             model_access: ModelAccess::default(),
+            sessions: Arc::new(RemoteSessionState::new()),
         })
     }
 
@@ -218,9 +222,326 @@ impl Leader {
                     e.handle.abort();
                 }
             }
-            // Other commands are stateless (Status, Shutdown, Reload) —
-            // no need to replay them from a pending file.
+            // Session and other stateless commands — no need to replay.
             _ => {}
+        }
+    }
+
+    /// Resolve an agent name for a chat context. Returns the agent name
+    /// to use, falling back to the default "api" agent.
+    pub async fn resolve_chat_agent(&self, _chat_id: &str) -> String {
+        // Per-user overrides are handled by the frontend binary (telegram/http).
+        // The leader just needs to ensure a fallback "api" agent exists.
+        {
+            let mut config = self.config.lock().await;
+            if !config.agents.contains_key("api") {
+                let first_model = config.models.keys().next().cloned().unwrap_or_else(|| "primary".to_string());
+                config.agents.insert(
+                    "api".to_string(),
+                    AgentConfig {
+                        inputs: vec![],
+                        output: vec![],
+                        stream_output: None,
+                        tool_output: None,
+                        consume_tool_calls: false,
+                        system: vec![],
+                        model: first_model,
+                        history_limit: None,
+                        realtime_audio: false,
+                        allowed_extensions: vec![],
+                        prompt: None,
+                        sampling: Default::default(),
+                        compression: Default::default(),
+                        context_checkpoint_limit: Some(10000),
+                        excluded_from_summary: vec![],
+                        tools_enabled: true,
+                        enable_thinking: false,
+                        inference_retries: 3,
+                        enable_oom_recovery: true,
+                        inference_retry_delay_ms: 500,
+                        compression_db_path: None,
+                    },
+                );
+            }
+        }
+        "api".to_string()
+    }
+
+    /// Handle a session-tree IPC command. Returns the JSON-serialized IpcResponse.
+    async fn handle_session_command(&self, cmd: Command) -> String {
+        let resp = match cmd {
+            Command::SessionCreate { session_id } => {
+                self.sessions.get_or_create_tree(&session_id).await;
+                IpcResponse::ok_str("created")
+            }
+            Command::SessionDelete { session_id } => {
+                self.sessions.remove_tree(&session_id).await;
+                IpcResponse::ok_str("deleted")
+            }
+            Command::SessionList => {
+                let ids = self.sessions.list_ids().await;
+                IpcResponse::ok_json(&ids)
+            }
+            Command::SessionBuild { session_id, steps } => {
+                let tree = self.sessions.get_or_create_tree(&session_id).await;
+                let conv_steps: Vec<ConversationStep> = steps
+                    .into_iter()
+                    .map(|s| ConversationStep { role: s.role, content: s.content })
+                    .collect();
+                match crate::remote_session::build_conversation(&tree, &conv_steps).await {
+                    Ok(state) => IpcResponse::ok_json(&state),
+                    Err(e) => IpcResponse::err(e),
+                }
+            }
+            Command::SessionSetupDirs { session_id, system_msgs } => {
+                let tree = self.sessions.get_or_create_tree(&session_id).await;
+                match crate::remote_session::setup_request_dirs(&tree, &system_msgs).await {
+                    Ok((stream_dir, tools_dir, system_dir)) => {
+                        let info = serde_json::json!({
+                            "stream_dir": stream_dir.to_string_lossy(),
+                            "tools_dir": tools_dir.to_string_lossy(),
+                            "system_dir": system_dir.to_string_lossy(),
+                        });
+                        IpcResponse::ok_json(&info)
+                    }
+                    Err(e) => IpcResponse::err(e),
+                }
+            }
+            Command::SessionCreateResponseDir { session_id, current_hash } => {
+                let tree = self.sessions.get_or_create_tree(&session_id).await;
+                match crate::remote_session::create_response_dir(&tree, &current_hash).await {
+                    Ok(dir) => IpcResponse::ok_str(dir.to_string_lossy().to_string()),
+                    Err(e) => IpcResponse::err(e),
+                }
+            }
+            Command::SessionCacheResponse { session_id, parent_hash, content, response_dir } => {
+                let tree = self.sessions.get_or_create_tree(&session_id).await;
+                crate::remote_session::cache_response(
+                    &tree, &parent_hash, &content, PathBuf::from(&response_dir),
+                ).await;
+                IpcResponse::ok_str("cached")
+            }
+            Command::SessionChat { session_id, steps, model, .. } => {
+                match self.run_session_chat(&session_id, &steps, &model).await {
+                    Ok(content) => IpcResponse {
+                        ok: true, data: Some(content), error: None,
+                    },
+                    Err(e) => IpcResponse::err(e.to_string()),
+                }
+            }
+            _ => IpcResponse::err("unexpected command in session handler"),
+        };
+        serde_json::to_string(&resp).unwrap_or_else(|_| r#"{"ok":false,"error":"serialize"}"#.to_string())
+    }
+
+    /// Run a full chat turn: build conversation state, spawn an ephemeral agent,
+    /// collect output. Returns the assistant's response text.
+    async fn run_session_chat(
+        &self,
+        session_id: &str,
+        steps: &[SessionStep],
+        model: &str,
+    ) -> Result<String> {
+        let config = self.config.lock().await;
+        let base_agent = config.agents.get(model)
+            .ok_or_else(|| anyhow!("agent '{}' not found in config", model))?
+            .clone();
+        let global_config = config.clone();
+        drop(config);
+
+        let tree = self.sessions.get_or_create_tree(session_id).await;
+
+        let conv_steps: Vec<ConversationStep> = steps.iter().map(|s| ConversationStep {
+            role: s.role.clone(),
+            content: s.content.clone(),
+        }).collect();
+
+        let state = crate::remote_session::build_conversation(&tree, &conv_steps)
+            .await
+            .map_err(|e| anyhow!("build_conversation: {}", e))?;
+
+        let (_stream_dir, _tools_dir, system_dir) =
+            crate::remote_session::setup_request_dirs(&tree, &state.system_msgs)
+                .await
+                .map_err(|e| anyhow!("setup_request_dirs: {}", e))?;
+
+        let response_dir = crate::remote_session::create_response_dir(&tree, &state.current_hash)
+            .await
+            .map_err(|e| anyhow!("create_response_dir: {}", e))?;
+
+        // Build isolated agent config
+        let mut isolated_config = base_agent.clone();
+        isolated_config.inputs = state.user_dirs.clone();
+        let mut output_dirs = vec![response_dir.to_string_lossy().to_string()];
+        output_dirs.extend(state.assistant_dirs);
+        isolated_config.output = output_dirs;
+        isolated_config.system = if state.system_msgs.is_empty() {
+            base_agent.system.clone()
+        } else {
+            let mut s = vec![system_dir.to_string_lossy().to_string()];
+            s.extend(base_agent.system.iter().cloned());
+            s
+        };
+
+        let model_arc = self.model.as_ref()
+            .ok_or_else(|| anyhow!("no model loaded"))?.clone();
+
+        let sampling = SamplingParams {
+            temperature: isolated_config.sampling.temperature,
+            top_p: isolated_config.sampling.top_p,
+            top_k: isolated_config.sampling.top_k,
+            min_p: isolated_config.sampling.min_p,
+            repetition_penalty: isolated_config.sampling.repetition_penalty,
+            frequency_penalty: isolated_config.sampling.frequency_penalty,
+            presence_penalty: isolated_config.sampling.presence_penalty,
+            max_len: isolated_config.sampling.max_len,
+            top_n_logprobs: 0,
+            stop_toks: None,
+            logits_bias: None,
+            n_choices: 1,
+            dry_params: None,
+        };
+
+        let agent_name = format!("session-{}-{}", session_id, uuid::Uuid::new_v4());
+        let agent = crate::Agent::new(
+            agent_name, isolated_config, global_config,
+            model_arc, sampling, self.model_access.clone(),
+        );
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = agent.run_loop().await {
+                eprintln!("Session agent error: {:?}", e);
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Write trigger
+        let trigger_dir = if state.user_dirs.is_empty() {
+            &response_dir
+        } else {
+            &PathBuf::from(state.user_dirs.last().unwrap())
+        };
+        let trigger_path = trigger_dir.join(format!(
+            "session-latest-{}.txt",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        tokio::fs::write(&trigger_path, &state.latest_user_msg)
+            .await
+            .map_err(|e| anyhow!("write trigger: {}", e))?;
+
+        let output_path = response_dir.to_string_lossy().to_string();
+        let content = wait_for_output(Some(output_path.clone()), SystemTime::now())
+            .await
+            .map_err(|e| anyhow!("wait_for_output: {}", e))?;
+
+        handle.abort();
+
+        // Cache response
+        crate::remote_session::cache_response(
+            &tree, &state.current_hash, &content, response_dir,
+        ).await;
+
+        Ok(content)
+    }
+}
+
+/// Wait for a new output file to appear in `output_dir` after `after` time.
+async fn wait_for_output(
+    output_dir_maybe: Option<String>,
+    after: SystemTime,
+) -> anyhow::Result<String> {
+    use tokio::time::timeout;
+    if let Some(output_dir) = output_dir_maybe {
+        let output_path = PathBuf::from(output_dir);
+        timeout(Duration::from_secs(120), async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut candidates = Vec::new();
+                if let Ok(mut entries) = tokio::fs::read_dir(&output_path).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Ok(metadata) = entry.metadata().await {
+                                let modified = metadata.modified()
+                                    .or_else(|_| metadata.created())
+                                    .map_err(|e| anyhow!("mtime: {}: {}", path.display(), e))?;
+                                if modified >= after {
+                                    candidates.push((modified, path));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((_, path)) = candidates.into_iter().max_by_key(|(t, _)| *t) {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    return anyhow::Result::Ok(
+                        tokio::fs::read_to_string(&path).await
+                            .map_err(|e| anyhow!("read output: {}", e))?,
+                    );
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("Timeout waiting for agent output"))?
+    } else {
+        Err(anyhow!("No output directory configured"))
+    }
+}
+
+impl Leader {
+    /// Spawn API frontend binaries discovered via the `api-*` config convention.
+    ///
+    /// Scans `config.plugins` for keys matching `api-*`.  For each found key,
+    /// looks up `ag-{key}` in PATH and spawns it with `--config` and `--section`,
+    /// passing the section's raw YAML value as the section argument.  Missing
+    /// binaries log a warning but never prevent the leader from starting.
+    ///
+    /// Third-party API plugins need only a matching key in the config file and
+    /// a `ag-api-<name>` binary on PATH — no leader changes required.
+    async fn spawn_api_binaries(&self) {
+        let pipe_path = PathBuf::from("/tmp/agentgraph")
+            .join(format!("ag-{}.sock", std::process::id()));
+
+        let config = self.config.lock().await;
+
+        for (key, value) in &config.plugins {
+            // Only process keys matching `api-*`
+            let section = match key.strip_prefix("api-") {
+                Some(s) => s,
+                None => continue,
+            };
+            let binary_name = format!("ag-api-{}", section);
+
+            // Serialize the section's YAML value to a JSON string so the child
+            // binary can parse it as its own config struct.
+            let section_json = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+
+            if let Ok(path) = which::which(&binary_name) {
+                if let Err(e) = std::process::Command::new(path)
+                    .arg("--config")
+                    .arg(&self.config_path)
+                    .arg("--socket")
+                    .arg(pipe_path.to_string_lossy().as_ref())
+                    .arg("--section")
+                    .arg(&section_json)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                {
+                    eprintln!("Leader: failed to spawn {}: {}", binary_name, e);
+                } else {
+                    println!("Leader: spawned {} (section api-{})", binary_name, section);
+                }
+            } else {
+                eprintln!(
+                    "Leader: {} not found in PATH — api-{} frontend unavailable",
+                    binary_name, section
+                );
+            }
         }
     }
 
@@ -274,71 +595,8 @@ impl Leader {
             let _ = tokio::fs::remove_file(pending_path).await;
         }
 
-        // 4. Start API server if enabled
-        let api_config = {
-            let config = self.config.lock().await;
-            config.api.clone()
-        };
-        if let Some(ref api) = api_config {
-            if api.enabled {
-                // Inject a default "api" agent template so consumers can
-                // unconditionally POST to /v1/chat/completions with model "api".
-                {
-                    let mut config = self.config.lock().await;
-                    if !config.agents.contains_key("api") {
-                        let first_model = config.models.keys().next().cloned().unwrap_or_else(|| "primary".to_string());
-                        config.agents.insert(
-                            "api".to_string(),
-                            AgentConfig {
-                                inputs: vec![],
-                                output: vec![],
-                                stream_output: None,
-                                tool_output: None,
-                                consume_tool_calls: false,
-                                system: vec![],
-                                model: first_model,
-                                history_limit: None,
-                                realtime_audio: false,
-                                allowed_extensions: vec![],
-                                prompt: None,
-                                sampling: Default::default(),
-                                compression: Default::default(),
-                                context_checkpoint_limit: Some(10000),
-                                excluded_from_summary: vec![],
-                                tools_enabled: true,
-                                enable_thinking: false,
-                                inference_retries: 3,
-                                enable_oom_recovery: true,
-                                inference_retry_delay_ms: 500,
-                                compression_db_path: None,
-                            },
-                        );
-                    }
-                }
-
-                let api_state = Arc::new(crate::api::ApiState {
-                    config: self.config.clone(),
-                    model: self.model.clone(),
-                    trees: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-                    model_access: self.model_access.clone(),
-                });
-                let bind_addr = format!("{}:{}", api.bind_address, api.port);
-                tokio::spawn(async move {
-                    let app = crate::api::router(api_state);
-                    match tokio::net::TcpListener::bind(&bind_addr).await {
-                        Ok(listener) => {
-                            println!("API server listening on {}", bind_addr);
-                            if let Err(e) = axum::serve(listener, app).await {
-                                eprintln!("API server error: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to bind API server to {}: {}", bind_addr, e);
-                        }
-                    }
-                });
-            }
-        }
+        // 4. Spawn API frontend binaries if their config sections are enabled.
+        self.spawn_api_binaries();
 
         // 5. IPC listener (self-healing: watchdog recreates socket if deleted)
         let pid = std::process::id();
@@ -363,6 +621,7 @@ impl Leader {
         let agents = self.agents.clone();
         let model_opt = self.model.clone();
         let config_mutex = self.config.clone();
+        let sessions = self.sessions.clone();
         let leader_for_ipc = Arc::new(self);
 
         // Accept loop — polls the shared listener; handles None (during
@@ -396,6 +655,8 @@ impl Leader {
                     let model_opt = model_opt.clone();
                     let config_mutex = config_mutex.clone();
                     let leader = leader_for_ipc.clone();
+                    let sessions = sessions.clone();
+                    let _ = &sessions; // used by session command handler closure capture
 
                     tokio::spawn(async move {
                         let mut buf = Vec::new();
@@ -495,6 +756,17 @@ Command::RunAgent(name, message, quiet) => {
                                         println!("Shutdown requested via IPC");
                                         let _ = stream.write_all(b"Shutting down...").await;
                                         std::process::exit(0);
+                                    }
+                                    // ── Session-tree commands ────────
+                                    Command::SessionCreate { .. }
+                                    | Command::SessionDelete { .. }
+                                    | Command::SessionList
+                                    | Command::SessionBuild { .. }
+                                    | Command::SessionSetupDirs { .. }
+                                    | Command::SessionCreateResponseDir { .. }
+                                    | Command::SessionCacheResponse { .. } => {
+                                        let resp = leader.handle_session_command(cmd).await;
+                                        let _ = stream.write_all(resp.as_bytes()).await;
                                     }
                                     _ => {
                                         let _ = stream.write_all(b"Command Received (Unimplemented)").await;

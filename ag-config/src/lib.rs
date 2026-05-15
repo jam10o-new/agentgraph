@@ -10,9 +10,6 @@ pub struct ModelConfig {
     pub dtype: Option<String>,
     pub builder: String,
     pub chat_template: Option<String>,
-    /// Maximum number of concurrent sequences. Lower values reduce KV cache
-    /// GPU memory proportionally. Default: 32. For sequential workloads
-    /// (agent turns, distillation pipelines), 1–4 is safe and memory-efficient.
     #[serde(default = "default_max_num_seqs")]
     pub max_num_seqs: usize,
 }
@@ -23,6 +20,7 @@ fn default_max_num_seqs() -> usize {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ApiConfig {
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
@@ -38,43 +36,67 @@ fn default_port() -> u16 {
     3000
 }
 
+/// Telegram bot configuration — consumed by the `ag-api-telegram` binary.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TelegramConfig {
+    /// Whether the Telegram bot should be spawned.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Telegram bot token from @BotFather.
+    pub bot_token: String,
+    /// Default agent to use for chats that don't have a per-chat override.
+    #[serde(default = "default_telegram_agent")]
+    pub default_agent: String,
+    /// Per-user agent overrides.  Key is the Telegram user ID (as a string).
+    /// Falls back to `default_agent` when a chat has no explicit override.
+    #[serde(default)]
+    pub user_agents: HashMap<String, String>,
+    /// Per-group agent overrides.  Key is the Telegram group ID.
+    #[serde(default)]
+    pub group_agents: HashMap<String, String>,
+    /// Per-channel agent overrides.  Key is the Telegram channel ID.
+    #[serde(default)]
+    pub channel_agents: HashMap<String, String>,
+    /// Comma-separated list of allowed user IDs. When non-empty, only these
+    /// users may interact with the bot.  Empty = allow all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+fn default_telegram_agent() -> String {
+    "api".to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub models: HashMap<String, ModelConfig>,
     pub agents: HashMap<String, AgentConfig>,
     #[serde(default)]
     pub shutdown_on_idle: bool,
-    /// Seconds of inactivity before a model is unloaded to free VRAM.
-    /// The model is reloaded automatically when the next request arrives.
-    /// `None` means models remain loaded indefinitely (backward-compatible).
     #[serde(default)]
     pub model_idle_secs: Option<u64>,
-    #[serde(default)]
-    pub api: Option<ApiConfig>,
+
+    /// Dynamic API plugin configurations.  Keys following the pattern
+    /// `api-*` (e.g. `api-http`, `api-telegram`) are treated as API
+    /// frontend sections.  Each value is an opaque YAML node that is
+    /// serialized verbatim and passed to the corresponding binary via
+    /// `--section`.  This lets third-party API plugins to be discovered
+    /// without any changes to the leader or shared config types.
+    #[serde(flatten)]
+    pub plugins: HashMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentConfig {
     pub inputs: Vec<String>,
-    /// Primary output directories. The agent writes its response to the first
-    /// directory, and reads all directories for assistant context. Other agents
-    /// should watch the first directory for triggered downstream work.
-    /// Accepts either a single string (backward-compatible) or a list of strings.
     #[serde(default, deserialize_with = "deserialize_output")]
     pub output: Vec<String>,
-    /// Optional streaming output directory. When set, assistant tokens are
-    /// written live to this directory for human display, in addition to the
-    /// primary `output` directory receiving the final result.
     #[serde(default)]
     pub stream_output: Option<String>,
-    /// Optional directory to write tool results into. When set, tool outputs
-    /// are persisted here instead of the primary output directory, keeping
-    /// downstream agent inputs clean from tool noise.
     #[serde(default)]
     pub tool_output: Option<String>,
     pub system: Vec<String>,
     pub model: String,
-    /// Latest N turns to load. 0 or None means unbound (all).
     pub history_limit: Option<usize>,
     #[serde(default)]
     pub realtime_audio: bool,
@@ -83,50 +105,24 @@ pub struct AgentConfig {
     pub prompt: Option<String>,
     #[serde(default)]
     pub sampling: SamplingConfig,
-    /// Per-agent compression settings.
     #[serde(default = "default_compression")]
     pub compression: CompressionConfig,
-    /// When the total character count of compressed history exceeds this value, a metasummary checkpoint is triggered.
-    /// 0 or None disables checkpointing.
     #[serde(default)]
     pub context_checkpoint_limit: Option<usize>,
-    /// Path to the SQLite database used for compression summaries, embeddings,
-    /// and domain clustering. Defaults to `<first_output_dir>/.agent_context/compression.db`
-    /// when not set. The database is shared across agent turns for persistent
-    /// long-term memory via vector retrieval.
     #[serde(default)]
     pub compression_db_path: Option<String>,
-    /// Input directories whose files should never be compressed or folded into metasummaries.
-    /// Useful for mutable/ephemeral inputs that must always reach the model verbatim.
     #[serde(default)]
     pub excluded_from_summary: Vec<String>,
-    /// Whether this agent is allowed to use tools. Defaults to true.
     #[serde(default = "default_true")]
     pub tools_enabled: bool,
-    /// When true, tool call content is consumed (hidden from output file).
-    /// When false (default), tool call details are written to the output
-    /// file so downstream agents (e.g. a distillation harness) can see them.
     #[serde(default)]
     pub consume_tool_calls: bool,
-    /// Whether to retry with reduced context when an OOM-like error is
-    /// detected. When true (default), the agent drops all but the most
-    /// recent conversation turn on the first OOM retry, keeping the
-    /// system prompt and latest user input only.
     #[serde(default = "default_true")]
     pub enable_oom_recovery: bool,
-    /// Enable extended thinking / chain-of-thought for models that support it
-    /// (e.g. Qwen3.5). Defaults to false because thinking mode can interfere
-    /// with streaming output reliability.
     #[serde(default)]
     pub enable_thinking: bool,
-    /// Number of times to retry inference on recoverable errors (OOMs, timeouts).
-    /// Defaults to 3. Set to 0 to disable retries.
-    /// Each retry includes the previously accumulated content as an assistant prefill,
-    /// so the model picks up where it left off rather than restarting from scratch.
     #[serde(default = "default_inference_retries")]
     pub inference_retries: u32,
-    /// Delay in milliseconds between inference retry attempts.
-    /// Defaults to 500ms. Larger values help OOM recovery as VRAM may take time to free.
     #[serde(default = "default_inference_retry_delay_ms")]
     pub inference_retry_delay_ms: u64,
 }

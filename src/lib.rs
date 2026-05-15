@@ -7,13 +7,16 @@ pub mod utils;
 pub mod ipc;
 pub mod audio;
 pub mod api;
+pub mod remote_session;
 
 // Re-export key types
 pub use config::Config;
 pub use leader::Leader;
 pub use agent::Agent;
 pub use utils::{find_leader_socket, is_leader_alive, LeaderStatus, AgentLogger, LEADER_PID_FILE};
-pub use ipc::Command;
+pub use ipc::{Command, SessionStep, IpcResponse};
+pub use api::ApiState;
+pub use remote_session::RemoteSessionState;
 
 /// Full version string including git commit hash.
 /// Format: `<cargo-version>-<short-hash>` or `<cargo-version>-<short-hash>-dirty`.
