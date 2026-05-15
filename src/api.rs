@@ -18,6 +18,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 
 use crate::config::Config;
+use crate::leader::ModelAccess;
 
 /// Metadata for a node in the conversation tree.
 pub struct NodeMeta {
@@ -43,6 +44,7 @@ pub struct ApiState {
     /// Per-agent conversation trees for API requests. Each agent/model gets its
     /// own temp workspace and directory-sharing graph.
     pub trees: Mutex<HashMap<String, Arc<SessionTree>>>,
+    pub model_access: ModelAccess,
 }
 
 pub fn router(state: Arc<ApiState>) -> Router {
@@ -379,7 +381,14 @@ async fn chat_completions(
         };
 
         let agent_name = format!("api-{}-{}", req.model, uuid::Uuid::new_v4());
-        let agent = crate::Agent::new(agent_name, isolated_config, global_config, model, sampling);
+        let agent = crate::Agent::new(
+            agent_name,
+            isolated_config,
+            global_config,
+            model,
+            sampling,
+            state.model_access.clone(),
+        );
 
         let handle = tokio::spawn(async move {
             if let Err(e) = agent.run_loop().await {
@@ -871,6 +880,7 @@ mod tests {
             config,
             model: None,
             trees: Mutex::new(HashMap::new()),
+            model_access: ModelAccess::default(),
         });
         let app = router(state);
 
@@ -907,6 +917,7 @@ mod tests {
             config,
             model: None,
             trees: Mutex::new(HashMap::new()),
+            model_access: ModelAccess::default(),
         });
         let app = router(state);
 
@@ -961,6 +972,7 @@ mod tests {
             config,
             model: None,
             trees: Mutex::new(HashMap::new()),
+            model_access: ModelAccess::default(),
         });
         let app = router(state);
 
@@ -1021,6 +1033,7 @@ mod tests {
             config,
             model: None,
             trees: Mutex::new(HashMap::new()),
+            model_access: ModelAccess::default(),
         });
         let app = router(state);
 

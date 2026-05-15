@@ -3,6 +3,7 @@ use crate::config::{AgentConfig, Config};
 use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_frontmatter};
 use crate::find_leader_socket;
 use crate::ipc::Command;
+use crate::leader::ModelAccess;
 use crate::utils::AgentLogger;
 use anyhow::{Context, Result, anyhow};
 use mistralrs::{
@@ -41,6 +42,7 @@ pub struct Agent {
     pub volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
     pub output_forwarder: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
     pub logger: AgentLogger,
+    pub model_access: ModelAccess,
 }
 
 impl Agent {
@@ -50,6 +52,7 @@ impl Agent {
         global_config: Config,
         model: Arc<Model>,
         sampling: SamplingParams,
+        model_access: ModelAccess,
     ) -> Self {
         Self {
             name: name.clone(),
@@ -60,6 +63,7 @@ impl Agent {
             volatile_context: Arc::new(Mutex::new(Vec::new())),
             output_forwarder: Arc::new(Mutex::new(None)),
             logger: AgentLogger::new(&name),
+            model_access,
         }
     }
 
@@ -161,12 +165,13 @@ impl Agent {
                     let volatile_context = self.volatile_context.clone();
                     let forwarder = self.output_forwarder.clone();
                     let logger = AgentLogger::new(&name);
+                    let model_access = self.model_access.clone();
                     let done_tx = inference_done_tx.clone();
 
                     inference_in_progress = true;
                     retrigger_pending = false;
                     tokio::spawn(async move {
-                        let result = run_inference(agent_name, model, config, global_config, sampling, volatile_context, logger).await;
+                        let result = run_inference(agent_name, model, config, global_config, sampling, volatile_context, logger, model_access).await;
                         match result {
                             Ok(content) => {
                                 if let Some(tx) = forwarder.lock().await.take() {
@@ -202,10 +207,11 @@ impl Agent {
                         let forwarder = self.output_forwarder.clone();
                         let logger = AgentLogger::new(&name);
                         let done_tx = inference_done_tx.clone();
+                        let ma = self.model_access.clone();
 
                         inference_in_progress = true;
                         tokio::spawn(async move {
-                            let result = run_inference(agent_name, model, config, global_config, sampling, volatile_context, logger).await;
+                            let result = run_inference(agent_name, model, config, global_config, sampling, volatile_context, logger, ma).await;
                             match result {
                                 Ok(content) => {
                                     if let Some(tx) = forwarder.lock().await.take() {
@@ -371,8 +377,12 @@ async fn run_inference(
     sampling: SamplingParams,
     volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
     logger: AgentLogger,
+    model_access: ModelAccess,
 ) -> Result<String> {
     logger.log("Starting inference turn").await;
+
+    // Mark model as recently accessed so the idle eviction timer knows it's in use.
+    model_access.touch(&config.model).await;
 
     // 1. Collate System Prompts
     let mut system_content = String::new();

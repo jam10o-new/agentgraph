@@ -20,6 +20,19 @@ pub struct AgentEntry {
     pub trigger_path: PathBuf,
 }
 
+/// Tracks the last inference time per model alias for idle eviction.
+#[derive(Clone, Default)]
+pub struct ModelAccess {
+    pub last_access: Arc<tokio::sync::RwLock<HashMap<String, tokio::time::Instant>>>,
+}
+
+impl ModelAccess {
+    pub async fn touch(&self, alias: &str) {
+        let mut map = self.last_access.write().await;
+        map.insert(alias.to_string(), tokio::time::Instant::now());
+    }
+}
+
 pub struct Leader {
     pub config: Arc<Mutex<Config>>,
     pub config_path: String,
@@ -29,6 +42,7 @@ pub struct Leader {
     pub binary_mtime: SystemTime,
     pub model: Option<Arc<mistralrs::Model>>,
     pub agents: Arc<Mutex<HashMap<String, AgentEntry>>>,
+    pub model_access: ModelAccess,
 }
 
 impl Leader {
@@ -51,6 +65,7 @@ impl Leader {
             binary_mtime,
             model, 
             agents: Arc::new(Mutex::new(HashMap::new())),
+            model_access: ModelAccess::default(),
         })
     }
 
@@ -86,6 +101,7 @@ impl Leader {
             config,
             model.clone(),
             sampling,
+            self.model_access.clone(),
         );
 
         // Shared output forwarder: the leader installs a sender when it
@@ -304,6 +320,7 @@ impl Leader {
                     config: self.config.clone(),
                     model: self.model.clone(),
                     trees: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                    model_access: self.model_access.clone(),
                 });
                 let bind_addr = format!("{}:{}", api.bind_address, api.port);
                 tokio::spawn(async move {

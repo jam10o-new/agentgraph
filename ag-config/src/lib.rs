@@ -44,6 +44,11 @@ pub struct Config {
     pub agents: HashMap<String, AgentConfig>,
     #[serde(default)]
     pub shutdown_on_idle: bool,
+    /// Seconds of inactivity before a model is unloaded to free VRAM.
+    /// The model is reloaded automatically when the next request arrives.
+    /// `None` means models remain loaded indefinitely (backward-compatible).
+    #[serde(default)]
+    pub model_idle_secs: Option<u64>,
     #[serde(default)]
     pub api: Option<ApiConfig>,
 }
