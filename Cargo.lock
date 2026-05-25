@@ -207,9 +207,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "ag-tool-bash"
+version = "0.1.0"
+dependencies = [
+ "ag-tool-common",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ag-tool-common"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ag-tool-load-skill"
+version = "0.1.0"
+dependencies = [
+ "ag-tool-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ag-tool-loadctx"
+version = "0.1.0"
+dependencies = [
+ "ag-tool-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ag-tool-ls"
+version = "0.1.0"
+dependencies = [
+ "ag-tool-common",
  "serde",
  "serde_json",
 ]
@@ -221,6 +258,28 @@ dependencies = [
  "ag-tool-common",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ag-tool-skills"
+version = "0.1.0"
+dependencies = [
+ "ag-tool-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ag-tool-spawn"
+version = "0.1.0"
+dependencies = [
+ "ag-config",
+ "ag-ipc",
+ "ag-tool-common",
+ "ag-utils",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
