@@ -207,6 +207,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ag-tool-common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ag-tool-read"
+version = "0.1.0"
+dependencies = [
+ "ag-tool-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ag-utils"
 version = "0.1.0"
 dependencies = [

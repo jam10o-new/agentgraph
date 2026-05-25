@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "ag-designer", "ag-config", "ag-ipc", "ag-api-http", "ag-api-telegram", "ag-utils"]
+members = [".", "ag-designer", "ag-config", "ag-ipc", "ag-api-http", "ag-api-telegram", "ag-utils", "ag-tool-common", "ag-tool-read"]
 
 [package]
 name = "agentgraph"
