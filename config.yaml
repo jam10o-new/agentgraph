@@ -134,7 +134,7 @@ agents:
       top_k: 50
       max_len: 4096
 
-# Tool Configuration (Plugin System)
+# 3. Tool Configuration (Plugin System)
 #   AgentGraph discovers tool binaries from PATH using the `ag-tool-*` naming convention.
 #   Each binary must support three modes:
 #     --describe → prints JSON Function schema (used for model tool definitions)
