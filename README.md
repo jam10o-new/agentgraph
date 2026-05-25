@@ -32,10 +32,7 @@ Protip: Use and spawn with [`psi-cli`](https://github.com/jam10o-new/psi-cli) - 
 
 - **Async-First Architecture**: Every agent runs in its own coroutine with dedicated filesystem watchers and interrupt logic.
 - **Leader/Follower Pattern**: A single leader process manages model loading and inference, while followers (CLI subcommands) communicate via Unix Domain Sockets. This ensures VRAM is never duplicated across processes.
-- **Idiomatic Tool Calling**: Supports native `mistralrs` tool calling for models like Qwen or Llama. Current built-in tools include:
-  - `execute_command`: Run shell commands on the host.
-  - `spawn_new_agent`: Dynamically create new agents with custom configs.
-  - `load_into_context`: Load arbitrary files into the model's volatile context.
+- **Idiomatic Tool Calling**: Supports native `mistralrs` tool calling for models like Qwen or Llama. Tools are implemented as independent plugin binaries discovered from `$PATH` at runtime (see Plugin System below).
 - **Multimodal Support (Vision)**: Automatically detects images (`jpg`, `jpeg`, `png`, `webp`) in an agent's input directory and attaches them to the inference request.
 - **Context Compression**: Just-in-time summarization that compresses older conversation turns into contextually relevant "domains" to save context window space over time.
 - **Configuration-Driven**: All models, agents, and sampling parameters are managed via a simple YAML configuration.
@@ -95,7 +92,67 @@ Each agent watches a specific directory structure:
 - `output/`: Assistant responses are streamed here in real-time.
 
 ### Tool Execution
-When a model issues a tool call, the agent loop handles the execution and feeds the results back into the context for a follow-up turn. This allows for complex multi-step reasoning and environment interaction.
+When a model issues a tool call, the agent loop hands it off to the configured tool binary, feeds the results back into the context for a follow-up turn, and continues. This allows for complex multi-step reasoning and environment interaction.
+
+## Plugin System
+
+AgentGraph supports two types of plugins, both discovered from `$PATH` via naming convention:
+
+### Tool Plugins (`ag-tool-*`)
+
+Tool plugins are independent binaries named `ag-tool-<name>`. Each agent config lists which tools it has access to:
+
+```yaml
+agents:
+  my_agent:
+    tools:
+      - ag-tool-bash
+      - ag-tool-read
+      - ag-tool-ls
+```
+
+An empty list (or omitting `tools`) disables tools entirely.
+
+Each tool binary must support three modes:
+| Mode | Description |
+|------|-------------|
+| `--describe` | Prints a JSON Function schema (`name`, `description`, `parameters`) matching mistralrs's native format. |
+| `--help` | Prints LLM guidance text that is appended to the agent's system prompt. |
+| default | Reads JSON arguments from stdin, executes the tool, writes the result to stdout. |
+
+Tool schemas are cached globally after first discovery, so binaries only need to be spawned once.
+
+**Built-in tools:**
+| Binary | Function name | Description |
+|--------|---------------|-------------|
+| `ag-tool-bash` | `execute_command` | Execute shell commands on the host |
+| `ag-tool-read` | `read_file` | Read file contents |
+| `ag-tool-ls` | `list_directory` | List directory entries |
+| `ag-tool-skills` | `list_skills` | Discover SKILL.md files recursively |
+| `ag-tool-load-skill` | `load_skill` | Copy a skill directory into system context |
+| `ag-tool-loadctx` | `load_into_context` | Load files into volatile context |
+| `ag-tool-spawn` | `spawn_new_agent` | Dynamically create a new agent |
+
+### API Plugins (`ag-api-*`)
+
+API plugins provide frontends (HTTP, Telegram, etc.) that communicate with the leader over a Unix domain socket. Any top-level config key matching `api-*` triggers discovery:
+
+```yaml
+api-http:
+  bind_address: "127.0.0.1"
+  port: 3000
+
+api-telegram:
+  bot_token: "..."
+  default_agent: "researcher"
+```
+
+The leader spawns `ag-api-<name>` from `$PATH` with `--config`, `--socket`, and `--section <json>` arguments. Section values are opaque to the leader — each binary parses its own config independently. Missing binaries are logged but never prevent startup.
+
+**Third-party plugins** follow the same conventions without requiring leader or config-schema changes.
+
+### Training guidance in system prompts
+The `--help` output of each tool binary is injected into the system prompt during inference, so the model receives tool-specific usage guidance in natural language alongside the structured function schema.
 
 ## Roadmap
 

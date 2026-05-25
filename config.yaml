@@ -55,8 +55,14 @@ agents:
     # Inputs listed here are never compressed or folded into metasummaries.
     # Use for ephemeral/mutable inputs that must always reach the model verbatim.
     excluded_from_summary: []
-    # Allow this agent to use tools (execute_command, read_file, etc.)
-    tools_enabled: true
+    # Tool binaries to make available to this agent (empty list = no tools).
+    # Each entry is the full binary name (e.g. ag-tool-bash, ag-tool-read).
+    # Built-in tool binaries: ag-tool-bash, ag-tool-read, ag-tool-ls,
+    #   ag-tool-skills, ag-tool-load-skill, ag-tool-loadctx, ag-tool-spawn
+    tools:
+      - ag-tool-bash
+      - ag-tool-read
+      - ag-tool-ls
     sampling:
       temperature: 0.7
       top_p: 0.9
@@ -72,7 +78,8 @@ agents:
       - "agents/stream_watcher/system"
     model: "primary"
     history_limit: 10
-    tools_enabled: false
+    tools: []
+    sampling:
     sampling:
       temperature: 0.7
       top_p: 0.9
@@ -87,7 +94,10 @@ agents:
     model: "primary"
     history_limit: 0
     tool_output: "agents/tool_runner/tools"
-    tools_enabled: true
+    tools:
+      - ag-tool-bash
+      - ag-tool-read
+      - ag-tool-ls
     sampling:
       temperature: 0.2
       max_len: 512
@@ -110,23 +120,35 @@ agents:
     context_checkpoint_limit: 40000
     tool_output: "agents/coder/tools"
     excluded_from_summary: []
-    tools_enabled: true
+    tools:
+      - ag-tool-bash
+      - ag-tool-read
+      - ag-tool-ls
+      - ag-tool-skills
+      - ag-tool-load-skill
+      - ag-tool-loadctx
+      - ag-tool-spawn
     sampling:
       temperature: 0.2
       top_p: 0.95
       top_k: 50
       max_len: 4096
 
-# 3. "api" binary configs:
-#  OpenAI-compatible API Server (optional)
-# When enabled, each configured agent is exposed as a "model" via the API.
-# Messages sent via /v1/chat/completions are written to the agent's first input
-# directory, and responses are read from the output directory.
-# and
-#  Telegram bot (optional)
-# When enabled, you can route telegram conversations to specific agents
-# Requires a token from the BotFather and security boundaries are defined
-# at the agent level (tool use or not) or the model level (context size, memory use)
+# Tool Configuration (Plugin System)
+#   AgentGraph discovers tool binaries from PATH using the `ag-tool-*` naming convention.
+#   Each binary must support three modes:
+#     --describe → prints JSON Function schema (used for model tool definitions)
+#     --help     → prints guidance text (appended to the system prompt)
+#     default    → reads JSON arguments from stdin, writes result to stdout
+#   An empty list (or omitting 'tools') disables tools entirely.
+#   Built-in tools: ag-tool-bash, ag-tool-read, ag-tool-ls, ag-tool-skills,
+#                    ag-tool-load-skill, ag-tool-loadctx, ag-tool-spawn
+#
+# 4. API Plugin Configuration (similar convention)
+#   Any top-level key matching `api-*` is treated as an API frontend section.
+#   The leader spawns `ag-api-<name>` binaries from PATH, passing `--config`,
+#   `--socket`, and `--section <json>` arguments.
+#   Third-party plugins follow the same convention without leader changes.
 api-http:
   bind_address: "127.0.0.1"
   port: 3000
@@ -141,5 +163,5 @@ api-telegram:
   channel_agents:
     "-100987654321": "channel_agent"
 
-# 4. Global Settings
+# 5. Global Settings
 shutdown_on_idle: false
