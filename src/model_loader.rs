@@ -1,39 +1,6 @@
 use crate::config::ModelConfig;
 use anyhow::{Result, anyhow};
 use mistralrs::{GgufModelBuilder, IsqBits, ModelDType, MultiModelBuilder, MultimodalModelBuilder};
-use std::path::{Path, PathBuf};
-
-fn has_model_template(model_src: &str) -> bool {
-    let check_file = |p: &Path| -> bool {
-        let ct = p.join("chat_template.jinja");
-        let tp = p.join("tokenizer_config.json");
-        if let Ok(c) = std::fs::read_to_string(tp) {
-            c.contains("\"chat_template\"")
-        } else if let Ok(true) = std::fs::exists(ct) {
-            true
-        } else {
-            false
-        }
-    };
-
-    let p = Path::new(model_src);
-    if p.exists() && p.is_dir() {
-        return check_file(p);
-    }
-
-    // Check HF cache
-    if let Ok(home) = std::env::var("HOME") {
-        let cache_base = PathBuf::from(home).join(".cache/huggingface/hub");
-        let model_dir_name = format!("models--{}", model_src.replace('/', "--"));
-        let model_path = cache_base.join(model_dir_name).join("snapshots");
-        if let Ok(mut entries) = std::fs::read_dir(model_path) {
-            if let Some(Ok(entry)) = entries.next() {
-                return check_file(&entry.path());
-            }
-        }
-    }
-    false
-}
 
 pub async fn load_models(
     configs: &std::collections::HashMap<String, ModelConfig>,

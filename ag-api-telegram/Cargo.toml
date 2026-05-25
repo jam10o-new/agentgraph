@@ -8,11 +8,13 @@ name = "ag-api-telegram"
 path = "src/main.rs"
 
 [dependencies]
-agentgraph = { path = ".." }
+ag-ipc = { path = "../ag-ipc" }
+ag-utils = { path = "../ag-utils" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = "1"
+serde_yaml = "0.9.34"
 serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ag-config = { path = "../ag-config" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "query"] }

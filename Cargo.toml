@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "ag-designer", "ag-config", "ag-api-http", "ag-api-telegram"]
+members = [".", "ag-designer", "ag-config", "ag-ipc", "ag-api-http", "ag-api-telegram", "ag-utils"]
 
 [package]
 name = "agentgraph"
@@ -36,6 +36,8 @@ bytemuck = "1.25.0"
 bitflags = "2.11.0"
 serde_yaml = "0.9.34"
 ag-config = { path = "ag-config" }
+ag-ipc = { path = "ag-ipc" }
+ag-utils = { path = "ag-utils" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"

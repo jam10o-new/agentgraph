@@ -104,6 +104,67 @@ impl RemoteSessionState {
     pub async fn list_ids(&self) -> Vec<String> {
         self.trees.lock().await.keys().cloned().collect()
     }
+
+    /// List all child nodes of `parent_hash` within the tree identified by `id`.
+    /// Returns a Vec of (hash, role, content_preview).
+    pub async fn list_children(&self, id: &str, parent_hash: &str) -> Vec<(String, String, String)> {
+        let trees_guard = self.trees.lock().await;
+        let Some(tree) = trees_guard.get(id) else {
+            return Vec::new();
+        };
+        let nodes = tree.nodes.lock().await;
+        let parent_pattern = if parent_hash.is_empty() {
+            None
+        } else {
+            Some(parent_hash.to_string())
+        };
+        let mut children: Vec<_> = nodes
+            .iter()
+            .filter(|(_, meta)| {
+                match (&meta.parent_hash, &parent_pattern) {
+                    (Some(ph), Some(pp)) => ph == pp,
+                    (None, None) => true,  // both root
+                    _ => false,
+                }
+            })
+            .map(|(hash, meta)| {
+                let preview = meta
+                    .dir
+                    .join("msg.txt")
+                    .to_string_lossy()
+                    .to_string();
+                (hash.clone(), meta.role.clone(), preview)
+            })
+            .collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+        children
+    }
+
+    /// Walk the parent chain from `hash` to the root, returning the path
+    /// as a chronological Vec of (hash, role, content_preview).
+    pub async fn get_path(&self, id: &str, hash: &str) -> Vec<(String, String, String)> {
+        let trees_guard = self.trees.lock().await;
+        let Some(tree) = trees_guard.get(id) else {
+            return Vec::new();
+        };
+        let nodes = tree.nodes.lock().await;
+        let mut path = Vec::new();
+        let mut current = hash.to_string();
+        while !current.is_empty() {
+            if let Some(meta) = nodes.get(&current) {
+                let preview = format!(
+                    "{}",
+                    meta.dir.join("msg.txt").to_string_lossy()
+                );
+                path.push((current.clone(), meta.role.clone(), preview));
+                current = meta.parent_hash.clone().unwrap_or_default();
+            } else {
+                break;
+            }
+        }
+        path.reverse();
+        path
+    }
 }
 
 // ---------------------------------------------------------------------------

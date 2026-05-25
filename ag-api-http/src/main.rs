@@ -4,23 +4,21 @@
 //! agent inference.  All session state lives in the leader process; this
 //! binary is a thin wire-format adapter: JSON-over-IPC in, SSE/JSON out.
 
-use agentgraph::ipc::{Command, IpcResponse, SessionStep};
-use agentgraph::find_leader_socket;
+use ag_ipc::{Command, IpcResponse, SessionStep};
+use ag_utils::find_leader_socket;
 use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
-    response::{IntoResponse, Sse, sse::Event},
+    response::IntoResponse,
     routing::{get, post},
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 
 // ---------------------------------------------------------------------------
@@ -52,9 +50,15 @@ struct HttpConfig {
     port: u16,
 }
 
-fn default_true() -> bool { true }
-fn default_bind() -> String { "127.0.0.1".into() }
-fn default_port() -> u16 { 3000 }
+fn default_true() -> bool {
+    true
+}
+fn default_bind() -> String {
+    "127.0.0.1".into()
+}
+fn default_port() -> u16 {
+    3000
+}
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -102,10 +106,16 @@ struct Choice {
 }
 
 #[derive(Debug, Serialize)]
-struct MessageResponse { role: String, content: String }
+struct MessageResponse {
+    role: String,
+    content: String,
+}
 
 #[derive(Debug, Serialize)]
-struct ModelsListResponse { object: String, data: Vec<ModelObject> }
+struct ModelsListResponse {
+    object: String,
+    data: Vec<ModelObject>,
+}
 
 #[derive(Debug, Serialize)]
 struct ModelObject {
@@ -126,12 +136,21 @@ async fn ipc_raw(socket: &str, cmd: &Command) -> Result<String, String> {
         .map_err(|e| format!("connect: {e}"))?;
 
     let payload = serde_json::to_vec(cmd).map_err(|e| format!("serialize: {e}"))?;
-    stream.write_all(&payload).await.map_err(|e| format!("write: {e}"))?;
+    stream
+        .write_all(&payload)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
     stream.flush().await.map_err(|e| format!("flush: {e}"))?;
-    stream.shutdown().await.map_err(|e| format!("shutdown: {e}"))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|e| format!("shutdown: {e}"))?;
 
     let mut buf = String::new();
-    stream.read_to_string(&mut buf).await.map_err(|e| format!("read: {e}"))?;
+    stream
+        .read_to_string(&mut buf)
+        .await
+        .map_err(|e| format!("read: {e}"))?;
     Ok(buf)
 }
 
@@ -185,10 +204,14 @@ async fn chat_completions(
         .unwrap_or_default()
         .as_secs();
 
-    let steps: Vec<SessionStep> = req.messages.iter().map(|m| SessionStep {
-        role: m.role.clone(),
-        content: m.content.clone(),
-    }).collect();
+    let steps: Vec<SessionStep> = req
+        .messages
+        .iter()
+        .map(|m| SessionStep {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect();
 
     // Check if leader socket is available
     let leader_ready = find_leader_socket().await.is_some();
@@ -207,7 +230,10 @@ async fn chat_completions(
                     let content = resp.data.unwrap_or_default();
 
                     Ok(Json(ChatCompletionResponse {
-                        id, object: "chat.completion".into(), created, model: req.model,
+                        id,
+                        object: "chat.completion".into(),
+                        created,
+                        model: req.model,
                         choices: vec![Choice {
                             index: 0,
                             message: MessageResponse {
@@ -216,7 +242,8 @@ async fn chat_completions(
                             },
                             finish_reason: "stop".into(),
                         }],
-                    }).into_response())
+                    })
+                    .into_response())
                 } else {
                     let _err = resp.error.unwrap_or_else(|| "unknown error".into());
                     Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -248,11 +275,10 @@ fn router(state: Arc<AppState>) -> Router {
 async fn main() {
     let cli = Cli::parse();
 
-    let _http_cfg: HttpConfig = serde_json::from_str(&cli.section)
-        .unwrap_or_else(|e| {
-            eprintln!("ag-api-http: failed to parse section config: {e}");
-            std::process::exit(1);
-        });
+    let _http_cfg: HttpConfig = serde_json::from_str(&cli.section).unwrap_or_else(|e| {
+        eprintln!("ag-api-http: failed to parse section config: {e}");
+        std::process::exit(1);
+    });
 
     if !_http_cfg.enabled {
         eprintln!("ag-api-http: enabled=false, exiting");

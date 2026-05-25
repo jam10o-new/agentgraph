@@ -1,18 +1,18 @@
-use crate::config::{Config, AgentConfig};
-use crate::model_loader::load_models;
 use crate::agent::Agent;
+use crate::config::{AgentConfig, Config};
 use crate::ipc::{Command, IpcResponse, SessionStep};
-use crate::remote_session::{RemoteSessionState, ConversationStep};
-use crate::utils::{is_leader_alive, LeaderStatus, LEADER_PID_FILE};
+use crate::model_loader::load_models;
+use crate::remote_session::{ConversationStep, RemoteSessionState};
+use crate::utils::{LEADER_PID_FILE, LeaderStatus, is_leader_alive};
 use anyhow::{Context, Result, anyhow};
-use std::sync::Arc;
-use std::collections::HashMap;
 use mistralrs::{SamplingParams, TextMessageRole};
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use std::path::PathBuf;
-use std::time::{SystemTime, Duration};
 
 pub struct AgentEntry {
     pub handle: tokio::task::JoinHandle<()>,
@@ -62,11 +62,11 @@ impl Leader {
             .and_then(|m| m.modified().ok())
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
-        Ok(Self { 
-            config: Arc::new(Mutex::new(config)), 
+        Ok(Self {
+            config: Arc::new(Mutex::new(config)),
             config_path,
             binary_mtime,
-            model, 
+            model,
             agents: Arc::new(Mutex::new(HashMap::new())),
             model_access: ModelAccess::default(),
             sessions: Arc::new(RemoteSessionState::new()),
@@ -80,8 +80,11 @@ impl Leader {
             return Ok(());
         }
 
-        let model = self.model.as_ref().ok_or_else(|| anyhow!("No models loaded in leader. Cannot spawn agent {}.", name))?;
-        
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| anyhow!("No models loaded in leader. Cannot spawn agent {}.", name))?;
+
         let sampling = SamplingParams {
             temperature: agent_config.sampling.temperature,
             top_p: agent_config.sampling.top_p,
@@ -114,11 +117,17 @@ impl Leader {
         let forwarder: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>> =
             Arc::new(Mutex::new(None));
         agent.output_forwarder = forwarder.clone();
-        
+
         // We use the first input directory as the "trigger" path for manual runs
-        let trigger_path = PathBuf::from(agent_config.inputs.first().cloned().unwrap_or_else(|| ".".into()));
+        let trigger_path = PathBuf::from(
+            agent_config
+                .inputs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| ".".into()),
+        );
         let volatile_context = agent.volatile_context.clone();
-        
+
         let name_for_log = name.clone();
         let handle = tokio::spawn(async move {
             if let Err(e) = agent.run_loop().await {
@@ -126,12 +135,15 @@ impl Leader {
             }
         });
 
-        agents.insert(name, AgentEntry {
-            handle,
-            volatile_context,
-            output_forwarder: forwarder,
-            trigger_path,
-        });
+        agents.insert(
+            name,
+            AgentEntry {
+                handle,
+                volatile_context,
+                output_forwarder: forwarder,
+                trigger_path,
+            },
+        );
         Ok(())
     }
 
@@ -160,10 +172,7 @@ impl Leader {
         // Remove PID file so the new leader can write a fresh one
         let _ = std::fs::remove_file(LEADER_PID_FILE);
 
-        let pending_path = pending_dir.join(format!(
-            "pending_command_{}.json",
-            pid
-        ));
+        let pending_path = pending_dir.join(format!("pending_command_{}.json", pid));
         if let Ok(json) = serde_json::to_vec(cmd) {
             let _ = std::fs::write(&pending_path, &json);
         }
@@ -194,7 +203,10 @@ impl Leader {
     /// Process a single pending command (called on startup after a restart).
     async fn process_pending_command(&self, cmd: Command) {
         match cmd {
-            Command::SpawnAgent { name, config: agent_config } => {
+            Command::SpawnAgent {
+                name,
+                config: agent_config,
+            } => {
                 if let Err(e) = self.spawn_agent(name, agent_config).await {
                     eprintln!("Pending command spawn error: {}", e);
                 }
@@ -203,7 +215,11 @@ impl Leader {
                 let agents_map = self.agents.lock().await;
                 if let Some(entry) = agents_map.get(&name) {
                     if let Some(msg) = message {
-                        entry.volatile_context.lock().await.push((TextMessageRole::User, msg));
+                        entry
+                            .volatile_context
+                            .lock()
+                            .await
+                            .push((TextMessageRole::User, msg));
                     }
                     let trigger_file = entry.trigger_path.join(format!(
                         ".trigger-{}",
@@ -235,7 +251,12 @@ impl Leader {
         {
             let mut config = self.config.lock().await;
             if !config.agents.contains_key("api") {
-                let first_model = config.models.keys().next().cloned().unwrap_or_else(|| "primary".to_string());
+                let first_model = config
+                    .models
+                    .keys()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "primary".to_string());
                 config.agents.insert(
                     "api".to_string(),
                     AgentConfig {
@@ -286,14 +307,20 @@ impl Leader {
                 let tree = self.sessions.get_or_create_tree(&session_id).await;
                 let conv_steps: Vec<ConversationStep> = steps
                     .into_iter()
-                    .map(|s| ConversationStep { role: s.role, content: s.content })
+                    .map(|s| ConversationStep {
+                        role: s.role,
+                        content: s.content,
+                    })
                     .collect();
                 match crate::remote_session::build_conversation(&tree, &conv_steps).await {
                     Ok(state) => IpcResponse::ok_json(&state),
                     Err(e) => IpcResponse::err(e),
                 }
             }
-            Command::SessionSetupDirs { session_id, system_msgs } => {
+            Command::SessionSetupDirs {
+                session_id,
+                system_msgs,
+            } => {
                 let tree = self.sessions.get_or_create_tree(&session_id).await;
                 match crate::remote_session::setup_request_dirs(&tree, &system_msgs).await {
                     Ok((stream_dir, tools_dir, system_dir)) => {
@@ -307,31 +334,57 @@ impl Leader {
                     Err(e) => IpcResponse::err(e),
                 }
             }
-            Command::SessionCreateResponseDir { session_id, current_hash } => {
+            Command::SessionCreateResponseDir {
+                session_id,
+                current_hash,
+            } => {
                 let tree = self.sessions.get_or_create_tree(&session_id).await;
                 match crate::remote_session::create_response_dir(&tree, &current_hash).await {
                     Ok(dir) => IpcResponse::ok_str(dir.to_string_lossy().to_string()),
                     Err(e) => IpcResponse::err(e),
                 }
             }
-            Command::SessionCacheResponse { session_id, parent_hash, content, response_dir } => {
+            Command::SessionCacheResponse {
+                session_id,
+                parent_hash,
+                content,
+                response_dir,
+            } => {
                 let tree = self.sessions.get_or_create_tree(&session_id).await;
                 crate::remote_session::cache_response(
-                    &tree, &parent_hash, &content, PathBuf::from(&response_dir),
-                ).await;
+                    &tree,
+                    &parent_hash,
+                    &content,
+                    PathBuf::from(&response_dir),
+                )
+                .await;
                 IpcResponse::ok_str("cached")
             }
-            Command::SessionChat { session_id, steps, model, .. } => {
-                match self.run_session_chat(&session_id, &steps, &model).await {
-                    Ok(content) => IpcResponse {
-                        ok: true, data: Some(content), error: None,
-                    },
-                    Err(e) => IpcResponse::err(e.to_string()),
-                }
+            Command::SessionChat {
+                session_id,
+                steps,
+                model,
+                ..
+            } => match self.run_session_chat(&session_id, &steps, &model).await {
+                Ok(content) => IpcResponse {
+                    ok: true,
+                    data: Some(content),
+                    error: None,
+                },
+                Err(e) => IpcResponse::err(e.to_string()),
+            },
+            Command::SessionListChildren { session_id, hash } => {
+                let children = self.sessions.list_children(&session_id, &hash).await;
+                IpcResponse::ok_json(&children)
+            }
+            Command::SessionPath { session_id, hash } => {
+                let path = self.sessions.get_path(&session_id, &hash).await;
+                IpcResponse::ok_json(&path)
             }
             _ => IpcResponse::err("unexpected command in session handler"),
         };
-        serde_json::to_string(&resp).unwrap_or_else(|_| r#"{"ok":false,"error":"serialize"}"#.to_string())
+        serde_json::to_string(&resp)
+            .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize"}"#.to_string())
     }
 
     /// Run a full chat turn: build conversation state, spawn an ephemeral agent,
@@ -343,7 +396,9 @@ impl Leader {
         model: &str,
     ) -> Result<String> {
         let config = self.config.lock().await;
-        let base_agent = config.agents.get(model)
+        let base_agent = config
+            .agents
+            .get(model)
             .ok_or_else(|| anyhow!("agent '{}' not found in config", model))?
             .clone();
         let global_config = config.clone();
@@ -351,10 +406,13 @@ impl Leader {
 
         let tree = self.sessions.get_or_create_tree(session_id).await;
 
-        let conv_steps: Vec<ConversationStep> = steps.iter().map(|s| ConversationStep {
-            role: s.role.clone(),
-            content: s.content.clone(),
-        }).collect();
+        let conv_steps: Vec<ConversationStep> = steps
+            .iter()
+            .map(|s| ConversationStep {
+                role: s.role.clone(),
+                content: s.content.clone(),
+            })
+            .collect();
 
         let state = crate::remote_session::build_conversation(&tree, &conv_steps)
             .await
@@ -383,8 +441,11 @@ impl Leader {
             s
         };
 
-        let model_arc = self.model.as_ref()
-            .ok_or_else(|| anyhow!("no model loaded"))?.clone();
+        let model_arc = self
+            .model
+            .as_ref()
+            .ok_or_else(|| anyhow!("no model loaded"))?
+            .clone();
 
         let sampling = SamplingParams {
             temperature: isolated_config.sampling.temperature,
@@ -404,8 +465,12 @@ impl Leader {
 
         let agent_name = format!("session-{}-{}", session_id, uuid::Uuid::new_v4());
         let agent = crate::Agent::new(
-            agent_name, isolated_config, global_config,
-            model_arc, sampling, self.model_access.clone(),
+            agent_name,
+            isolated_config,
+            global_config,
+            model_arc,
+            sampling,
+            self.model_access.clone(),
         );
 
         let handle = tokio::spawn(async move {
@@ -441,9 +506,8 @@ impl Leader {
         handle.abort();
 
         // Cache response
-        crate::remote_session::cache_response(
-            &tree, &state.current_hash, &content, response_dir,
-        ).await;
+        crate::remote_session::cache_response(&tree, &state.current_hash, &content, response_dir)
+            .await;
 
         Ok(content)
     }
@@ -466,7 +530,8 @@ async fn wait_for_output(
                         let path = entry.path();
                         if path.is_file() {
                             if let Ok(metadata) = entry.metadata().await {
-                                let modified = metadata.modified()
+                                let modified = metadata
+                                    .modified()
                                     .or_else(|_| metadata.created())
                                     .map_err(|e| anyhow!("mtime: {}: {}", path.display(), e))?;
                                 if modified >= after {
@@ -479,7 +544,8 @@ async fn wait_for_output(
                 if let Some((_, path)) = candidates.into_iter().max_by_key(|(t, _)| *t) {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     return anyhow::Result::Ok(
-                        tokio::fs::read_to_string(&path).await
+                        tokio::fs::read_to_string(&path)
+                            .await
                             .map_err(|e| anyhow!("read output: {}", e))?,
                     );
                 }
@@ -503,8 +569,8 @@ impl Leader {
     /// Third-party API plugins need only a matching key in the config file and
     /// a `ag-api-<name>` binary on PATH — no leader changes required.
     async fn spawn_api_binaries(&self) {
-        let pipe_path = PathBuf::from("/tmp/agentgraph")
-            .join(format!("ag-{}.sock", std::process::id()));
+        let pipe_path =
+            PathBuf::from("/tmp/agentgraph").join(format!("ag-{}.sock", std::process::id()));
 
         let config = self.config.lock().await;
 
@@ -552,7 +618,8 @@ impl Leader {
             LeaderStatus::Ready { socket, pid } => {
                 return Err(anyhow!(
                     "Another leader is already running (PID {}, socket: {:?})",
-                    pid, socket
+                    pid,
+                    socket
                 ));
             }
             LeaderStatus::Degraded { pid } => {
@@ -560,7 +627,8 @@ impl Leader {
                     "Another leader process is running (PID {}) but has no IPC socket. \
                      The existing leader may be in a degraded state. \
                      Check `/tmp/agentgraph/leader.log`. Kill PID {} manually if needed.",
-                    pid, pid
+                    pid,
+                    pid
                 ));
             }
             LeaderStatus::NotRunning => {}
@@ -596,15 +664,16 @@ impl Leader {
         }
 
         // 4. Spawn API frontend binaries if their config sections are enabled.
-        self.spawn_api_binaries();
+        let _ = self.spawn_api_binaries().await;
 
         // 5. IPC listener (self-healing: watchdog recreates socket if deleted)
         let pid = std::process::id();
         let pipe_path = PathBuf::from("/tmp/agentgraph").join(format!("ag-{}.sock", pid));
         let parent = pipe_path.parent().unwrap().to_path_buf();
-        tokio::fs::create_dir_all(&parent)
-            .await
-            .context(format!("Failed to create IPC socket dir: {}", parent.display()))?;
+        tokio::fs::create_dir_all(&parent).await.context(format!(
+            "Failed to create IPC socket dir: {}",
+            parent.display()
+        ))?;
         let _ = tokio::fs::remove_file(&pipe_path).await;
         let initial_listener = UnixListener::bind(&pipe_path)?;
         println!("Leader PID {} listening on {:?}", pid, pipe_path);
@@ -678,66 +747,114 @@ impl Leader {
                                         // Ignore existing models
                                         for (name, _) in &new_config.models {
                                             if !config.models.contains_key(name) {
-                                                eprintln!("Warning: Dynamic model loading not yet supported for model '{}'.", name);
+                                                eprintln!(
+                                                    "Warning: Dynamic model loading not yet supported for model '{}'.",
+                                                    name
+                                                );
                                             }
                                         }
                                         // Add new agents
                                         for (name, agent_config) in new_config.agents {
                                             if !agents.lock().await.contains_key(&name) {
-                                                if let Err(e) = leader.spawn_agent(name, agent_config).await {
-                                                    let _ = stream.write_all(format!("Error spawning agent: {}", e).as_bytes()).await;
+                                                if let Err(e) =
+                                                    leader.spawn_agent(name, agent_config).await
+                                                {
+                                                    let _ = stream
+                                                        .write_all(
+                                                            format!("Error spawning agent: {}", e)
+                                                                .as_bytes(),
+                                                        )
+                                                        .await;
                                                 }
                                             }
                                         }
                                         let _ = stream.write_all(b"Config updated").await;
                                     }
-                                    Command::SpawnAgent { name, config: agent_config } => {
-                                        if let Err(e) = leader.spawn_agent(name, agent_config).await {
-                                            let _ = stream.write_all(format!("Error spawning agent: {}", e).as_bytes()).await;
+                                    Command::SpawnAgent {
+                                        name,
+                                        config: agent_config,
+                                    } => {
+                                        if let Err(e) = leader.spawn_agent(name, agent_config).await
+                                        {
+                                            let _ = stream
+                                                .write_all(
+                                                    format!("Error spawning agent: {}", e)
+                                                        .as_bytes(),
+                                                )
+                                                .await;
                                         } else {
                                             let _ = stream.write_all(b"Agent Spawned").await;
                                         }
                                     }
-Command::RunAgent(name, message, quiet) => {
-    let forwarder_opt = {
-        let agents_map = agents.lock().await;
-        if let Some(entry) = agents_map.get(&name) {
-            if let Some(msg) = message {
-                entry.volatile_context.lock().await.push((TextMessageRole::User, msg));
-            }
-            Some((entry.output_forwarder.clone(), entry.trigger_path.clone()))
-        } else {
-            None
-        }
-    };
+                                    Command::RunAgent(name, message, quiet) => {
+                                        let forwarder_opt = {
+                                            let agents_map = agents.lock().await;
+                                            if let Some(entry) = agents_map.get(&name) {
+                                                if let Some(msg) = message {
+                                                    entry
+                                                        .volatile_context
+                                                        .lock()
+                                                        .await
+                                                        .push((TextMessageRole::User, msg));
+                                                }
+                                                Some((
+                                                    entry.output_forwarder.clone(),
+                                                    entry.trigger_path.clone(),
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        };
 
-    match forwarder_opt {
-        Some((forwarder, trigger_path)) => {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            forwarder.lock().await.replace(tx);
+                                        match forwarder_opt {
+                                            Some((forwarder, trigger_path)) => {
+                                                let (tx, mut rx) =
+                                                    tokio::sync::mpsc::unbounded_channel::<String>(
+                                                    );
+                                                forwarder.lock().await.replace(tx);
 
-            let trigger_file = trigger_path.join(format!(".trigger-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()));
-            let _ = tokio::fs::write(&trigger_file, b"").await;
-            let _ = tokio::fs::remove_file(&trigger_file).await;
+                                                let trigger_file = trigger_path.join(format!(
+                                                    ".trigger-{}",
+                                                    std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap()
+                                                        .as_millis()
+                                                ));
+                                                let _ = tokio::fs::write(&trigger_file, b"").await;
+                                                let _ = tokio::fs::remove_file(&trigger_file).await;
 
-            if !quiet {
-                let _ = stream.write_all(format!("Triggered agent {}\n", name).as_bytes()).await;
-            }
+                                                if !quiet {
+                                                    let _ = stream
+                                                        .write_all(
+                                                            format!("Triggered agent {}\n", name)
+                                                                .as_bytes(),
+                                                        )
+                                                        .await;
+                                                }
 
-            let output = tokio::time::timeout(
-                Duration::from_secs(120),
-                rx.recv(),
-            ).await.ok().flatten().unwrap_or_default();
+                                                let output = tokio::time::timeout(
+                                                    Duration::from_secs(120),
+                                                    rx.recv(),
+                                                )
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                                .unwrap_or_default();
 
-            forwarder.lock().await.take();
+                                                forwarder.lock().await.take();
 
-            let _ = stream.write_all(output.as_bytes()).await;
-        }
-        None => {
-            let _ = stream.write_all(format!("Agent {} not found", name).as_bytes()).await;
-        }
-    }
-}
+                                                let _ = stream.write_all(output.as_bytes()).await;
+                                            }
+                                            None => {
+                                                let _ = stream
+                                                    .write_all(
+                                                        format!("Agent {} not found", name)
+                                                            .as_bytes(),
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                    }
                                     Command::StopAgent(name) => {
                                         let mut agents_map = agents.lock().await;
                                         if let Some(e) = agents_map.remove(&name) {
@@ -749,7 +866,11 @@ Command::RunAgent(name, message, quiet) => {
                                     }
                                     Command::Status => {
                                         let agents_map = agents.lock().await;
-                                        let status = format!("Active Agents: {:?}\nModels Loaded: {}", agents_map.keys().collect::<Vec<_>>(), model_opt.is_some());
+                                        let status = format!(
+                                            "Active Agents: {:?}\nModels Loaded: {}",
+                                            agents_map.keys().collect::<Vec<_>>(),
+                                            model_opt.is_some()
+                                        );
                                         let _ = stream.write_all(status.as_bytes()).await;
                                     }
                                     Command::Shutdown => {
@@ -769,7 +890,15 @@ Command::RunAgent(name, message, quiet) => {
                                         let _ = stream.write_all(resp.as_bytes()).await;
                                     }
                                     _ => {
-                                        let _ = stream.write_all(b"Command Received (Unimplemented)").await;
+                                        let _ = stream
+                                            .write_all(
+                                                format!(
+                                                    "Command Received (Unimplemented: {:?})",
+                                                    cmd
+                                                )
+                                                .as_bytes(),
+                                            )
+                                            .await;
                                     }
                                 }
                             }
@@ -800,10 +929,7 @@ Command::RunAgent(name, message, quiet) => {
                             );
                         }
                         Err(e) => {
-                            eprintln!(
-                                "Failed to recreate socket {:?}: {}",
-                                pipe_path_clone, e
-                            );
+                            eprintln!("Failed to recreate socket {:?}: {}", pipe_path_clone, e);
                         }
                     }
                 }

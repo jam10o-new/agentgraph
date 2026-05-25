@@ -1,10 +1,10 @@
 use crate::audio::AudioListener;
 use crate::config::{AgentConfig, Config};
 use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_frontmatter};
-use crate::find_leader_socket;
 use crate::ipc::Command;
 use crate::leader::ModelAccess;
 use crate::utils::AgentLogger;
+use crate::utils::find_leader_socket;
 use anyhow::{Context, Result, anyhow};
 use mistralrs::{
     Constraint, Function, Model, MultimodalMessages, RequestBuilder, Response, SamplingParams,
@@ -83,9 +83,10 @@ impl Agent {
             fs::create_dir_all(&p)
                 .await
                 .context(format!("Failed to create input directory: {}", p.display()))?;
-            let cp = fs::canonicalize(&p)
-                .await
-                .context(format!("Failed to canonicalize input path: {}", p.display()))?;
+            let cp = fs::canonicalize(&p).await.context(format!(
+                "Failed to canonicalize input path: {}",
+                p.display()
+            ))?;
             watcher.watch(&cp, RecursiveMode::NonRecursive)?;
             canonical_inputs.push(cp);
         }
@@ -351,10 +352,7 @@ fn count_matching_files(dir: &str, format_str: &str, extension: &str) -> usize {
         return 0;
     }
     // Build a prefix to match: everything before the first variable
-    let prefix = format_str
-        .split(&['{', '}'][..])
-        .next()
-        .unwrap_or("");
+    let prefix = format_str.split(&['{', '}'][..]).next().unwrap_or("");
     let suffix = format!(".{}", extension);
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(dir_path) {
@@ -399,25 +397,30 @@ async fn run_inference(
                 // Check for schema files before the hidden-file skip
                 if let Some(parsed) = ParsedSchemaName::try_parse(&name_str) {
                     if let Ok(content) = fs::read_to_string(entry.path()).await {
-                        let constraint_type = parsed.constraint_hint.as_deref()
-                            .unwrap_or_else(|| {
+                        let constraint_type =
+                            parsed.constraint_hint.as_deref().unwrap_or_else(|| {
                                 // Default: JsonSchema for .json, nothing otherwise
-                                if parsed.extension == "json" { "json" } else { "" }
+                                if parsed.extension == "json" {
+                                    "json"
+                                } else {
+                                    ""
+                                }
                             });
                         let constraint = match constraint_type {
                             "json" => serde_json::from_str::<serde_json::Value>(&content)
                                 .map(Constraint::JsonSchema),
                             "lark" => Ok(Constraint::Lark(content)),
                             "regex" => Ok(Constraint::Regex(content)),
-                            "llg" => serde_json::from_str(&content)
-                                .map(Constraint::Llguidance),
+                            "llg" => serde_json::from_str(&content).map(Constraint::Llguidance),
                             _ => continue, // unknown or no default, skip
                         };
                         if let Ok(c) = constraint {
-                            logger.log(&format!(
-                                "Loaded output schema: .schema-{}.{}",
-                                parsed.format_str, parsed.extension
-                            )).await;
+                            logger
+                                .log(&format!(
+                                    "Loaded output schema: .schema-{}.{}",
+                                    parsed.format_str, parsed.extension
+                                ))
+                                .await;
                             output_schema = Some(OutputSchema {
                                 format_str: parsed.format_str,
                                 extension: parsed.extension,
@@ -501,23 +504,16 @@ async fn run_inference(
                 let p = entry.path();
                 if p.is_file() {
                     let p_display = p.display().to_string();
-                    let metadata = fs::metadata(&p)
-                        .await
-                        .context(format!(
-                            "Failed to read metadata for input file: {}",
-                            p_display
-                        ))?;
+                    let metadata = fs::metadata(&p).await.context(format!(
+                        "Failed to read metadata for input file: {}",
+                        p_display
+                    ))?;
                     let meta_str = format_file_metadata(&p, &metadata);
                     all_files.push(FileEntry {
                         path: p,
-                        created: metadata
-                            .created()
-                            .map_err(|e| {
-                                anyhow!(
-                                    "Failed to get creation time for {}: {e}",
-                                    p_display
-                                )
-                            })?,
+                        created: metadata.created().map_err(|e| {
+                            anyhow!("Failed to get creation time for {}: {e}", p_display)
+                        })?,
                         role: HistoryTurnRole::User,
                         metadata_str: meta_str,
                         excluded: is_excluded,
@@ -532,22 +528,15 @@ async fn run_inference(
                 let p = entry.path();
                 if p.is_file() {
                     let p_display = p.display().to_string();
-                    let metadata = fs::metadata(&p)
-                        .await
-                        .context(format!(
-                            "Failed to read metadata for output file: {}",
-                            p_display
-                        ))?;
+                    let metadata = fs::metadata(&p).await.context(format!(
+                        "Failed to read metadata for output file: {}",
+                        p_display
+                    ))?;
                     all_files.push(FileEntry {
                         path: p,
-                        created: metadata
-                            .created()
-                            .map_err(|e| {
-                                anyhow!(
-                                    "Failed to get creation time for {}: {e}",
-                                    p_display
-                                )
-                            })?,
+                        created: metadata.created().map_err(|e| {
+                            anyhow!("Failed to get creation time for {}: {e}", p_display)
+                        })?,
                         role: HistoryTurnRole::Assistant,
                         metadata_str: String::new(),
                         excluded: false,
@@ -559,34 +548,25 @@ async fn run_inference(
     // Tool outputs are loaded as assistant history so the model sees its own prior tool results.
     // When tool_output is not explicitly set, default to the "tool_output" subdirectory
     // within the first output directory.
-    let effective_tool_dir = config.tool_output.clone().or_else(|| {
-        config
-            .output
-            .first()
-            .map(|o| format!("{}/tool_output", o))
-    });
+    let effective_tool_dir = config
+        .tool_output
+        .clone()
+        .or_else(|| config.output.first().map(|o| format!("{}/tool_output", o)));
     if let Some(ref tool_dir) = effective_tool_dir {
         if let Ok(mut entries) = fs::read_dir(tool_dir).await {
             while let Some(entry) = entries.next_entry().await? {
                 let p = entry.path();
                 if p.is_file() {
                     let p_display = p.display().to_string();
-                    let metadata = fs::metadata(&p)
-                        .await
-                        .context(format!(
-                            "Failed to read metadata for tool output file: {}",
-                            p_display
-                        ))?;
+                    let metadata = fs::metadata(&p).await.context(format!(
+                        "Failed to read metadata for tool output file: {}",
+                        p_display
+                    ))?;
                     all_files.push(FileEntry {
                         path: p,
-                        created: metadata
-                            .created()
-                            .map_err(|e| {
-                                anyhow!(
-                                    "Failed to get creation time for {}: {e}",
-                                    p_display
-                                )
-                            })?,
+                        created: metadata.created().map_err(|e| {
+                            anyhow!("Failed to get creation time for {}: {e}", p_display)
+                        })?,
                         role: HistoryTurnRole::Tool,
                         metadata_str: String::new(),
                         excluded: false,
@@ -617,9 +597,7 @@ async fn run_inference(
                 let path_str = entry.path.to_string_lossy();
                 format!("{:016x}", xxh3_64(path_str.as_bytes()))
             };
-            let content_hash = {
-                format!("{:016x}", xxh3_64(final_content.as_bytes()))
-            };
+            let content_hash = { format!("{:016x}", xxh3_64(final_content.as_bytes())) };
             combined_history.push(HistoryTurn {
                 role: entry.role.clone(),
                 content: final_content,
@@ -657,14 +635,27 @@ async fn run_inference(
         .unwrap_or_default();
 
     // 3. Compression
-    let checkpoint_base = config.output.first()
+    let checkpoint_base = config
+        .output
+        .first()
         .and_then(|o| PathBuf::from(o).parent().map(|p| p.to_path_buf()))
-        .or_else(|| config.stream_output.as_ref().and_then(|s| PathBuf::from(s).parent().map(|p| p.to_path_buf())))
+        .or_else(|| {
+            config
+                .stream_output
+                .as_ref()
+                .and_then(|s| PathBuf::from(s).parent().map(|p| p.to_path_buf()))
+        })
         .unwrap_or_else(|| PathBuf::from("."));
     // Save for potential OOM recovery rebuild
-    let oom_db_path = config.compression_db_path.as_ref()
+    let oom_db_path = config
+        .compression_db_path
+        .as_ref()
         .map(PathBuf::from)
-        .unwrap_or_else(|| checkpoint_base.join(".agent_context").join("compression.db"));
+        .unwrap_or_else(|| {
+            checkpoint_base
+                .join(".agent_context")
+                .join("compression.db")
+        });
     let oom_compression_config = config.compression.clone();
     let comp_mgr = CompressionManager::new(&oom_db_path, &config.compression)?;
     // Snapshot of uncompressed history so OOM recovery can re-compress
@@ -731,18 +722,25 @@ async fn run_inference(
         logger
             .log(&format!("Adding {} images to request", images.len()))
             .await;
-        multimodal =
-            multimodal.add_image_message(TextMessageRole::User, &effective_user_text, images.clone());
+        multimodal = multimodal.add_image_message(
+            TextMessageRole::User,
+            &effective_user_text,
+            images.clone(),
+        );
     } else {
         multimodal = multimodal.add_message(TextMessageRole::User, &effective_user_text);
     }
 
     let tools = if config.tools_enabled {
         if output_schema.is_some() {
-            logger.log("Tools disabled — schema constraint is active (tools conflict with llguidance)").await;
+            logger
+                .log(
+                    "Tools disabled — schema constraint is active (tools conflict with llguidance)",
+                )
+                .await;
             vec![]
         } else {
-        vec![
+            vec![
             Tool {
                 tp: ToolType::Function,
                 function: Function {
@@ -859,8 +857,8 @@ async fn run_inference(
                 },
             },
         ]
-    }
-} else {
+        }
+    } else {
         vec![]
     };
 
@@ -896,14 +894,10 @@ async fn run_inference(
                 stream_path
             ))
             .await;
-        Some(
-            fs::File::create(&stream_path)
-                .await
-                .context(format!(
-                    "Failed to create stream output file: {}",
-                    stream_path.display()
-                ))?,
-        )
+        Some(fs::File::create(&stream_path).await.context(format!(
+            "Failed to create stream output file: {}",
+            stream_path.display()
+        ))?)
     } else {
         logger
             .log("Streaming disabled, will create output file after completion")
@@ -927,8 +921,7 @@ async fn run_inference(
     // entire turn. This preserves more history than dropping everything.
     let mut oom_recompression_done = false;
     let mut oom_recovery_pending = false;
-    let oom_aggressive_limit = config.context_checkpoint_limit
-        .map(|l| (l / 2).max(1));
+    let oom_aggressive_limit = config.context_checkpoint_limit.map(|l| (l / 2).max(1));
 
     let mut final_output = String::new();
     loop {
@@ -936,11 +929,10 @@ async fn run_inference(
         // uncompressed history with tighter limits before rebuilding the
         // request.
         if oom_recovery_pending {
-            logger.log("Recompressing context with aggressive limits after OOM").await;
-            let oom_comp_mgr = CompressionManager::new(
-                &oom_db_path,
-                &oom_compression_config,
-            )?;
+            logger
+                .log("Recompressing context with aggressive limits after OOM")
+                .await;
+            let oom_comp_mgr = CompressionManager::new(&oom_db_path, &oom_compression_config)?;
             let mut history_retry = uncompressed_history.clone();
             let recompr_context = match oom_comp_mgr
                 .get_compressed_context(
@@ -954,7 +946,9 @@ async fn run_inference(
             {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    logger.log(&format!("OOM recompression failed: {:?}", e)).await;
+                    logger
+                        .log(&format!("OOM recompression failed: {:?}", e))
+                        .await;
                     break; // give up
                 }
             };
@@ -974,8 +968,8 @@ async fn run_inference(
                     images.clone(),
                 );
             } else {
-                new_multimodal = new_multimodal
-                    .add_message(TextMessageRole::User, &effective_user_text);
+                new_multimodal =
+                    new_multimodal.add_message(TextMessageRole::User, &effective_user_text);
             }
             request = RequestBuilder::from(new_multimodal)
                 .set_sampling(sampling.clone())
@@ -998,10 +992,8 @@ async fn run_inference(
         loop {
             let mut retry_request = base_request.clone();
             if !accumulated_content.is_empty() {
-                retry_request = retry_request.add_message(
-                    TextMessageRole::Assistant,
-                    accumulated_content.clone(),
-                );
+                retry_request = retry_request
+                    .add_message(TextMessageRole::Assistant, accumulated_content.clone());
                 logger
                     .log(&format!(
                         "Retrying inference with {} chars of prefill content",
@@ -1066,12 +1058,7 @@ async fn run_inference(
                                 accumulated_content.push_str(content);
                                 if let Some(ref mut f) = stream_file {
                                     if let Err(e) = f.write_all(content.as_bytes()).await {
-                                        logger
-                                            .log(&format!(
-                                                "Stream write error: {:?}",
-                                                e
-                                            ))
-                                            .await;
+                                        logger.log(&format!("Stream write error: {:?}", e)).await;
                                     }
                                     let _ = f.flush().await;
                                 }
@@ -1082,13 +1069,11 @@ async fn run_inference(
                         }
                     }
                     Response::ModelError(msg, _) => {
-                        stream_error =
-                            Some(format!("Model error during streaming: {}", msg));
+                        stream_error = Some(format!("Model error during streaming: {}", msg));
                         break;
                     }
                     Response::InternalError(e) => {
-                        stream_error =
-                            Some(format!("Internal error during streaming: {}", e));
+                        stream_error = Some(format!("Internal error during streaming: {}", e));
                         break;
                     }
                     // Done, CompletionDone, etc. — stream is ending normally
@@ -1186,8 +1171,7 @@ async fn run_inference(
         // Skip tool-call appending when using a schema — constrained
         // output is expected to be the complete, valid response.
         if !config.consume_tool_calls && !current_tool_calls.is_empty() && output_schema.is_none() {
-            let mut seen_ids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut deduped: Vec<&ToolCallResponse> = Vec::new();
             // Iterate in reverse so the first-seen (last-occurrence) wins
             for tc in current_tool_calls.iter().rev() {
@@ -1274,7 +1258,10 @@ async fn run_inference(
                             .iter()
                             .map(|v| v.as_str().unwrap_or_default().to_string())
                             .collect(),
-                        output: args["output"].as_str().map(|s| vec![s.to_string()]).unwrap_or_default(),
+                        output: args["output"]
+                            .as_str()
+                            .map(|s| vec![s.to_string()])
+                            .unwrap_or_default(),
                         stream_output: args["stream_output"].as_str().map(|s| s.to_string()),
                         tool_output: args["tool_output"].as_str().map(|s| s.to_string()),
                         system: args["system"]
@@ -1378,7 +1365,11 @@ async fn run_inference(
                     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
                     let mut search_roots: Vec<String> = args["search_paths"]
                         .as_array()
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     if search_roots.is_empty() {
                         if let Ok(home) = std::env::var("HOME") {
@@ -1398,24 +1389,39 @@ async fn run_inference(
                         while let Some(dir) = stack.pop() {
                             let skill_md = dir.join("SKILL.md");
                             if skill_md.exists() && skill_md.is_file() {
-                                let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                                let name = dir
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
                                 let mut description = String::new();
                                 if let Ok(content) = tokio::fs::read_to_string(&skill_md).await {
                                     if content.starts_with("---") {
                                         if let Some(end) = content[3..].find("---") {
-                                            let frontmatter = &content[3..end+3];
+                                            let frontmatter = &content[3..end + 3];
                                             for line in frontmatter.lines() {
                                                 if line.starts_with("description:") {
-                                                    description = line["description:".len()..].trim().to_string();
+                                                    description = line["description:".len()..]
+                                                        .trim()
+                                                        .to_string();
                                                 }
                                             }
                                         }
                                     }
                                     if description.is_empty() && content.len() > 100 {
-                                        description = content.lines().skip(1).find(|l| !l.trim().is_empty() && !l.starts_with("---")).unwrap_or("").to_string();
+                                        description = content
+                                            .lines()
+                                            .skip(1)
+                                            .find(|l| !l.trim().is_empty() && !l.starts_with("---"))
+                                            .unwrap_or("")
+                                            .to_string();
                                     }
                                 }
-                                skills.push(format!("- {} ({}): {}", name, dir.display(), description));
+                                skills.push(format!(
+                                    "- {} ({}): {}",
+                                    name,
+                                    dir.display(),
+                                    description
+                                ));
                                 continue; // Don't recurse into skill directories
                             }
                             if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
@@ -1437,7 +1443,8 @@ async fn run_inference(
                 "load_skill" => {
                     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
                     let skill_path = args["skill_path"].as_str().unwrap_or_default();
-                    let system_dir = args["system_dir"].as_str()
+                    let system_dir = args["system_dir"]
+                        .as_str()
                         .map(|s| s.to_string())
                         .or_else(|| config.system.first().cloned())
                         .unwrap_or_else(|| ".".to_string());
@@ -1449,9 +1456,14 @@ async fn run_inference(
                         if !skill_md.exists() {
                             format!("Error: No SKILL.md found at {}", skill_md.display())
                         } else {
-                            let dest = PathBuf::from(&system_dir).join(src.file_name().unwrap_or_default());
+                            let dest = PathBuf::from(&system_dir)
+                                .join(src.file_name().unwrap_or_default());
                             match copy_dir(&src, &dest).await {
-                                Ok(_) => format!("Skill loaded from {} into {}", src.display(), dest.display()),
+                                Ok(_) => format!(
+                                    "Skill loaded from {} into {}",
+                                    src.display(),
+                                    dest.display()
+                                ),
                                 Err(e) => format!("Error copying skill: {}", e),
                             }
                         }
@@ -1520,13 +1532,11 @@ async fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
         if src_path.is_dir() {
             Box::pin(copy_dir(&src_path, &dest_path)).await?;
         } else {
-            fs::copy(&src_path, &dest_path)
-                .await
-                .context(format!(
-                    "Failed to copy {} to {}",
-                    src_path.display(),
-                    dest_path.display()
-                ))?;
+            fs::copy(&src_path, &dest_path).await.context(format!(
+                "Failed to copy {} to {}",
+                src_path.display(),
+                dest_path.display()
+            ))?;
         }
     }
     Ok(())
