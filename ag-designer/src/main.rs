@@ -168,7 +168,7 @@ impl SnarlViewer<MyNode> for DemoViewer {
                         compression,
                         context_checkpoint_limit,
                         excluded_from_summary,
-                        tools_enabled,
+                        tools,
                         ..
                     },
             } => {
@@ -334,7 +334,11 @@ impl SnarlViewer<MyNode> for DemoViewer {
                     ui.collapsing("Advanced Configuration", |ui| {
                         ui.horizontal(|ui| {
                             ui.checkbox(realtime_audio, "Realtime Audio");
-                            ui.checkbox(tools_enabled, "Tools Enabled");
+                            let mut tools_str = tools.join(",");
+                            ui.label("Tools:");
+                            if ui.text_edit_singleline(&mut tools_str).changed() {
+                                *tools = tools_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                            }
                             ui.label("History:");
                             let mut hl = history_limit.unwrap_or(0);
                             if ui.add(egui::DragValue::new(&mut hl)).changed() {
@@ -777,7 +781,7 @@ impl eframe::App for SnarlApp {
                                 },
                                 context_checkpoint_limit: None,
                                 excluded_from_summary: Vec::new(),
-                                tools_enabled: true,
+                                tools: Vec::new(),
                                 consume_tool_calls: false,
                                 enable_thinking: false,
                                 inference_retries: 3,

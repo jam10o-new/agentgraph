@@ -3,6 +3,9 @@ use crate::config::{AgentConfig, Config};
 use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_frontmatter};
 use crate::ipc::Command;
 use crate::leader::ModelAccess;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::Mutex as StdMutex;
 use crate::utils::AgentLogger;
 use crate::utils::find_leader_socket;
 use anyhow::{Context, Result, anyhow};
@@ -457,6 +460,29 @@ async fn run_inference(
         system_content.push_str(extra_prompt);
     }
 
+    // ── Tool discovery (dynamic, per-binary --describe / --help) ──────────
+    // Run early so guidance text is injected into the system prompt before
+    // it gets consumed by the history builder.
+    let mut tool_registry: Option<ToolRegistry> = None;
+    let mut tools = vec![];
+    if !config.tools.is_empty() && output_schema.is_none() {
+        match discover_tools(&config.tools, &logger).await {
+            Ok(registry) => {
+                if !registry.guidance.is_empty() {
+                    system_content.push_str("\n\n== Tool Usage Guidance ==\n");
+                    system_content.push_str(&registry.guidance);
+                }
+                tools = registry.tools.clone();
+                tool_registry = Some(registry);
+            }
+            Err(e) => {
+                logger.log(&format!("Tool discovery error: {e}")).await;
+            }
+        }
+    } else if output_schema.is_some() && !config.tools.is_empty() {
+        logger.log("Tools disabled — schema constraint is active (tools conflict with llguidance)").await;
+    }
+
     let mut combined_history = Vec::new();
     if !system_content.is_empty() {
         if let Some((n, d, body)) = extract_frontmatter(&system_content) {
@@ -731,141 +757,10 @@ async fn run_inference(
         multimodal = multimodal.add_message(TextMessageRole::User, &effective_user_text);
     }
 
-    let tools = if config.tools_enabled {
-        if output_schema.is_some() {
-            logger
-                .log(
-                    "Tools disabled — schema constraint is active (tools conflict with llguidance)",
-                )
-                .await;
-            vec![]
-        } else {
-            vec![
-            Tool {
-                tp: ToolType::Function,
-                function: Function {
-                    name: "execute_command".into(),
-                    description: Some("Execute a shell command on the host".into()),
-                    parameters: Some(json_schema_obj!({
-                        "type": "object",
-                        "properties": {
-                            "command": {"type": "string"},
-                            "args": {"type": "array", "items": {"type": "string"}}
-                        }
-                    })),
-                    strict: None,
-                },
-            },
-            Tool {
-                tp: ToolType::Function,
-                function: Function {
-                    name: "spawn_new_agent".into(),
-                    description: Some("Spawn a new agent dynamically".into()),
-                    parameters: Some(json_schema_obj!({
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "inputs": {"type": "array", "items": {"type": "string"}},
-                            "output": {"type": "string"},
-                            "stream_output": {"type": "string", "nullable": true},
-                            "tool_output": {"type": "string", "nullable": true},
-                            "system": {"type": "array", "items": {"type": "string"}},
-                            "model": {"type": "string"},
-                            "history_limit": {"type": "integer", "nullable": true},
-                            "realtime_audio": {"type": "boolean"},
-                            "prompt": {"type": "string", "nullable": true},
-                            "tools_enabled": {"type": "boolean"},
-                            "excluded_from_summary": {"type": "array", "items": {"type": "string"}},
-                            "context_checkpoint_limit": {"type": "integer", "nullable": true}
-                        }
-                    })),
-                    strict: None,
-                },
-            },
-            Tool {
-                tp: ToolType::Function,
-                function: Function {
-                    name: "load_into_context".into(),
-                    description: Some("Load files into context for the next turn".into()),
-                    parameters: Some(json_schema_obj!({
-                        "type": "object",
-                        "properties": {
-                            "files": {"type": "array", "items": {"type": "string"}}
-                        }
-                    })),
-                    strict: None,
-                },
-            },
-            Tool {
-                tp: ToolType::Function,
-                function: Function {
-                    name: "read_file".into(),
-                    description: Some(
-                        "Read the contents of one or more files and return them immediately".into(),
-                    ),
-                    parameters: Some(json_schema_obj!({
-                        "type": "object",
-                        "properties": {
-                            "files": {"type": "array", "items": {"type": "string"}}
-                        }
-                    })),
-                    strict: None,
-                },
-            },
-            Tool {
-                tp: ToolType::Function,
-                function: Function {
-                    name: "list_directory".into(),
-                    description: Some("List files and directories at a given path".into()),
-                    parameters: Some(json_schema_obj!({
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"}
-                        }
-                    })),
-                    strict: None,
-                },
-            },
-            Tool {
-                tp: ToolType::Function,
-                function: Function {
-                    name: "list_skills".into(),
-                    description: Some("Discover available skills by searching for SKILL.md files in ~/.config and the current working directory. Returns a list of skills with their names, descriptions, and paths.".into()),
-                    parameters: Some(json_schema_obj!({
-                        "type": "object",
-                        "properties": {
-                            "search_paths": {"type": "array", "items": {"type": "string"}, "description": "Optional additional paths to search. Defaults to ~/.config and cwd."}
-                        }
-                    })),
-                    strict: None,
-                },
-            },
-            Tool {
-                tp: ToolType::Function,
-                function: Function {
-                    name: "load_skill".into(),
-                    description: Some("Load a skill into the agent's system context by copying its directory into a system prompt directory. The skill's SKILL.md and any reference files become part of the agent's system prompt.".into()),
-                    parameters: Some(json_schema_obj!({
-                        "type": "object",
-                        "properties": {
-                            "skill_path": {"type": "string", "description": "Path to the skill directory containing SKILL.md"},
-                            "system_dir": {"type": "string", "description": "Target system directory to copy the skill into. Defaults to the agent's first system directory."}
-                        },
-                        "required": ["skill_path"]
-                    })),
-                    strict: None,
-                },
-            },
-        ]
-        }
-    } else {
-        vec![]
-    };
-
     // When not consuming tool calls (distillation mode), write the tool
     // definitions to a well-known hidden file in the first system directory
     // so downstream harnesses know what tools the model had access to.
-    if !config.consume_tool_calls && config.tools_enabled && !tools.is_empty() {
+    if !config.consume_tool_calls && !tools.is_empty() {
         if let Some(ref sys_dir) = config.system.first() {
             let tools_path = PathBuf::from(sys_dir).join(".agentgraph_tools.json");
             if let Ok(json) = serde_json::to_string_pretty(&tools) {
@@ -1225,251 +1120,31 @@ async fn run_inference(
             current_tool_calls.clone(),
         );
         for (tool_idx, tc) in current_tool_calls.iter().enumerate() {
-            let result = match tc.function.name.as_str() {
-                "execute_command" => {
-                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
-                    let cmd = args["command"].as_str().unwrap_or_default();
-                    let args_vec: Vec<String> = args["args"]
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .map(|v| v.as_str().unwrap_or_default().to_string())
-                        .collect();
-                    match tokio::process::Command::new(cmd)
-                        .args(args_vec)
-                        .output()
-                        .await
-                    {
-                        Ok(output) => format!(
-                            "Stdout: {}\nStderr: {}",
-                            String::from_utf8_lossy(&output.stdout),
-                            String::from_utf8_lossy(&output.stderr)
-                        ),
-                        Err(e) => format!("Error executing command: {}", e),
-                    }
-                }
-                "spawn_new_agent" => {
-                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
-                    let name = args["name"].as_str().unwrap_or_default().to_string();
-                    let config = AgentConfig {
-                        inputs: args["inputs"]
-                            .as_array()
-                            .unwrap_or(&vec![])
-                            .iter()
-                            .map(|v| v.as_str().unwrap_or_default().to_string())
-                            .collect(),
-                        output: args["output"]
-                            .as_str()
-                            .map(|s| vec![s.to_string()])
-                            .unwrap_or_default(),
-                        stream_output: args["stream_output"].as_str().map(|s| s.to_string()),
-                        tool_output: args["tool_output"].as_str().map(|s| s.to_string()),
-                        system: args["system"]
-                            .as_array()
-                            .unwrap_or(&vec![])
-                            .iter()
-                            .map(|v| v.as_str().unwrap_or_default().to_string())
-                            .collect(),
-                        model: args["model"].as_str().unwrap_or("primary").to_string(),
-                        history_limit: args["history_limit"].as_u64().map(|u| u as usize),
-                        realtime_audio: args["realtime_audio"].as_bool().unwrap_or(false),
-                        allowed_extensions: vec![],
-                        prompt: args["prompt"].as_str().map(|s| s.to_string()),
-                        sampling: Default::default(),
-                        compression: Default::default(),
-                        context_checkpoint_limit: args["context_checkpoint_limit"]
-                            .as_u64()
-                            .map(|u| u as usize),
-                        excluded_from_summary: args["excluded_from_summary"]
-                            .as_array()
-                            .unwrap_or(&vec![])
-                            .iter()
-                            .map(|v| v.as_str().unwrap_or_default().to_string())
-                            .collect(),
-                        tools_enabled: args["tools_enabled"].as_bool().unwrap_or(true),
-                        consume_tool_calls: args["consume_tool_calls"].as_bool().unwrap_or(false),
-                        enable_thinking: args["enable_thinking"].as_bool().unwrap_or(false),
-                        inference_retries: 3,
-                        enable_oom_recovery: true,
-                        inference_retry_delay_ms: 500,
-                        compression_db_path: None,
-                    };
-                    send_ipc_command(Command::SpawnAgent { name, config })
-                        .await
-                        .unwrap_or_else(|e| e.to_string())
-                }
-                "load_into_context" => {
-                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
-                    let empty_vec = vec![];
-                    let files = args["files"].as_array().unwrap_or(&empty_vec);
-                    let mut loaded = Vec::new();
-                    for f in files {
-                        let p = f.as_str().unwrap_or_default();
-                        if let Ok(c) = fs::read_to_string(p).await {
-                            loaded.push((TextMessageRole::System, format!("File {}:\n{}", p, c)));
-                        }
-                    }
-                    volatile_context.lock().await.extend(loaded);
-                    "Files loaded into context for next turn".into()
-                }
-                "read_file" => {
-                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
-                    let empty_vec = vec![];
-                    let files = args["files"].as_array().unwrap_or(&empty_vec);
-                    let mut out = String::new();
-                    for f in files {
-                        let p = f.as_str().unwrap_or_default();
-                        match fs::read_to_string(p).await {
-                            Ok(c) => {
-                                out.push_str(&format!("--- {} ---\n{}\n", p, c));
-                            }
-                            Err(e) => {
-                                out.push_str(&format!("--- {} ---\nError: {}\n", p, e));
-                            }
-                        }
-                    }
-                    if out.is_empty() {
-                        "No files requested.".into()
-                    } else {
-                        out
-                    }
-                }
-                "list_directory" => {
-                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
-                    let p = args["path"].as_str().unwrap_or(".");
-                    let mut out = String::new();
-                    match fs::read_dir(p).await {
-                        Ok(mut entries) => {
-                            while let Some(entry) = entries.next_entry().await? {
-                                let meta = entry.metadata().await?;
-                                let file_type = if meta.is_dir() { "dir" } else { "file" };
-                                out.push_str(&format!(
-                                    "[{}] {} ({} bytes)\n",
-                                    file_type,
-                                    entry.path().display(),
-                                    meta.len()
+            let result = if let Some(ref registry) = tool_registry {
+                if let Some(binary_name) = registry.name_to_binary.get(&tc.function.name) {
+                    match execute_tool_binary(binary_name, &tc.function.arguments).await {
+                        Ok(output) => {
+                            // load_into_context has special semantics: store
+                            // output in volatile context for the next turn.
+                            if tc.function.name == "load_into_context" {
+                                volatile_context.lock().await.push((
+                                    TextMessageRole::System,
+                                    output,
                                 ));
+                                "Files loaded into context for next turn.".into()
+                            } else {
+                                output
                             }
                         }
                         Err(e) => {
-                            out.push_str(&format!("Error reading directory: {}", e));
+                            format!("Error executing {}: {}", tc.function.name, e)
                         }
                     }
-                    if out.is_empty() {
-                        "Directory is empty or path not found.".into()
-                    } else {
-                        out
-                    }
+                } else {
+                    format!("Unknown tool: {}", tc.function.name)
                 }
-                "list_skills" => {
-                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
-                    let mut search_roots: Vec<String> = args["search_paths"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if search_roots.is_empty() {
-                        if let Ok(home) = std::env::var("HOME") {
-                            search_roots.push(format!("{}/.config", home));
-                        }
-                        if let Ok(cwd) = std::env::current_dir() {
-                            search_roots.push(cwd.to_string_lossy().to_string());
-                        }
-                    }
-                    let mut skills = Vec::new();
-                    for root in &search_roots {
-                        let root_path = PathBuf::from(root);
-                        if !root_path.exists() {
-                            continue;
-                        }
-                        let mut stack = vec![root_path];
-                        while let Some(dir) = stack.pop() {
-                            let skill_md = dir.join("SKILL.md");
-                            if skill_md.exists() && skill_md.is_file() {
-                                let name = dir
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                let mut description = String::new();
-                                if let Ok(content) = tokio::fs::read_to_string(&skill_md).await {
-                                    if content.starts_with("---") {
-                                        if let Some(end) = content[3..].find("---") {
-                                            let frontmatter = &content[3..end + 3];
-                                            for line in frontmatter.lines() {
-                                                if line.starts_with("description:") {
-                                                    description = line["description:".len()..]
-                                                        .trim()
-                                                        .to_string();
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if description.is_empty() && content.len() > 100 {
-                                        description = content
-                                            .lines()
-                                            .skip(1)
-                                            .find(|l| !l.trim().is_empty() && !l.starts_with("---"))
-                                            .unwrap_or("")
-                                            .to_string();
-                                    }
-                                }
-                                skills.push(format!(
-                                    "- {} ({}): {}",
-                                    name,
-                                    dir.display(),
-                                    description
-                                ));
-                                continue; // Don't recurse into skill directories
-                            }
-                            if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
-                                while let Ok(Some(entry)) = entries.next_entry().await {
-                                    let path = entry.path();
-                                    if path.is_dir() {
-                                        stack.push(path);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if skills.is_empty() {
-                        "No skills found. Skills are directories containing a SKILL.md file.".into()
-                    } else {
-                        format!("Found {} skills:\n{}", skills.len(), skills.join("\n"))
-                    }
-                }
-                "load_skill" => {
-                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
-                    let skill_path = args["skill_path"].as_str().unwrap_or_default();
-                    let system_dir = args["system_dir"]
-                        .as_str()
-                        .map(|s| s.to_string())
-                        .or_else(|| config.system.first().cloned())
-                        .unwrap_or_else(|| ".".to_string());
-                    if skill_path.is_empty() {
-                        "Error: skill_path is required".into()
-                    } else {
-                        let src = PathBuf::from(skill_path);
-                        let skill_md = src.join("SKILL.md");
-                        if !skill_md.exists() {
-                            format!("Error: No SKILL.md found at {}", skill_md.display())
-                        } else {
-                            let dest = PathBuf::from(&system_dir)
-                                .join(src.file_name().unwrap_or_default());
-                            match copy_dir(&src, &dest).await {
-                                Ok(_) => format!(
-                                    "Skill loaded from {} into {}",
-                                    src.display(),
-                                    dest.display()
-                                ),
-                                Err(e) => format!("Error copying skill: {}", e),
-                            }
-                        }
-                    }
-                }
-                _ => format!("Unknown tool: {}", tc.function.name),
+            } else {
+                "Tools are not enabled for this agent.".into()
             };
 
             // Persist tool result to the dedicated tool_output directory if configured.
@@ -1504,6 +1179,182 @@ async fn run_inference(
 
     logger.log("Inference turn complete").await;
     Ok(final_output)
+}
+
+// ── Tool plugin system ──────────────────────────────────────────────────
+
+/// Cached tool schema + guidance, keyed by binary name.
+struct CachedTool {
+    tool: Tool,
+    guidance: String,
+}
+
+/// Global tool cache — avoids spawning `--describe`/`--help` on every turn.
+static TOOL_CACHE: LazyLock<StdMutex<HashMap<String, CachedTool>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Built tool registry for a single inference run.
+struct ToolRegistry {
+    tools: Vec<Tool>,
+    guidance: String,
+    /// Maps function name (e.g. `read_file`) → binary name (e.g. `ag-tool-read`).
+    name_to_binary: HashMap<String, String>,
+}
+
+/// Discover tools by running `--describe` and `--help` on each configured binary.
+/// Results are cached globally.
+async fn discover_tools(
+    tool_names: &[String],
+    logger: &AgentLogger,
+) -> anyhow::Result<ToolRegistry> {
+    let mut tools = Vec::new();
+    let mut guidance_parts = Vec::new();
+    let mut name_to_binary = HashMap::new();
+
+    // Phase 1: load from cache (short lock)
+    let uncached: Vec<String> = {
+        let cache = TOOL_CACHE.lock().unwrap();
+        for name in tool_names {
+            if let Some(cached) = cache.get(name) {
+                tools.push(cached.tool.clone());
+                guidance_parts.push(cached.guidance.clone());
+                let func_name = cached.tool.function.name.clone();
+                name_to_binary.insert(func_name, name.clone());
+            }
+        }
+        tool_names
+            .iter()
+            .filter(|n| !cache.contains_key(*n))
+            .cloned()
+            .collect()
+    };
+
+    // Phase 2: discover uncached tools (no lock held across await)
+    for name in &uncached {
+        let binary_path = match which::which(name) {
+            Ok(p) => p,
+            Err(_) => {
+                logger
+                    .log(&format!(
+                        "Tool binary '{name}' not found on PATH — skipping"
+                    ))
+                    .await;
+                continue;
+            }
+        };
+
+        // --describe → JSON Function schema
+        let describe = tokio::process::Command::new(&binary_path)
+            .arg("--describe")
+            .output()
+            .await;
+        let (func_name, tool) = match describe {
+            Ok(out) if out.status.success() => {
+                let raw = String::from_utf8_lossy(&out.stdout);
+                match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(schema) => {
+                        let fn_name =
+                            schema["name"].as_str().unwrap_or(name).to_string();
+                        let tool = Tool {
+                            tp: ToolType::Function,
+                            function: Function {
+                                name: fn_name.clone(),
+                                description: schema["description"]
+                                    .as_str()
+                                    .map(String::from),
+                                parameters: schema
+                                    .get("parameters")
+                                    .and_then(|p| p.as_object())
+                                    .map(|obj| {
+                                        obj.iter()
+                                            .map(|(k, v)| (k.clone(), v.clone()))
+                                            .collect::<HashMap<String, serde_json::Value>>()
+                                    }),
+                                strict: None,
+                            },
+                        };
+                        (fn_name, tool)
+                    }
+                    Err(e) => {
+                        logger
+                            .log(&format!(
+                                "Failed to parse --describe from '{name}': {e}"
+                            ))
+                            .await;
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                logger
+                    .log(&format!(
+                        "Tool '{name}' --describe failed"
+                    ))
+                    .await;
+                continue;
+            }
+        };
+
+        // --help → LLM guidance
+        let guidance = match tokio::process::Command::new(&binary_path)
+            .arg("--help")
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            }
+            _ => String::new(),
+        };
+
+        name_to_binary.insert(func_name.clone(), name.clone());
+        tools.push(tool.clone());
+        guidance_parts.push(guidance.clone());
+
+        // Insert into global cache (short lock)
+        TOOL_CACHE.lock().unwrap().insert(
+            name.clone(),
+            CachedTool {
+                tool,
+                guidance,
+            },
+        );
+    }
+
+    Ok(ToolRegistry {
+        tools,
+        guidance: guidance_parts.join("\n\n"),
+        name_to_binary,
+    })
+}
+
+/// Execute a tool by spawning its binary, writing arguments to stdin,
+/// and capturing stdout.
+async fn execute_tool_binary(binary_name: &str, arguments: &str) -> Result<String, anyhow::Error> {
+    let path = which::which(binary_name)?;
+    let mut child = tokio::process::Command::new(&path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(arguments.as_bytes()).await?;
+    }
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Ok(format!(
+            "Error: tool '{binary_name}' exited with status {}.\nStderr: {stderr}",
+            output.status
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 async fn send_ipc_command(cmd: Command) -> Result<String> {

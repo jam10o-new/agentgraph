@@ -134,9 +134,10 @@ enum Commands {
         /// Enable realtime audio
         #[arg(long)]
         realtime_audio: bool,
-        /// Enable tool usage (default true)
-        #[arg(long, default_value_t = true)]
-        tools_enabled: bool,
+        /// Tool binaries to enable (comma-separated list of binary names).
+        /// Use empty for no tools. Default: all known tools.
+        #[arg(long, value_delimiter = ',', default_value = "ag-tool-bash,ag-tool-read,ag-tool-ls,ag-tool-skills,ag-tool-load-skill,ag-tool-loadctx,ag-tool-spawn")]
+        tools: Vec<String>,
         /// Enable extended thinking / chain-of-thought
         #[arg(long)]
         enable_thinking: bool,
@@ -247,7 +248,7 @@ async fn main() -> Result<()> {
                     compression_threshold, compression_inverse_prob, compression_resummarize_prob,
                     context_checkpoint_limit, excluded_from_summary,
                     allowed_extensions, realtime_audio,
-                    tools_enabled, enable_thinking,
+                    tools, enable_thinking,
                     inference_retries, inference_retry_delay_ms,
                     enable_oom_recovery,
                     ..  // future-proof
@@ -283,7 +284,7 @@ async fn main() -> Result<()> {
                         },
                         context_checkpoint_limit,
                         excluded_from_summary,
-                        tools_enabled,
+                        tools,
                         enable_thinking,
                         inference_retries: inference_retries.unwrap_or(3),
                         inference_retry_delay_ms: inference_retry_delay_ms.unwrap_or(500),

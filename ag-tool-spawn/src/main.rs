@@ -17,7 +17,7 @@ struct Args {
     history_limit: Option<usize>,
     realtime_audio: bool,
     prompt: Option<String>,
-    tools_enabled: bool,
+    tools: Vec<String>,
     excluded_from_summary: Vec<String>,
     context_checkpoint_limit: Option<usize>,
 }
@@ -63,7 +63,7 @@ fn parse_args() -> Result<Args, String> {
         history_limit: int_opt(&raw, "history_limit"),
         realtime_audio: bool_def(&raw, "realtime_audio", true),
         prompt: str_opt(&raw, "prompt"),
-        tools_enabled: bool_def(&raw, "tools_enabled", true),
+        tools: arr(&raw, "tools"),
         excluded_from_summary: arr(&raw, "excluded_from_summary"),
         context_checkpoint_limit: int_opt(&raw, "context_checkpoint_limit"),
     })
@@ -88,7 +88,7 @@ async fn main() {
                     "history_limit": { "type": "integer", "nullable": true },
                     "realtime_audio": { "type": "boolean" },
                     "prompt": { "type": "string", "nullable": true, "description": "Optional system prompt suffix." },
-                    "tools_enabled": { "type": "boolean", "description": "Whether the new agent can use tools." },
+                    "tools": { "type": "array", "items": { "type": "string" }, "description": "Tool binary names to enable (e.g. ag-tool-bash, ag-tool-read). Empty = no tools." },
                     "excluded_from_summary": { "type": "array", "items": { "type": "string" } },
                     "context_checkpoint_limit": { "type": "integer", "nullable": true }
                 }
@@ -104,7 +104,8 @@ async fn main() {
              - The new agent watches its own input directories and runs independently.\n\
              - Use output directories to wire agents together (colony pattern).\n\
              - Provide a unique name to avoid conflicts with existing agents.\n\
-             - The new agent inherits the global model configuration.",
+             - The new agent inherits the global model configuration.\n\
+             - Set 'tools' to a list of tool binary names (empty list = no tools).",
         );
         return;
     }
@@ -112,7 +113,7 @@ async fn main() {
     // ── Execute ──
     let Args {
         name, inputs, output, stream_output, tool_output, system, model,
-        history_limit, realtime_audio, prompt, tools_enabled,
+        history_limit, realtime_audio, prompt, tools,
         excluded_from_summary, context_checkpoint_limit,
     } = parse_args().unwrap_or_else(|e| {
         eprintln!("Error: {e}");
@@ -135,7 +136,7 @@ async fn main() {
         context_checkpoint_limit,
         compression_db_path: None,
         excluded_from_summary,
-        tools_enabled,
+        tools,
         consume_tool_calls: false,
         enable_thinking: false,
         inference_retries: 3,

@@ -113,8 +113,11 @@ pub struct AgentConfig {
     pub compression_db_path: Option<String>,
     #[serde(default)]
     pub excluded_from_summary: Vec<String>,
-    #[serde(default = "default_true")]
-    pub tools_enabled: bool,
+    /// Tool binaries to make available to this agent. Each entry is the
+    /// full binary name (e.g. `ag-tool-bash`, `ag-tool-read`).
+    /// An empty list means no tools are available at all.
+    #[serde(default)]
+    pub tools: Vec<String>,
     #[serde(default)]
     pub consume_tool_calls: bool,
     #[serde(default = "default_true")]
