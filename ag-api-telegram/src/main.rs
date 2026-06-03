@@ -94,7 +94,7 @@ async fn ipc_send(socket: &str, cmd: &Command) -> Result<IpcResponse, String> {
 // ── Telegram API helpers ────────────────────────────────────────────────────
 
 async fn send_message(client: &reqwest::Client, token: &str, chat_id: i64, text: &str) {
-    let _ = client
+    let result = client
         .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
         .json(&serde_json::json!({
             "chat_id": chat_id,
@@ -103,16 +103,31 @@ async fn send_message(client: &reqwest::Client, token: &str, chat_id: i64, text:
         }))
         .send()
         .await;
+    if let Err(e) = result {
+        eprintln!("ag-api-telegram: sendMessage failed (chat {chat_id}): {e}");
+    } else if let Ok(resp) = result {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            eprintln!(
+                "ag-api-telegram: sendMessage HTTP {status} (chat {chat_id}): {body}",
+                body = body.chars().take(500).collect::<String>()
+            );
+        }
+    }
 }
 
 async fn send_chat_action(client: &reqwest::Client, token: &str, chat_id: i64, action: &str) {
-    let _ = client
+    let result = client
         .post(format!(
             "https://api.telegram.org/bot{token}/sendChatAction"
         ))
         .json(&serde_json::json!({ "chat_id": chat_id, "action": action }))
         .send()
         .await;
+    if let Err(e) = result {
+        eprintln!("ag-api-telegram: sendChatAction failed (chat {chat_id}): {e}");
+    }
 }
 
 // ── Command handlers ───────────────────────────────────────────────────────
@@ -388,7 +403,11 @@ async fn main() {
         chats: Mutex::new(HashMap::new()),
     });
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .expect("failed to build HTTP client");
     let token = &state.tg.bot_token.clone();
     let base_url = format!("https://api.telegram.org/bot{token}");
     let mut offset: i64 = 0;

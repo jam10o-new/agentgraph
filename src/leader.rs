@@ -879,7 +879,10 @@ impl Leader {
                                         std::process::exit(0);
                                     }
                                     // ── Session-tree commands ────────
-                                    Command::SessionCreate { .. }
+                                    Command::SessionChat { .. }
+                                    | Command::SessionListChildren { .. }
+                                    | Command::SessionPath { .. }
+                                    | Command::SessionCreate { .. }
                                     | Command::SessionDelete { .. }
                                     | Command::SessionList
                                     | Command::SessionBuild { .. }

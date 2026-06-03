@@ -181,7 +181,7 @@ pub fn hash_state(parent_hash: &str, role: &str, content: &str) -> String {
     parent_hash.hash(&mut hasher);
     role.hash(&mut hasher);
     content.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+    format!("{:016x}", hasher.finish())
 }
 
 // ---------------------------------------------------------------------------
