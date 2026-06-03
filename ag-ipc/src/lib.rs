@@ -83,6 +83,26 @@ pub enum Command {
         session_id: String,
         hash: String,
     },
+
+    /// Persist the active branch to `~/.agentgraph/sessions/`.  Only copies
+    /// the branch (path from current_hash to root), not sibling branches.
+    SessionPersist {
+        session_id: String,
+        agent: String,
+        current_hash: String,
+    },
+
+    /// Reset: drop the active tree, create a fresh tempdir.  The persisted
+    /// archive (if any) is kept on disk.
+    SessionReset {
+        session_id: String,
+    },
+
+    /// Delete: drop the active tree AND remove the persisted archive from
+    /// disk + index.  The entire session is wiped.
+    SessionDeletePersisted {
+        session_id: String,
+    },
 }
 
 /// Response from a SessionChat command.

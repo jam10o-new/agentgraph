@@ -403,6 +403,28 @@ impl Leader {
                 let path = self.sessions.get_path(&session_id, &hash).await;
                 IpcResponse::ok_json(&path)
             }
+            Command::SessionPersist {
+                session_id,
+                agent,
+                current_hash,
+            } => {
+                match self
+                    .sessions
+                    .persist_branch(&session_id, &agent, &current_hash)
+                    .await
+                {
+                    Ok(()) => IpcResponse::ok_str("persisted"),
+                    Err(e) => IpcResponse::err(e),
+                }
+            }
+            Command::SessionReset { session_id } => {
+                self.sessions.reset_tree(&session_id).await;
+                IpcResponse::ok_str("reset")
+            }
+            Command::SessionDeletePersisted { session_id } => {
+                self.sessions.delete_tree(&session_id).await;
+                IpcResponse::ok_str("deleted")
+            }
             _ => IpcResponse::err("unexpected command in session handler"),
         };
         serde_json::to_string(&resp)
@@ -981,7 +1003,10 @@ impl Leader {
                                     | Command::SessionBuild { .. }
                                     | Command::SessionSetupDirs { .. }
                                     | Command::SessionCreateResponseDir { .. }
-                                    | Command::SessionCacheResponse { .. } => {
+                                    | Command::SessionCacheResponse { .. }
+                                    | Command::SessionPersist { .. }
+                                    | Command::SessionReset { .. }
+                                    | Command::SessionDeletePersisted { .. } => {
                                         let resp = leader.handle_session_command(cmd).await;
                                         let _ = stream.write_all(resp.as_bytes()).await;
                                     }

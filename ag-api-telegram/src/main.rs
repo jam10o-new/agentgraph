@@ -370,7 +370,9 @@ async fn handle_command(
             "/branches — Show diverging paths\n",
             "/system — Read system directory\n",
             "/be <text> — Add to system dir\n",
-            "/reset — Reset conversation\n",
+            "/reset — Reset active tree (keeps persisted archive)\n",
+            "/persist — Save active branch to disk (privileged)\n",
+            "/delete — Wipe active tree + persisted archive (privileged)\n",
             "/config — Show agent config\n",
             "/help — This help"
         )
@@ -456,12 +458,88 @@ async fn handle_command(
             chats.remove(&chat_id);
             let _ = ipc_send(
                 &state.socket_path,
-                &Command::SessionDelete {
+                &Command::SessionReset {
                     session_id: format!("tg-{chat_id}"),
                 },
             )
             .await;
-            "Conversation reset. Start fresh!".into()
+            "Conversation reset to fresh state. Persisted history (if any) is still accessible via /branches.".into()
+        }
+        "/persist" => {
+            if !state.is_privileged(user_id) {
+                "Access denied — persist is a privileged command.".into()
+            } else {
+                let agent = state.agent_for(chat_id, chat_type).await;
+                let hist = state
+                    .chats
+                    .lock()
+                    .await
+                    .get(&chat_id)
+                    .map(|c| c.history.clone())
+                    .unwrap_or_default();
+                // First get the current_hash by building the conversation.
+                let build_resp = ipc_send(
+                    &state.socket_path,
+                    &Command::SessionBuild {
+                        session_id: format!("tg-{chat_id}"),
+                        steps: hist,
+                        agent_name: None,
+                    },
+                )
+                .await;
+                match build_resp {
+                    Ok(resp) if resp.ok => {
+                        if let Some(data) = &resp.data {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                                let current_hash = v["current_hash"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string();
+                                if current_hash.is_empty() {
+                                    "Nothing to persist — no conversation yet.".into()
+                                } else {
+                                    match ipc_send(
+                                        &state.socket_path,
+                                        &Command::SessionPersist {
+                                            session_id: format!("tg-{chat_id}"),
+                                            agent,
+                                            current_hash,
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        Ok(r) if r.ok => "Session persisted. Future messages continue from this point; persisted history survives leader restart.".into(),
+                                        Ok(r) => format!("Persist failed: {}", r.error.unwrap_or_else(|| "unknown error".into())),
+                                        Err(e) => format!("IPC error: {e}"),
+                                    }
+                                }
+                            } else {
+                                "Failed to parse session state.".into()
+                            }
+                        } else {
+                            "No session data.".into()
+                        }
+                    }
+                    Ok(_) => "Failed to build conversation state.".into(),
+                    Err(e) => format!("IPC error: {e}"),
+                }
+            }
+        }
+        "/delete" => {
+            if !state.is_privileged(user_id) {
+                "Access denied — delete is a privileged command.".into()
+            } else {
+                let mut chats = state.chats.lock().await;
+                chats.remove(&chat_id);
+                let _ = ipc_send(
+                    &state.socket_path,
+                    &Command::SessionDeletePersisted {
+                        session_id: format!("tg-{chat_id}"),
+                    },
+                )
+                .await;
+                "Session fully deleted. Persisted history removed.".into()
+            }
         }
         "/config" => {
             if !state.is_privileged(user_id) {
