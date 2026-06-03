@@ -4,7 +4,7 @@
 //! agent inference.  All session state lives in the leader process; this
 //! binary is a thin wire-format adapter: JSON-over-IPC in, SSE/JSON out.
 
-use ag_ipc::{Command, IpcResponse, SessionStep};
+use ag_ipc::{Command, IpcResponse, SessionChatResponse, SessionStep};
 use ag_utils::find_leader_socket;
 use axum::{
     Json, Router,
@@ -227,7 +227,18 @@ async fn chat_completions(
         match ipc(&state.socket, &cmd).await {
             Ok(resp) => {
                 if resp.ok {
-                    let content = resp.data.unwrap_or_default();
+                    // Parse the SessionChatResponse from the IPC response
+                    let sc_resp: SessionChatResponse = resp
+                        .data
+                        .as_deref()
+                        .and_then(|d| serde_json::from_str(d).ok())
+                        .unwrap_or_else(|| SessionChatResponse {
+                            ok: true,
+                            content: resp.data.clone(),
+                            stream_path: None,
+                            error: None,
+                        });
+                    let content = sc_resp.content.unwrap_or_default();
 
                     Ok(Json(ChatCompletionResponse {
                         id,

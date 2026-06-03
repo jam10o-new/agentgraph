@@ -4,12 +4,14 @@
 //! Unix socket for session operations, and exposes AgentGraph agents
 //! through a persistent Telegram bot with /commands.
 
-use ag_ipc::{Command, IpcResponse, SessionStep};
+use ag_ipc::{Command, IpcResponse, SessionChatResponse, SessionStep};
 use ag_utils::find_leader_socket;
 use clap::Parser;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
@@ -48,6 +50,16 @@ struct TelegramConfig {
     /// may use privileged commands (insecure default for open deployments).
     #[serde(default)]
     privileged_users: Vec<i64>,
+    /// How often (in milliseconds) to poll the stream file and call
+    /// editMessageText for progressive output.  Higher values reduce
+    /// Telegram API calls but make updates feel less responsive.
+    /// Default: 2000 (2 seconds).  Set to 0 to disable streaming entirely.
+    #[serde(default = "default_stream_poll")]
+    stream_poll_interval_ms: u64,
+}
+
+fn default_stream_poll() -> u64 {
+    2000
 }
 
 fn default_agent() -> String {
@@ -97,7 +109,27 @@ async fn ipc_send(socket: &str, cmd: &Command) -> Result<IpcResponse, String> {
 /// https://core.telegram.org/bots/api#markdownv2-style
 fn escape_markdown_v2(text: &str) -> String {
     let special = |c: char| -> bool {
-        matches!(c, '_' | '*' | '[' | ']' | '(' | ')' | '~' | '`' | '>' | '#' | '+' | '-' | '=' | '|' | '{' | '}' | '.' | '!' | '\\')
+        matches!(
+            c,
+            '_' | '*'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | '~'
+                | '`'
+                | '>'
+                | '#'
+                | '+'
+                | '-'
+                | '='
+                | '|'
+                | '{'
+                | '}'
+                | '.'
+                | '!'
+                | '\\'
+        )
     };
     let mut result = String::with_capacity(text.len() + text.len() / 8);
     for c in text.chars() {
@@ -113,10 +145,10 @@ async fn send_message(client: &reqwest::Client, token: &str, chat_id: i64, text:
     // Four-tier fallback: Markdown → MarkdownV2 → escaped MarkdownV2 → plain text.
     let escaped = escape_markdown_v2(text);
     let candidates: [(&str, Option<&str>); 4] = [
-        (text, Some("Markdown")),       // 0. legacy — forgiving, what the model usually works with
-        (text, Some("MarkdownV2")),     // 1. strict V2
+        (text, Some("Markdown")), // 0. legacy — forgiving, what the model usually works with
+        (text, Some("MarkdownV2")), // 1. strict V2
         (&escaped, Some("MarkdownV2")), // 2. escaped — guaranteed safe
-        (text, None),                    // 3. plain text — last resort
+        (text, None),             // 3. plain text — last resort
     ];
     for (i, (body_text, pmode)) in candidates.iter().enumerate() {
         let mut body = serde_json::json!({
@@ -159,6 +191,147 @@ async fn send_message(client: &reqwest::Client, token: &str, chat_id: i64, text:
     }
 }
 
+/// Send a message and return the message_id for subsequent edits.
+async fn send_initial_message(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> Option<i64> {
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+    });
+    match client
+        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                return v["result"]["message_id"].as_i64();
+            }
+            None
+        }
+        Err(e) => {
+            eprintln!("ag-api-telegram: sendMessage failed (chat {chat_id}): {e}");
+            None
+        }
+    }
+}
+
+/// Edit an existing message (for progressive streaming updates).
+/// Falls back gracefully on parse errors (same tiered strategy as send_message).
+async fn edit_message_text(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) {
+    if text.is_empty() {
+        return; // nothing to edit
+    }
+    let elapsed = std::time::Instant::now();
+    let escaped = escape_markdown_v2(text);
+    let candidates: [(&str, Option<&str>); 4] = [
+        (text, Some("Markdown")),
+        (text, Some("MarkdownV2")),
+        (&escaped, Some("MarkdownV2")),
+        (text, None),
+    ];
+    for (i, (body_text, pmode)) in candidates.iter().enumerate() {
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": body_text,
+        });
+        if let Some(pm) = pmode {
+            body["parse_mode"] = serde_json::Value::String(pm.to_string());
+        }
+        let resp = match client
+            .post(format!("https://api.telegram.org/bot{token}/editMessageText"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "ag-api-telegram: editMessageText transport failed (chat {chat_id}, msg {message_id}): {e}"
+                );
+                return;
+            }
+        };
+        // Telegram always returns HTTP 200 with ok:true/false in the body.
+        // Check the JSON body instead of relying on HTTP status.
+        let body_text = resp.text().await.unwrap_or_default();
+        match serde_json::from_str::<serde_json::Value>(&body_text) {
+            Ok(v) if v["ok"].as_bool().unwrap_or(false) => {
+                if i > 0 {
+                    eprintln!(
+                        "ag-api-telegram: editMessageText delivered via tier {i} (chat {chat_id})"
+                    );
+                }
+                return;
+            }
+            Ok(v) => {
+                let desc = v["description"].as_str().unwrap_or("unknown error");
+                let is_modified = desc.contains("message is not modified");
+                if is_modified {
+                    // Content identical — not an error, just no-op.
+                    return;
+                }
+                let is_parse = desc.contains("can't parse entities");
+                if !is_parse || i == candidates.len() - 1 {
+                    eprintln!(
+                        "ag-api-telegram: editMessageText failed (chat {chat_id}, msg {message_id}, tier {i}): {desc}"
+                    );
+                }
+                if !is_parse {
+                    return;
+                }
+                // Parse error — try next tier.
+            }
+            Err(e) => {
+                eprintln!(
+                    "ag-api-telegram: editMessageText unparseable response (chat {chat_id}): {e} — {body}",
+                    body = &body_text.chars().take(300).collect::<String>()
+                );
+                return;
+            }
+        }
+    }
+    eprintln!(
+        "ag-api-telegram: editMessageText all tiers exhausted (chat {chat_id}, msg {message_id}, {} chars, took {}ms)",
+        text.len(),
+        elapsed.elapsed().as_millis(),
+    );
+}
+
+/// Read the latest content from the stream output file inside `stream_dir`.
+/// Returns None if no stream file has appeared yet.
+async fn read_stream_content(stream_dir: &str) -> Option<String> {
+    let mut dir = tokio::fs::read_dir(stream_dir).await.ok()?;
+    let mut files = Vec::new();
+    loop {
+        match dir.next_entry().await {
+            Ok(Some(entry)) => {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("out-") {
+                    files.push(entry.path());
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    files.sort();
+    let path = files.last()?;
+    tokio::fs::read_to_string(path).await.ok()
+}
+
 async fn send_chat_action(client: &reqwest::Client, token: &str, chat_id: i64, action: &str) {
     let result = client
         .post(format!(
@@ -196,7 +369,7 @@ async fn handle_command(
             "/retry — Regenerate last response\n",
             "/branches — Show diverging paths\n",
             "/system — Read system directory\n",
-            "/system add <text> — Add to system dir\n",
+            "/be <text> — Add to system dir\n",
             "/reset — Reset conversation\n",
             "/config — Show agent config\n",
             "/help — This help"
@@ -210,7 +383,10 @@ async fn handle_command(
                 let len = chat.history.len();
                 if len >= 2 {
                     chat.history.truncate(len - 2);
-                    format!("Rolled back to turn {}. Send a new message to continue.", chat.history.len() / 2)
+                    format!(
+                        "Rolled back to turn {}. Send a new message to continue.",
+                        chat.history.len() / 2
+                    )
                 } else if len == 1 {
                     chat.history.clear();
                     "Rolled back to start. Send a new message.".into()
@@ -238,10 +414,15 @@ async fn handle_command(
             // Query the session tree for branches from root.
             // Future: could use current position hash from a prior SessionBuild.
             let session_id = format!("tg-{chat_id}");
-            match ipc_send(&state.socket_path, &Command::SessionListChildren {
-                session_id,
-                hash: String::new(), // query root branches
-            }).await {
+            match ipc_send(
+                &state.socket_path,
+                &Command::SessionListChildren {
+                    session_id,
+                    hash: String::new(), // query root branches
+                },
+            )
+            .await
+            {
                 Ok(resp) if resp.ok => {
                     if let Some(data) = &resp.data {
                         match serde_json::from_str::<Vec<Vec<String>>>(data) {
@@ -249,7 +430,11 @@ async fn handle_command(
                                 let mut out = String::from("**Branches**\n\n");
                                 for c in &children {
                                     let label = if c.len() >= 2 {
-                                        format!("`{}` {}: …", c[0].chars().take(8).collect::<String>(), c[1])
+                                        format!(
+                                            "`{}` {}: …",
+                                            c[0].chars().take(8).collect::<String>(),
+                                            c[1]
+                                        )
                                     } else {
                                         format!("`{}`", c[0].chars().take(8).collect::<String>())
                                     };
@@ -271,8 +456,11 @@ async fn handle_command(
             chats.remove(&chat_id);
             let _ = ipc_send(
                 &state.socket_path,
-                &Command::SessionDelete { session_id: format!("tg-{chat_id}") },
-            ).await;
+                &Command::SessionDelete {
+                    session_id: format!("tg-{chat_id}"),
+                },
+            )
+            .await;
             "Conversation reset. Start fresh!".into()
         }
         "/config" => {
@@ -280,33 +468,61 @@ async fn handle_command(
                 "Access denied — config is a privileged command.".into()
             } else {
                 let agent = state.agent_for(chat_id, chat_type).await;
-                format!("**Session config**\nChat ID: `{chat_id}`\nType: `{chat_type}`\nAgent: `{agent}`")
+                format!(
+                    "**Session config**\nChat ID: `{chat_id}`\nType: `{chat_type}`\nAgent: `{agent}`"
+                )
             }
         }
         "/system" => {
-            let hist = state.chats.lock().await
+            let agent = state.agent_for(chat_id, chat_type).await;
+            let hist = state
+                .chats
+                .lock()
+                .await
                 .get(&chat_id)
                 .map(|c| c.history.clone())
                 .unwrap_or_default();
-            if let Ok(resp) = ipc_send(&state.socket_path, &Command::SessionBuild {
-                session_id: format!("tg-{chat_id}"),
-                steps: hist,
-            }).await {
+            if let Ok(resp) = ipc_send(
+                &state.socket_path,
+                &Command::SessionBuild {
+                    session_id: format!("tg-{chat_id}"),
+                    steps: hist,
+                    agent_name: Some(agent),
+                },
+            )
+            .await
+            {
                 if resp.ok {
                     if let Some(data) = &resp.data {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                            let sys_msgs = v["system_msgs"]
+                            let sys_msgs: Vec<&str> = v["system_msgs"]
                                 .as_array()
-                                .map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>())
+                                .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
                                 .unwrap_or_default();
-                            if sys_msgs.is_empty() {
-                                "**System dir** — empty (no system messages)".into()
-                            } else {
-                                let mut out = String::from("**System dir**\n\n");
+                            let cfg_msgs: Vec<&str> = v["config_system_msgs"]
+                                .as_array()
+                                .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+                                .unwrap_or_default();
+                            let mut out = String::new();
+                            if !cfg_msgs.is_empty() {
+                                out.push_str("**System prompt (config)**\n\n");
+                                for (i, msg) in cfg_msgs.iter().enumerate() {
+                                    let snippet: String = msg.chars().take(400).collect();
+                                    out.push_str(&format!("`{i}`: {snippet}\n\n"));
+                                }
+                            }
+                            if !sys_msgs.is_empty() {
+                                if !out.is_empty() {
+                                    out.push_str("**Dynamic messages (/be)**\n\n");
+                                }
                                 for (i, msg) in sys_msgs.iter().enumerate() {
                                     let snippet: String = msg.chars().take(200).collect();
                                     out.push_str(&format!("`{i}`: {snippet}\n\n"));
                                 }
+                            }
+                            if out.is_empty() {
+                                "**System dir** — empty (no system messages)".into()
+                            } else {
                                 out
                             }
                         } else {
@@ -322,29 +538,29 @@ async fn handle_command(
                 "Failed to reach leader.".into()
             }
         }
-        _ => {
-            if cmd.starts_with("/system add ") {
-                if !state.is_privileged(user_id) {
-                    "Access denied — system write is a privileged command.".into()
-                } else {
-                    let content = cmd.strip_prefix("/system add ").unwrap_or("");
-                    if content.is_empty() {
-                        "Usage: /system add <text>".into()
-                    } else {
-                        match ipc_send(&state.socket_path, &Command::SessionSetupDirs {
-                            session_id: format!("tg-{chat_id}"),
-                            system_msgs: vec![content.to_string()],
-                        }).await {
-                            Ok(resp) if resp.ok => "System directory updated.".into(),
-                            Ok(resp) => resp.error.unwrap_or_else(|| "error".into()),
-                            Err(e) => format!("IPC error: {e}"),
-                        }
-                    }
-                }
+        "/be" => {
+            if !state.is_privileged(user_id) {
+                "Access denied — system write is a privileged command.".into()
             } else {
-                "Unknown command. Type /help for available commands.".into()
+                let content = cmd.strip_prefix("/be").unwrap_or("");
+                if content.is_empty() {
+                    "Usage: /be <text>\nAdds a system prompt to this chat's history.".into()
+                } else {
+                    let agent = state.agent_for(chat_id, chat_type).await;
+                    let mut chats = state.chats.lock().await;
+                    let chat = chats.entry(chat_id).or_insert_with(|| ChatState {
+                        history: Vec::new(),
+                        agent: agent.clone(),
+                    });
+                    chat.history.push(SessionStep {
+                        role: "system".to_string(),
+                        content: content.to_string(),
+                    });
+                    "System message added.".into()
+                }
             }
         }
+        _ => "Unknown command. Type /help for available commands.".into(),
     };
 
     send_message(client, token, chat_id, &response).await;
@@ -354,7 +570,10 @@ async fn handle_command(
 
 impl BotState {
     async fn show_tree(&self, chat_id: i64) -> String {
-        let hist = self.chats.lock().await
+        let hist = self
+            .chats
+            .lock()
+            .await
             .get(&chat_id)
             .map(|c| c.history.clone())
             .unwrap_or_default();
@@ -372,7 +591,9 @@ impl BotState {
             let snippet: String = step.content.chars().take(80).collect();
             out.push_str(&format!("{i}. {icon} {snippet}\n"));
         }
-        out.push_str(&format!("\nUse /back to roll back, /branches to see forks, /retry to regenerate."));
+        out.push_str(&format!(
+            "\nUse /back to roll back, /branches to see forks, /retry to regenerate."
+        ));
         out
     }
 }
@@ -533,22 +754,125 @@ async fn main() {
 
                 send_chat_action(&client, token, chat_id, "typing").await;
 
+                let poll_ms = state.tg.stream_poll_interval_ms;
+                let use_stream = poll_ms > 0;
+
                 match ipc_send(
                     &cli.socket,
                     &Command::SessionChat {
                         session_id: format!("tg-{chat_id}"),
                         steps: steps.clone(),
                         model: agent,
-                        stream: false,
+                        stream: use_stream,
                     },
                 )
                 .await
                 {
                     Ok(resp) => {
-                        if resp.ok {
-                            let reply = resp.data.unwrap_or_else(|| "_(empty response)_".into());
+                        if !resp.ok {
+                            let err = resp.error.unwrap_or_else(|| "unknown error".into());
+                            send_message(&client, token, chat_id, &format!("Error: {err}")).await;
+                            continue;
+                        }
+                        // Parse the SessionChatResponse from data
+                        let data = match &resp.data {
+                            Some(d) => d,
+                            None => {
+                                send_message(&client, token, chat_id, "_(empty response)_").await;
+                                continue;
+                            }
+                        };
+                        let sc_resp: SessionChatResponse =
+                            match serde_json::from_str(data) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    send_message(
+                                        &client,
+                                        token,
+                                        chat_id,
+                                        &format!("Parse error: {e}"),
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            };
+
+                        if let Some(stream_dir) = &sc_resp.stream_path {
+                            // ── Streaming path ──────────────────────────
+                            let message_id = send_initial_message(
+                                &client, token, chat_id, "⏳",
+                            )
+                            .await
+                            .unwrap_or(0);
+                            if message_id == 0 {
+                                eprintln!("ag-api-telegram: failed to get message_id for streaming (chat {chat_id})");
+                                continue;
+                            }
+                            eprintln!(
+                                "ag-api-telegram: streaming started (chat {chat_id}, msg {message_id}, dir {stream_dir})"
+                            );
+                            let mut last_content = String::new();
+                            let stream_dir = stream_dir.clone();
+                            let mut reads_without_content: u32 = 0;
+                            loop {
+                                tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+
+                                // Check for .done marker
+                                let done_path = PathBuf::from(&stream_dir).join(".done");
+                                let is_done =
+                                    tokio::fs::metadata(&done_path).await.is_ok();
+
+                                // Read latest stream content
+                                match read_stream_content(&stream_dir).await {
+                                    Some(content) => {
+                                        if content != last_content {
+                                            eprintln!(
+                                                "ag-api-telegram: streaming update (chat {chat_id}, {} chars)",
+                                                content.len(),
+                                            );
+                                            edit_message_text(
+                                                &client,
+                                                token,
+                                                chat_id,
+                                                message_id,
+                                                &content,
+                                            )
+                                            .await;
+                                            last_content = content;
+                                        }
+                                        reads_without_content = 0;
+                                    }
+                                    None => {
+                                        reads_without_content += 1;
+                                        if reads_without_content == 1 {
+                                            eprintln!(
+                                                "ag-api-telegram: stream file not yet visible (chat {chat_id})"
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if is_done {
+                                    eprintln!(
+                                        "ag-api-telegram: streaming done (chat {chat_id}, final {} chars)",
+                                        last_content.len(),
+                                    );
+                                    break;
+                                }
+                            }
+                            // Store in history
+                            let mut chats = state.chats.lock().await;
+                            if let Some(chat) = chats.get_mut(&chat_id) {
+                                if !last_content.is_empty() {
+                                    chat.history.push(SessionStep {
+                                        role: "assistant".to_string(),
+                                        content: last_content,
+                                    });
+                                }
+                            }
+                        } else if let Some(reply) = sc_resp.content {
+                            // ── Blocking path ───────────────────────────
                             send_message(&client, token, chat_id, &reply).await;
-                            // Store assistant response in local history
                             let mut chats = state.chats.lock().await;
                             if let Some(chat) = chats.get_mut(&chat_id) {
                                 chat.history.push(SessionStep {
@@ -557,8 +881,7 @@ async fn main() {
                                 });
                             }
                         } else {
-                            let err = resp.error.unwrap_or_else(|| "unknown error".into());
-                            send_message(&client, token, chat_id, &format!("Error: {err}")).await;
+                            send_message(&client, token, chat_id, "_(empty response)_").await;
                         }
                     }
                     Err(e) => {

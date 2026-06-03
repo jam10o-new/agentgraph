@@ -1,6 +1,6 @@
 use crate::agent::Agent;
 use crate::config::{AgentConfig, Config};
-use crate::ipc::{Command, IpcResponse, SessionStep};
+use crate::ipc::{Command, IpcResponse, SessionChatResponse, SessionStep};
 use crate::model_loader::load_models;
 use crate::remote_session::{ConversationStep, RemoteSessionState};
 use crate::utils::{LEADER_PID_FILE, LeaderStatus, is_leader_alive};
@@ -303,7 +303,11 @@ impl Leader {
                 let ids = self.sessions.list_ids().await;
                 IpcResponse::ok_json(&ids)
             }
-            Command::SessionBuild { session_id, steps } => {
+            Command::SessionBuild {
+                session_id,
+                steps,
+                agent_name,
+            } => {
                 let tree = self.sessions.get_or_create_tree(&session_id).await;
                 let conv_steps: Vec<ConversationStep> = steps
                     .into_iter()
@@ -312,10 +316,29 @@ impl Leader {
                         content: s.content,
                     })
                     .collect();
-                match crate::remote_session::build_conversation(&tree, &conv_steps).await {
-                    Ok(state) => IpcResponse::ok_json(&state),
-                    Err(e) => IpcResponse::err(e),
+                let build_result =
+                    crate::remote_session::build_conversation(&tree, &conv_steps).await;
+                let mut state = match build_result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Serialize the error inline since this arm
+                        // evaluates to &str, not IpcResponse.
+                        let resp = IpcResponse::err(e);
+                        return serde_json::to_string(&resp)
+                            .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize"}"#.to_string());
+                    }
+                };
+                // If caller asked for config-level system content, read it.
+                if let Some(agent_name) = agent_name {
+                    let config = self.config.lock().await;
+                    if let Some(agent) = config.agents.get(&agent_name) {
+                        if !agent.system.is_empty() {
+                            state.config_system_msgs =
+                                crate::remote_session::read_system_dirs(&agent.system).await;
+                        }
+                    }
                 }
+                IpcResponse::ok_json(&state)
             }
             Command::SessionSetupDirs {
                 session_id,
@@ -364,15 +387,14 @@ impl Leader {
                 session_id,
                 steps,
                 model,
-                ..
-            } => match self.run_session_chat(&session_id, &steps, &model).await {
-                Ok(content) => IpcResponse {
-                    ok: true,
-                    data: Some(content),
-                    error: None,
-                },
-                Err(e) => IpcResponse::err(e.to_string()),
-            },
+                stream,
+            } => {
+                let resp = self.run_session_chat(&session_id, &steps, &model, stream).await;
+                match resp {
+                    Ok(sc) => IpcResponse::ok_json(&sc),
+                    Err(e) => IpcResponse::err(e.to_string()),
+                }
+            }
             Command::SessionListChildren { session_id, hash } => {
                 let children = self.sessions.list_children(&session_id, &hash).await;
                 IpcResponse::ok_json(&children)
@@ -388,13 +410,22 @@ impl Leader {
     }
 
     /// Run a full chat turn: build conversation state, spawn an ephemeral agent,
-    /// collect output. Returns the assistant's response text.
+    /// collect output.
+    ///
+    /// When `stream` is true and the agent has `stream_output` configured, the
+    /// method returns immediately with a `stream_path` — the caller should poll
+    /// that directory for token-by-token output.  A `.done` marker file is written
+    /// to the stream directory when inference completes (or fails).
+    ///
+    /// When streaming is not requested or the agent doesn't support it, the method
+    /// blocks until inference completes and returns the full response in `content`.
     async fn run_session_chat(
         &self,
         session_id: &str,
         steps: &[SessionStep],
         model: &str,
-    ) -> Result<String> {
+        stream: bool,
+    ) -> Result<SessionChatResponse> {
         let config = self.config.lock().await;
         let base_agent = config
             .agents
@@ -403,6 +434,8 @@ impl Leader {
             .clone();
         let global_config = config.clone();
         drop(config);
+
+        let use_stream = stream && base_agent.stream_output.is_some();
 
         let tree = self.sessions.get_or_create_tree(session_id).await;
 
@@ -418,7 +451,7 @@ impl Leader {
             .await
             .map_err(|e| anyhow!("build_conversation: {}", e))?;
 
-        let (_stream_dir, _tools_dir, system_dir) =
+        let (stream_dir, _tools_dir, system_dir) =
             crate::remote_session::setup_request_dirs(&tree, &state.system_msgs)
                 .await
                 .map_err(|e| anyhow!("setup_request_dirs: {}", e))?;
@@ -440,6 +473,9 @@ impl Leader {
             s.extend(base_agent.system.iter().cloned());
             s
         };
+        if use_stream {
+            isolated_config.stream_output = Some(stream_dir.to_string_lossy().to_string());
+        }
 
         let model_arc = self
             .model
@@ -498,18 +534,75 @@ impl Leader {
             .await
             .map_err(|e| anyhow!("write trigger: {}", e))?;
 
-        let output_path = response_dir.to_string_lossy().to_string();
-        let content = wait_for_output(Some(output_path.clone()), SystemTime::now())
-            .await
-            .map_err(|e| anyhow!("wait_for_output: {}", e))?;
+        if use_stream {
+            // ── Streaming path ───────────────────────────────────────────
+            // Spawn a background task that waits for completion, caches the
+            // response, and writes a .done marker so the caller knows when
+            // to stop polling the stream directory.
+            let bg_tree = tree.clone();
+            let bg_response_dir = response_dir.to_string_lossy().to_string();
+            let bg_stream_dir = stream_dir.to_string_lossy().to_string();
+            let bg_hash = state.current_hash.clone();
 
-        handle.abort();
+            tokio::spawn(async move {
+                let after = SystemTime::now();
+                match wait_for_output(Some(bg_response_dir.clone()), after).await {
+                    Ok(text) => {
+                        crate::remote_session::cache_response(
+                            &bg_tree,
+                            &bg_hash,
+                            &text,
+                            PathBuf::from(&bg_response_dir),
+                        )
+                        .await;
+                        let _ = tokio::fs::write(
+                            PathBuf::from(&bg_stream_dir).join(".done"),
+                            &text,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        eprintln!("Session streaming error: {:?}", e);
+                        let _ = tokio::fs::write(
+                            PathBuf::from(&bg_stream_dir).join(".done"),
+                            format!("error: {}", e),
+                        )
+                        .await;
+                    }
+                }
+            });
 
-        // Cache response
-        crate::remote_session::cache_response(&tree, &state.current_hash, &content, response_dir)
+            Ok(SessionChatResponse {
+                ok: true,
+                content: None,
+                stream_path: Some(stream_dir.to_string_lossy().to_string()),
+                error: None,
+            })
+        } else {
+            // ── Blocking path ───────────────────────────────────────────
+            let output_path = response_dir.to_string_lossy().to_string();
+            let content = wait_for_output(Some(output_path.clone()), SystemTime::now())
+                .await
+                .map_err(|e| anyhow!("wait_for_output: {}", e))?;
+
+            handle.abort();
+
+            // Cache response
+            crate::remote_session::cache_response(
+                &tree,
+                &state.current_hash,
+                &content,
+                response_dir,
+            )
             .await;
 
-        Ok(content)
+            Ok(SessionChatResponse {
+                ok: true,
+                content: Some(content),
+                stream_path: None,
+                error: None,
+            })
+        }
     }
 }
 

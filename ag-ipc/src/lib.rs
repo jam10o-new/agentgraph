@@ -32,9 +32,13 @@ pub enum Command {
     SessionList,
 
     /// Walk conversation steps through a tree, creating nodes.
+    /// If `agent_name` is provided, the leader also reads the agent's
+    /// config-level system directories and returns their content in
+    /// `config_system_msgs`.
     SessionBuild {
         session_id: String,
         steps: Vec<SessionStep>,
+        agent_name: Option<String>,
     },
 
     /// Create per-request stream/tools/system dirs and populate system messages.

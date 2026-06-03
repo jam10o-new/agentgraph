@@ -490,8 +490,8 @@ async fn run_inference(
                 role: HistoryTurnRole::Skill(n, d),
                 content: body,
                 turn_index: 0,
-                excluded_from_compression: false,
-                file_key: String::new(),
+                excluded_from_compression: true,
+                file_key: "_system_".into(),
                 file_path: String::new(),
                 content_hash: String::new(),
             });
@@ -500,8 +500,8 @@ async fn run_inference(
                 role: HistoryTurnRole::System,
                 content: system_content,
                 turn_index: 0,
-                excluded_from_compression: false,
-                file_key: String::new(),
+                excluded_from_compression: true,
+                file_key: "_system_".into(),
                 file_path: String::new(),
                 content_hash: String::new(),
             });
@@ -819,6 +819,8 @@ async fn run_inference(
     let oom_aggressive_limit = config.context_checkpoint_limit.map(|l| (l / 2).max(1));
 
     let mut final_output = String::new();
+    let mut tools_executed = false;
+    let mut nudged = false; // prevent more than one empty-output nudge
     loop {
         // If the previous turn failed with OOM, recompress the original
         // uncompressed history with tighter limits before rebuilding the
@@ -960,6 +962,20 @@ async fn run_inference(
                             }
                             if let Some(ref tcs) = choice.delta.tool_calls {
                                 current_tool_calls.extend(tcs.clone());
+                                // When tool calls are unconsumed, write them
+                                // to the stream file so the caller can see
+                                // what the model is doing in real time.
+                                if !config.consume_tool_calls {
+                                    if let Some(ref mut f) = stream_file {
+                                        for tc in tcs {
+                                            if let Ok(json) = serde_json::to_string(tc) {
+                                                let _ = f.write_all(json.as_bytes()).await;
+                                                let _ = f.write_all(b"\n").await;
+                                            }
+                                        }
+                                        let _ = f.flush().await;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1054,27 +1070,21 @@ async fn run_inference(
             break;
         }
 
-        // Only write the output file when we have a complete, non-empty
-        // response. On error we cleaned up and returned above, so by the
-        // time we reach this point the response is good.
-        //
-        // When consume_tool_calls is false, tool call JSON is appended
-        // so downstream agents (e.g. distillation harness) can see the
-        // raw structured output. Tool call deltas are deduplicated by ID
-        // (the last occurrence per ID carries the completed state).
+        // Prepare output content.  When consume_tool_calls is false, tool
+        // call JSON is appended so downstream agents (e.g. distillation
+        // harness) can see the raw structured output.  Tool call deltas
+        // are deduplicated by ID (the last occurrence per ID carries the
+        // completed state).
         let mut output_content = accumulated_content.clone();
-        // Skip tool-call appending when using a schema — constrained
-        // output is expected to be the complete, valid response.
         if !config.consume_tool_calls && !current_tool_calls.is_empty() && output_schema.is_none() {
             let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut deduped: Vec<&ToolCallResponse> = Vec::new();
-            // Iterate in reverse so the first-seen (last-occurrence) wins
             for tc in current_tool_calls.iter().rev() {
                 if seen_ids.insert(tc.id.clone()) {
                     deduped.push(tc);
                 }
             }
-            deduped.reverse(); // restore original order
+            deduped.reverse();
             if !output_content.is_empty() {
                 output_content.push_str("\n\n");
             }
@@ -1085,10 +1095,29 @@ async fn run_inference(
                 }
             }
         }
-        if !output_content.is_empty() {
+
+        final_output = output_content.clone();
+
+        if current_tool_calls.is_empty() {
+            // If the model went silent after executing tools, inject a
+            // nudge and retry once instead of writing empty output.
+            if output_content.is_empty() && tools_executed && !nudged {
+                nudged = true;
+                logger
+                    .log("Empty output after tool execution; nudging model to respond")
+                    .await;
+                request = request.add_message(
+                    TextMessageRole::System,
+                    "Tool execution complete. Provide your response based on the tool results.",
+                );
+                continue;
+            }
+            // Turn is complete — write the output file so that downstream
+            // watchers (wait_for_output, the streaming background task)
+            // can detect completion.
             if let Some(ref output_path) = output_file_path {
                 logger
-                    .log(&format!("Turn complete, writing to: {:?}", output_path))
+                    .log(&format!("Turn complete, writing {} chars to: {:?}", output_content.len(), output_path))
                     .await;
                 if let Err(e) = fs::write(output_path, &output_content).await {
                     logger
@@ -1096,15 +1125,6 @@ async fn run_inference(
                         .await;
                 }
             }
-        } else if output_file_path.is_some() {
-            logger
-                .log("Inference produced empty output; no output file written")
-                .await;
-        }
-
-        final_output = output_content.clone();
-
-        if current_tool_calls.is_empty() {
             break;
         }
 
@@ -1115,7 +1135,7 @@ async fn run_inference(
             ))
             .await;
         request = request.add_message_with_tool_call(
-            TextMessageRole::Tool,
+            TextMessageRole::Assistant,
             &accumulated_content,
             current_tool_calls.clone(),
         );
@@ -1175,6 +1195,7 @@ async fn run_inference(
 
             request = request.add_tool_message(result, tc.id.clone());
         }
+        tools_executed = true;
     }
 
     logger.log("Inference turn complete").await;

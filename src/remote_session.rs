@@ -56,8 +56,11 @@ pub struct ConversationState {
     pub assistant_dirs: Vec<String>,
     /// Content of the most recent (last) user message.
     pub latest_user_msg: String,
-    /// System messages collected from the input.
+    /// System messages collected from conversation steps (role=="system").
     pub system_msgs: Vec<String>,
+    /// System messages read from the agent's config-level system directories.
+    /// Populated when the leader has an agent_name to look up.
+    pub config_system_msgs: Vec<String>,
     /// Hash of the last message (current position in the tree).
     pub current_hash: String,
 }
@@ -275,6 +278,7 @@ pub async fn build_conversation(
         assistant_dirs,
         latest_user_msg,
         system_msgs,
+        config_system_msgs: Vec::new(),
         current_hash,
     })
 }
@@ -316,6 +320,35 @@ pub async fn setup_request_dirs(
     }
 
     Ok((api_stream, api_tools, api_system))
+}
+
+/// Read all visible (non-hidden) files from a list of system directories and
+/// return their concatenated content.  This mirrors the logic in `agent.rs`
+/// that loads system prompts during inference.
+pub async fn read_system_dirs(dirs: &[String]) -> Vec<String> {
+    let mut messages = Vec::new();
+    for sys_dir in dirs {
+        if let Ok(mut entries) = fs::read_dir(sys_dir).await {
+            let mut files = Vec::new();
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name_str = entry.file_name().to_string_lossy().to_string();
+                // Skip hidden files (same convention as agent.rs).
+                if name_str.starts_with('.') {
+                    continue;
+                }
+                if entry.path().is_file() {
+                    files.push(entry.path());
+                }
+            }
+            files.sort();
+            for f in files {
+                if let Ok(content) = fs::read_to_string(&f).await {
+                    messages.push(content);
+                }
+            }
+        }
+    }
+    messages
 }
 
 /// Create a fresh response directory in the tree for this request.
