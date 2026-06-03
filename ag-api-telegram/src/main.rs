@@ -93,26 +93,68 @@ async fn ipc_send(socket: &str, cmd: &Command) -> Result<IpcResponse, String> {
 
 // ── Telegram API helpers ────────────────────────────────────────────────────
 
+/// Escape Telegram MarkdownV2 special characters with a backslash.
+/// https://core.telegram.org/bots/api#markdownv2-style
+fn escape_markdown_v2(text: &str) -> String {
+    let special = |c: char| -> bool {
+        matches!(c, '_' | '*' | '[' | ']' | '(' | ')' | '~' | '`' | '>' | '#' | '+' | '-' | '=' | '|' | '{' | '}' | '.' | '!' | '\\')
+    };
+    let mut result = String::with_capacity(text.len() + text.len() / 8);
+    for c in text.chars() {
+        if special(c) {
+            result.push('\\');
+        }
+        result.push(c);
+    }
+    result
+}
+
 async fn send_message(client: &reqwest::Client, token: &str, chat_id: i64, text: &str) {
-    let result = client
-        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
-        .json(&serde_json::json!({
+    // Four-tier fallback: Markdown → MarkdownV2 → escaped MarkdownV2 → plain text.
+    let escaped = escape_markdown_v2(text);
+    let candidates: [(&str, Option<&str>); 4] = [
+        (text, Some("Markdown")),       // 0. legacy — forgiving, what the model usually works with
+        (text, Some("MarkdownV2")),     // 1. strict V2
+        (&escaped, Some("MarkdownV2")), // 2. escaped — guaranteed safe
+        (text, None),                    // 3. plain text — last resort
+    ];
+    for (i, (body_text, pmode)) in candidates.iter().enumerate() {
+        let mut body = serde_json::json!({
             "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown",
-        }))
-        .send()
-        .await;
-    if let Err(e) = result {
-        eprintln!("ag-api-telegram: sendMessage failed (chat {chat_id}): {e}");
-    } else if let Ok(resp) = result {
+            "text": body_text,
+        });
+        if let Some(pm) = pmode {
+            body["parse_mode"] = serde_json::Value::String(pm.to_string());
+        }
+        let resp = match client
+            .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("ag-api-telegram: sendMessage failed (chat {chat_id}): {e}");
+                return;
+            }
+        };
+        if resp.status().is_success() {
+            if i > 0 {
+                eprintln!("ag-api-telegram: sendMessage delivered via tier {i} (chat {chat_id})");
+            }
+            return;
+        }
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+        let err_body = resp.text().await.unwrap_or_default();
+        let is_parse_fail = err_body.contains("can't parse entities");
+        if !is_parse_fail || i == candidates.len() - 1 {
             eprintln!(
                 "ag-api-telegram: sendMessage HTTP {status} (chat {chat_id}): {body}",
-                body = body.chars().take(500).collect::<String>()
+                body = err_body.chars().take(500).collect::<String>()
             );
+        }
+        if !is_parse_fail {
+            return; // non-parse error, don't retry
         }
     }
 }
