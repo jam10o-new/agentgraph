@@ -119,6 +119,11 @@ pub struct SessionChatResponse {
 pub struct SessionStep {
     pub role: String,
     pub content: String,
+    /// Local file paths to multimedia files (images, video, audio) that
+    /// accompany this message.  The leader copies them to the agent's
+    /// input directories before triggering inference.
+    #[serde(default)]
+    pub media: Vec<String>,
 }
 
 /// Structured response returned by session commands over IPC.

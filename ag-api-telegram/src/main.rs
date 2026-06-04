@@ -332,6 +332,119 @@ async fn read_stream_content(stream_dir: &str) -> Option<String> {
     tokio::fs::read_to_string(path).await.ok()
 }
 
+/// Extract media from a Telegram message JSON, returning (file_id, kind, mime_or_ext).
+/// kind is one of: "photo", "video", "voice", "audio", "document", "animation"
+fn extract_media(msg: &serde_json::Value) -> Vec<(String, String, String)> {
+    let mut media = Vec::new();
+    // photo — array ofPhotoSize, last is largest
+    if let Some(photos) = msg["photo"].as_array() {
+        if let Some(largest) = photos.last() {
+            if let Some(fid) = largest["file_id"].as_str() {
+                media.push((fid.to_string(), "photo".into(), "jpg".into()));
+            }
+        }
+    }
+    // video
+    if let Some(fid) = msg["video"]["file_id"].as_str() {
+        let ext = msg["video"]["mime_type"].as_str()
+            .and_then(|m| ext_from_mime(m))
+            .unwrap_or("mp4");
+        media.push((fid.to_string(), "video".into(), ext.into()));
+    }
+    // voice / audio (voice is OGG, audio can be any)
+    if let Some(fid) = msg["voice"]["file_id"].as_str() {
+        media.push((fid.to_string(), "voice".into(), "ogg".into()));
+    }
+    if let Some(fid) = msg["audio"]["file_id"].as_str() {
+        let ext = msg["audio"]["mime_type"].as_str()
+            .and_then(|m| ext_from_mime(m))
+            .unwrap_or("mp3");
+        media.push((fid.to_string(), "audio".into(), ext.into()));
+    }
+    // document (any file)
+    if let Some(fid) = msg["document"]["file_id"].as_str() {
+        let ext = msg["document"]["file_name"].as_str()
+            .and_then(|n| std::path::Path::new(n).extension()?.to_str())
+            .or_else(|| msg["document"]["mime_type"].as_str().and_then(|m| ext_from_mime(m)))
+            .unwrap_or("bin");
+        media.push((fid.to_string(), "document".into(), ext.into()));
+    }
+    // animation (GIF)
+    if let Some(fid) = msg["animation"]["file_id"].as_str() {
+        media.push((fid.to_string(), "animation".into(), "mp4".into()));
+    }
+    // sticker
+    if let Some(fid) = msg["sticker"]["file_id"].as_str() {
+        let ext = if msg["sticker"]["is_animated"].as_bool().unwrap_or(false) || msg["sticker"]["is_video"].as_bool().unwrap_or(false) {
+            "webm"
+        } else {
+            "webp"
+        };
+        media.push((fid.to_string(), "sticker".into(), ext.into()));
+    }
+    media
+}
+
+fn ext_from_mime(mime: &str) -> Option<&str> {
+    match mime {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        "video/quicktime" => Some("mov"),
+        "video/x-msvideo" => Some("avi"),
+        "audio/wav" | "audio/wave" | "audio/x-wav" => Some("wav"),
+        "audio/mpeg" | "audio/mp3" => Some("mp3"),
+        "audio/ogg" => Some("ogg"),
+        "audio/opus" => Some("opus"),
+        "audio/x-flac" | "audio/flac" => Some("flac"),
+        "audio/aac" | "audio/x-aac" => Some("aac"),
+        "audio/mp4" | "audio/m4a" => Some("m4a"),
+        _ => None,
+    }
+}
+
+/// Download a Telegram file by file_id. Returns a temp file path with the given extension.
+async fn download_telegram_media(
+    client: &reqwest::Client,
+    token: &str,
+    file_id: &str,
+    ext: &str,
+) -> Option<PathBuf> {
+    // Step 1: getFile
+    let gfr: serde_json::Value = client
+        .get(format!("https://api.telegram.org/bot{token}/getFile"))
+        .query(&[("file_id", file_id)])
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let file_path = gfr["result"]["file_path"].as_str()?;
+    // Step 2: download
+    let bytes = client
+        .get(format!("https://api.telegram.org/file/bot{token}/{file_path}"))
+        .send()
+        .await
+        .ok()?
+        .bytes()
+        .await
+        .ok()?;
+    // Step 3: save to temp
+    let tmp = tempfile::Builder::new()
+        .suffix(&format!(".{}", ext))
+        .tempfile()
+        .ok()?;
+    let (mut file, path) = tmp.keep().ok()?;
+    use std::io::Write;
+    file.write_all(&bytes).ok()?;
+    file.flush().ok()?;
+    Some(path)
+}
+
 async fn send_chat_action(client: &reqwest::Client, token: &str, chat_id: i64, action: &str) {
     let result = client
         .post(format!(
@@ -586,6 +699,7 @@ async fn handle_command(
                     chat.history.push(SessionStep {
                         role: "system".to_string(),
                         content: content.to_string(),
+                        media: Vec::new(),
                     });
                     "System message added.".into()
                 }
@@ -749,8 +863,38 @@ async fn main() {
 
                 let chat_id = msg["chat"]["id"].as_i64().unwrap_or(0);
                 let chat_type = msg["chat"]["type"].as_str().unwrap_or("private");
-                let text = msg["text"].as_str().unwrap_or("");
+                let text = msg["text"].as_str().or_else(|| msg["caption"].as_str()).unwrap_or("");
                 let user_id = msg["from"]["id"].as_i64().unwrap_or(0);
+
+                // Download any media attached to this message
+                let media_items = extract_media(msg);
+                let mut media_paths: Vec<String> = Vec::new();
+                for (file_id, _kind, ext) in &media_items {
+                    if let Some(path) =
+                        download_telegram_media(&client, token, file_id, ext).await
+                    {
+                        media_paths.push(path.to_string_lossy().to_string());
+                    }
+                }
+
+                // If we have media but no text, synthesize a fallback caption
+                let effective_text = if text.is_empty() && !media_paths.is_empty() {
+                    format!(
+                        "[{} media file{} attached: {}]",
+                        media_paths.len(),
+                        if media_paths.len() == 1 { "" } else { "s" },
+                        media_paths
+                            .iter()
+                            .map(|p| {
+                                let p = std::path::Path::new(p);
+                                p.file_name().unwrap_or_default().to_string_lossy()
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                } else {
+                    text.to_string()
+                };
 
                 // Access control
                 if !state.tg.allowed_users.is_empty() && !state.tg.allowed_users.contains(&user_id)
@@ -778,7 +922,11 @@ async fn main() {
                     chat.agent = agent.clone();
                     chat.history.push(SessionStep {
                         role: "user".to_string(),
-                        content: text.to_string(),
+                        content: effective_text.clone(),
+                        media: media_paths
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect(),
                     });
                     chat.history.clone()
                 };
@@ -898,6 +1046,7 @@ async fn main() {
                                     chat.history.push(SessionStep {
                                         role: "assistant".to_string(),
                                         content: last_content,
+                                        media: Vec::new(),
                                     });
                                 }
                             }
@@ -909,6 +1058,7 @@ async fn main() {
                                 chat.history.push(SessionStep {
                                     role: "assistant".to_string(),
                                     content: reply,
+                                    media: Vec::new(),
                                 });
                             }
                         } else {

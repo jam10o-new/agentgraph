@@ -18,3 +18,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ag-config = { path = "../ag-config" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "query"] }
+tempfile = "3"

@@ -578,6 +578,20 @@ impl Leader {
             isolated_config.stream_output = Some(stream_dir.to_string_lossy().to_string());
         }
 
+        // Copy any media files from SessionSteps into the agent's input dirs.
+        let last_input = state.user_dirs.last().map(PathBuf::from).unwrap_or_else(|| response_dir.clone());
+        for step in steps.iter().filter(|s| !s.media.is_empty()) {
+            for media_path in &step.media {
+                let src = std::path::Path::new(media_path);
+                if let Some(fname) = src.file_name() {
+                    let dest = last_input.join(fname);
+                    if let Err(e) = tokio::fs::copy(src, &dest).await {
+                        eprintln!("Warning: failed to copy media {}: {}", media_path, e);
+                    }
+                }
+            }
+        }
+
         let model_arc = self
             .model
             .as_ref()

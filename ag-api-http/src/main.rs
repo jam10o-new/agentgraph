@@ -210,6 +210,7 @@ async fn chat_completions(
         .map(|m| SessionStep {
             role: m.role.clone(),
             content: m.content.clone(),
+            media: Vec::new(),
         })
         .collect();
 
