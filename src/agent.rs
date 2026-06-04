@@ -10,8 +10,8 @@ use crate::utils::AgentLogger;
 use crate::utils::find_leader_socket;
 use anyhow::{Context, Result, anyhow};
 use mistralrs::{
-    Constraint, Function, Model, MultimodalMessages, RequestBuilder, Response, SamplingParams,
-    TextMessageRole, Tool, ToolCallResponse, ToolChoice, ToolType,
+    AudioInput, Constraint, Function, Model, MultimodalMessages, RequestBuilder, Response,
+    SamplingParams, TextMessageRole, Tool, ToolCallResponse, ToolChoice, ToolType, VideoInput,
 };
 use notify::{Event, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
@@ -713,7 +713,8 @@ async fn run_inference(
     }
 
     let mut images = Vec::new();
-    let mut audio_files = Vec::new();
+    let mut audios: Vec<AudioInput> = Vec::new();
+    let mut videos: Vec<VideoInput> = Vec::new();
     for input_dir in &config.inputs {
         if let Ok(mut entries) = fs::read_dir(input_dir).await {
             while let Some(entry) = entries.next_entry().await? {
@@ -725,8 +726,56 @@ async fn run_inference(
                                 images.push(img);
                             }
                         }
-                        "wav" | "mp3" | "ogg" => {
-                            audio_files.push(p);
+                        "mp4" | "avi" | "mov" | "mkv" | "webm" | "m4v" | "gif" => {
+                            logger
+                                .log(&format!(
+                                    "Decoding video {} via ffmpeg",
+                                    p.display()
+                                ))
+                                .await;
+                            match decode_video(&p).await {
+                                Ok(video) => videos.push(video),
+                                Err(e) => logger
+                                    .log(&format!(
+                                        "Failed to decode video {}: {:?}",
+                                        p.display(),
+                                        e
+                                    ))
+                                    .await,
+                            }
+                        }
+                        "wav" => {
+                            match AudioInput::read_wav(&p.to_string_lossy()) {
+                                Ok(audio) => audios.push(audio),
+                                Err(e) => logger
+                                    .log(&format!(
+                                        "Failed to decode WAV {}: {:?}",
+                                        p.display(),
+                                        e
+                                    ))
+                                    .await,
+                            }
+                        }
+                        "mp3" | "ogg" | "flac" | "m4a" | "aac" | "opus" => {
+                            match std::fs::read(&p) {
+                                Ok(bytes) => match AudioInput::from_bytes(&bytes) {
+                                    Ok(audio) => audios.push(audio),
+                                    Err(e) => logger
+                                        .log(&format!(
+                                            "Failed to decode audio {}: {:?}",
+                                            p.display(),
+                                            e
+                                        ))
+                                        .await,
+                                },
+                                Err(e) => logger
+                                    .log(&format!(
+                                        "Failed to read audio file {}: {:?}",
+                                        p.display(),
+                                        e
+                                    ))
+                                    .await,
+                            }
                         }
                         _ => {}
                     }
@@ -736,7 +785,9 @@ async fn run_inference(
     }
 
     let effective_user_text =
-        if latest_user_input.is_empty() && (!images.is_empty() || !audio_files.is_empty()) {
+        if latest_user_input.is_empty()
+            && (!images.is_empty() || !audios.is_empty() || !videos.is_empty())
+        {
             fallback_text
         } else {
             latest_user_input
@@ -744,14 +795,28 @@ async fn run_inference(
     // Save for potential OOM recovery recompression
     let oom_latest_input = effective_user_text.clone();
 
-    if !images.is_empty() {
-        logger
-            .log(&format!("Adding {} images to request", images.len()))
-            .await;
-        multimodal = multimodal.add_image_message(
+    if !images.is_empty() || !audios.is_empty() || !videos.is_empty() {
+        if !images.is_empty() {
+            logger
+                .log(&format!("Adding {} images to request", images.len()))
+                .await;
+        }
+        if !audios.is_empty() {
+            logger
+                .log(&format!("Adding {} audio inputs to request", audios.len()))
+                .await;
+        }
+        if !videos.is_empty() {
+            logger
+                .log(&format!("Adding {} video inputs to request", videos.len()))
+                .await;
+        }
+        multimodal = multimodal.add_multimodal_message(
             TextMessageRole::User,
             &effective_user_text,
             images.clone(),
+            audios.clone(),
+            videos.clone(),
         );
     } else {
         multimodal = multimodal.add_message(TextMessageRole::User, &effective_user_text);
@@ -858,11 +923,13 @@ async fn run_inference(
             for (role, content) in &volatile_drained {
                 new_multimodal = new_multimodal.add_message(role.clone(), content.as_str());
             }
-            if !images.is_empty() {
-                new_multimodal = new_multimodal.add_image_message(
+            if !images.is_empty() || !audios.is_empty() || !videos.is_empty() {
+                new_multimodal = new_multimodal.add_multimodal_message(
                     TextMessageRole::User,
                     &effective_user_text,
                     images.clone(),
+                    audios.clone(),
+                    videos.clone(),
                 );
             } else {
                 new_multimodal =
@@ -1412,4 +1479,101 @@ async fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Decode a video file into a `VideoInput` by shelling out to FFmpeg.
+/// Extracts 32 uniformly sampled frames.
+async fn decode_video(path: &Path) -> Result<VideoInput> {
+    // Probe FPS and total frames with ffprobe
+    let probe = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate,nb_frames",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .ok();
+
+    let fps: f64 = probe
+        .as_ref()
+        .and_then(|o| String::from_utf8(o.stdout.clone()).ok())
+        .and_then(|s| {
+            s.lines()
+                .next()
+                .and_then(|l| {
+                    let mut parts = l.split('/');
+                    let num: f64 = parts.next()?.parse().ok()?;
+                    let den: f64 = parts.next()?.parse().ok()?;
+                    if den == 0.0 { None } else { Some(num / den) }
+                })
+        })
+        .unwrap_or(24.0);
+
+    let total_frames: usize = probe
+        .as_ref()
+        .and_then(|o| String::from_utf8(o.stdout.clone()).ok())
+        .and_then(|s| s.lines().nth(1)?.parse().ok())
+        .unwrap_or(0);
+
+    let num_frames = 32usize;
+    let sampled_indices: Vec<usize> = sample_frame_indices(total_frames, num_frames);
+
+    // Extract frames as PNG with ffmpeg
+    let tmpdir = tempfile::tempdir()?;
+    let tmp_path = tmpdir.path().join("frame_%04d.png");
+    let select_expr = sampled_indices
+        .iter()
+        .map(|i| format!("eq(n,{})", i))
+        .collect::<Vec<_>>()
+        .join("+");
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-vf", &format!("select='{}'", select_expr), "-vsync", "vfr"])
+        .arg(tmp_path.to_str().unwrap())
+        .output()
+        .await
+        .context("ffmpeg frame extraction failed")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "ffmpeg failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    // Read extracted frames
+    let mut frames: Vec<image::DynamicImage> = Vec::new();
+    for i in 1..=(num_frames as u32) {
+        let frame_path = tmpdir.path().join(format!("frame_{:04}.png", i));
+        match image::open(&frame_path) {
+            Ok(img) => frames.push(img),
+            Err(_) => break,
+        }
+    }
+    if frames.is_empty() {
+        return Err(anyhow!("No frames extracted from video"));
+    }
+
+    Ok(VideoInput::from_frames(frames, fps, Some(sampled_indices)))
+}
+
+/// Uniformly sample `n` frame indices from `total` frames.
+/// Mimics torch.arange(0, total, total/n).int()
+fn sample_frame_indices(total: usize, n: usize) -> Vec<usize> {
+    if total == 0 || n == 0 {
+        return Vec::new();
+    }
+    let step = total as f64 / n as f64;
+    (0..n)
+        .map(|i| ((i as f64) * step) as usize)
+        .take(total)
+        .collect()
 }
