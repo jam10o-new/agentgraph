@@ -458,6 +458,36 @@ async fn send_chat_action(client: &reqwest::Client, token: &str, chat_id: i64, a
     }
 }
 
+async fn write_access_request(user_id: i64, chat_id: i64, chat_type: &str, agent: &str, message: &str) {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let dir = home
+        .join(".agentgraph")
+        .join("requests");
+    let _ = tokio::fs::create_dir_all(&dir).await;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = dir.join(format!("{ts}-{user_id}.json"));
+    let payload = serde_json::json!({
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "chat_type": chat_type,
+        "agent": agent,
+        "message": message,
+        "timestamp_ms": ts,
+    });
+    if let Ok(json) = serde_json::to_string_pretty(&payload) {
+        let _ = tokio::fs::write(&path, &json).await;
+        eprintln!(
+            "ag-api-telegram: wrote access request for user {user_id} to {}",
+            path.display()
+        );
+    }
+}
+
 // ── Command handlers ───────────────────────────────────────────────────────
 
 async fn handle_command(
@@ -469,8 +499,9 @@ async fn handle_command(
     cmd: &str,
 ) {
     let token = &state.tg.bot_token;
+    let first_word = cmd.split_whitespace().next().unwrap_or("");
 
-    let response = match cmd.split_whitespace().next().unwrap_or("") {
+    let response = match first_word {
         "/start" => format!(
             "🤖 AgentGraph bot ready.\nAgent: `{}`\nType /help for commands.",
             state.agent_for(chat_id, chat_type).await
@@ -581,9 +612,8 @@ async fn handle_command(
             "Conversation reset to fresh state. Persisted history (if any) is still accessible via /branches.".into()
         }
         "/persist" => {
-            if !state.is_privileged(user_id) {
-                "Access denied — persist is a privileged command.".into()
-            } else {
+            let request_msg = cmd.strip_prefix("/persist").unwrap_or("").trim();
+            if state.is_privileged(user_id) {
                 let agent = state.agent_for(chat_id, chat_type).await;
                 let hist = state
                     .chats
@@ -592,7 +622,6 @@ async fn handle_command(
                     .get(&chat_id)
                     .map(|c| c.history.clone())
                     .unwrap_or_default();
-                // First get the current_hash by building the conversation.
                 let build_resp = ipc_send(
                     &state.socket_path,
                     &Command::SessionBuild {
@@ -638,6 +667,13 @@ async fn handle_command(
                     Ok(_) => "Failed to build conversation state.".into(),
                     Err(e) => format!("IPC error: {e}"),
                 }
+            } else if !request_msg.is_empty() {
+                // Non-privileged user with a message — write a request
+                // file so the admin can review and optionally add them.
+                write_access_request(user_id, chat_id, chat_type, &state.tg.default_agent, request_msg).await;
+                "Your access request has been saved. An admin will review it.".into()
+            } else {
+                "Access denied — persist is a privileged command. Use /persist <message> to request access.".into()
             }
         }
 "/delete" => {
