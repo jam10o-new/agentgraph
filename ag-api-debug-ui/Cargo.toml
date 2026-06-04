@@ -1,0 +1,18 @@
+[package]
+name = "ag-api-debug-ui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ag-api-debug-ui"
+path = "src/main.rs"
+
+[dependencies]
+ag-ipc = { path = "../ag-ipc" }
+ag-utils = { path = "../ag-utils" }
+ag-config = { path = "../ag-config" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+axum = "0.8"
+serde = "1"
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
