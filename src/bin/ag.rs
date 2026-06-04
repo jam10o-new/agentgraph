@@ -9,6 +9,51 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use std::time::Duration;
 
+// ── Config path resolution ──────────────────────────────────────────
+
+/// Resolve the config file path using the following precedence:
+///
+/// 1. `AGENTGRAPH_CONFIG` env var (explicit override)
+/// 2. Explicit CLI `--config` path
+/// 3. `./config.yaml` (current directory)
+/// 4. `~/.config/agentgraph/config.yaml` (XDG-style default)
+fn resolve_config_path(explicit: Option<&str>) -> String {
+    // 1. Environment variable override
+    if let Ok(env_path) = std::env::var("AGENTGRAPH_CONFIG") {
+        if std::path::Path::new(&env_path).exists() {
+            return env_path;
+        }
+    }
+    // 2. Explicit CLI argument
+    if let Some(path) = explicit {
+        if !path.is_empty() && path != "config.yaml" {
+            // User explicitly set a path — use it.
+            return path.to_string();
+        }
+    }
+    // 3. ./config.yaml (current directory, backward compat)
+    let cwd_path = "config.yaml";
+    if std::path::Path::new(cwd_path).exists() {
+        return cwd_path.to_string();
+    }
+    // 4. ~/.config/agentgraph/config.yaml
+    let home_default = dirs_next().join("config.yaml");
+    let home_default_str = home_default.to_string_lossy().to_string();
+    if std::path::Path::new(&home_default_str).exists() {
+        return home_default_str;
+    }
+    // Not found — fall back to cwd default (will fail loudly in load).
+    cwd_path.to_string()
+}
+
+fn dirs_next() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join(".config")
+        .join("agentgraph")
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -20,9 +65,9 @@ struct Cli {
 enum Commands {
     /// Start the agentgraph leader
     Leader {
-        /// Path to the config file
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
+        /// Path to the config file (optional; defaults are resolved)
+        #[arg(short, long)]
+        config: Option<String>,
         /// Path to a pending command file to process on startup
         #[arg(long)]
         pending_command: Option<String>,
@@ -162,9 +207,10 @@ async fn main() -> Result<()> {
     // Check if we are already in the background
     if std::env::var("AGENTGRAPH_BACKGROUND").is_ok() {
         if let Commands::Leader { config, pending_command } = cli.command {
-            let config_obj = Config::load(&config)?;
-            let config_path = std::path::absolute(&config)
-                .unwrap_or_else(|_| std::path::PathBuf::from(&config));
+            let resolved = resolve_config_path(config.as_deref());
+            let config_obj = Config::load(&resolved)?;
+            let config_path = std::path::absolute(&resolved)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&resolved));
             let leader = Leader::new(config_obj, config_path.to_string_lossy().to_string()).await?;
             leader.run(pending_command).await?;
             return Ok(());
@@ -173,9 +219,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Leader { config, .. } => {
+            let resolved = resolve_config_path(config.as_deref());
             match is_leader_alive().await {
                 LeaderStatus::Ready { .. } => {
-                    let config_obj = Config::load(&config)?;
+                    let config_obj = Config::load(&resolved)?;
                     let cmd = Command::UpdateConfig(config_obj);
                     send_command(cmd).await?;
                 }
@@ -189,8 +236,8 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
                 LeaderStatus::NotRunning => {
-                    spawn_background_leader(&config, None)?;
-                    println!("Leader started in background. Logs: /tmp/agentgraph/leader.log");
+                    spawn_background_leader(&resolved, None)?;
+                    println!("Leader started in background (config: {resolved}). Logs: /tmp/agentgraph/leader.log");
                 }
             }
         }
@@ -341,7 +388,7 @@ async fn ensure_leader() -> Result<()> {
         LeaderStatus::NotRunning => {}
     }
 
-    spawn_background_leader("config.yaml", None)?;
+    spawn_background_leader(&resolve_config_path(None), None)?;
     // Wait for leader to become ready (up to 90 s for model loading)
     for _ in 0..450 {
         tokio::time::sleep(Duration::from_millis(200)).await;

@@ -86,7 +86,7 @@ pub struct Config {
     pub plugins: HashMap<String, serde_yaml::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct AgentConfig {
     pub inputs: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_output")]
@@ -172,7 +172,7 @@ where
     deserializer.deserialize_any(OutputVisitor)
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct SamplingConfig {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -184,7 +184,7 @@ pub struct SamplingConfig {
     pub max_len: Option<usize>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct CompressionConfig {
     pub threshold: f64,
     pub inverse_probability: f64,

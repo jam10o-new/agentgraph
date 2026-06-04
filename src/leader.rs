@@ -74,10 +74,23 @@ impl Leader {
     }
 
     pub async fn spawn_agent(&self, name: String, agent_config: AgentConfig) -> Result<()> {
+        self.spawn_agent_force(name, agent_config, false).await
+    }
+
+    /// Spawn an agent.  When `force` is true, replaces an existing agent
+    /// with the same name (aborting its old task).
+    async fn spawn_agent_force(&self, name: String, agent_config: AgentConfig, force: bool) -> Result<()> {
         let mut agents = self.agents.lock().await;
         if agents.contains_key(&name) {
-            println!("Agent {} already exists, skipping.", name);
-            return Ok(());
+            if !force {
+                println!("Agent {} already exists, skipping.", name);
+                return Ok(());
+            }
+            // Force: abort existing and replace
+            if let Some(entry) = agents.remove(&name) {
+                entry.handle.abort();
+                println!("Agent {} aborted (will be replaced).", name);
+            }
         }
 
         let model = self
@@ -145,6 +158,72 @@ impl Leader {
             },
         );
         Ok(())
+    }
+
+    /// Apply a config update or reload.  Spawns newly added agents, stops
+    /// agents that were removed from the config, and restarts agents whose
+    /// configuration changed.  Also updates the in-memory Config snapshot.
+    async fn apply_config_update(&self, new_config: Config) {
+        let agents = self.agents.lock().await;
+        let mut old_config = self.config.lock().await;
+
+        // ── Models ──────────────────────────────────────────────────
+        for (name, new_model) in &new_config.models {
+            if !old_config.models.contains_key(name) {
+                eprintln!(
+                    "Warning: Dynamic model loading not yet supported for new model '{}'.",
+                    name
+                );
+            } else if let Some(old_model) = old_config.models.get(name) {
+                if old_model.id != new_model.id || old_model.gguf != new_model.gguf {
+                    eprintln!(
+                        "Warning: Model '{}' changed but hot-reload not supported. Restart leader.",
+                        name
+                    );
+                }
+            }
+        }
+
+        // ── Agents ──────────────────────────────────────────────────
+        // Stop agents that were in old config but not in new config.
+        let to_stop: Vec<String> = agents
+            .keys()
+            .filter(|name| !new_config.agents.contains_key(*name))
+            .cloned()
+            .collect();
+        // Release agents lock before stopping (stop acquires lock)
+        drop(agents);
+        for name in &to_stop {
+            let mut agents = self.agents.lock().await;
+            if let Some(entry) = agents.remove(name) {
+                entry.handle.abort();
+                println!("Stopped agent '{}' (removed from config).", name);
+            }
+        }
+
+        // Spawn new agents or restart changed ones.
+        for (name, new_agent_config) in &new_config.agents {
+            let needs_restart = {
+                let agents = self.agents.lock().await;
+                if agents.contains_key(name) {
+                    // Compare old vs new config
+                    old_config
+                        .agents
+                        .get(name)
+                        .is_none_or(|old| old != new_agent_config)
+                } else {
+                    true // not running → always spawn
+                }
+            };
+            if needs_restart {
+                if let Err(e) = self.spawn_agent_force(name.clone(), new_agent_config.clone(), true).await {
+                    eprintln!("Failed to spawn agent '{}': {}", name, e);
+                }
+            }
+        }
+
+        // Update in-memory config snapshot
+        *old_config = new_config;
     }
 
     /// Check whether the on-disk binary has been replaced since startup.
@@ -837,7 +916,7 @@ impl Leader {
 
                     let agents = agents.clone();
                     let model_opt = model_opt.clone();
-                    let config_mutex = config_mutex.clone();
+                    let _config_mutex = config_mutex.clone();
                     let leader = leader_for_ipc.clone();
                     let sessions = sessions.clone();
                     let _ = &sessions; // used by session command handler closure capture
@@ -858,32 +937,22 @@ impl Leader {
 
                                 match cmd {
                                     Command::UpdateConfig(new_config) => {
-                                        let config = config_mutex.lock().await;
-                                        // Ignore existing models
-                                        for (name, _) in &new_config.models {
-                                            if !config.models.contains_key(name) {
-                                                eprintln!(
-                                                    "Warning: Dynamic model loading not yet supported for model '{}'.",
-                                                    name
-                                                );
-                                            }
-                                        }
-                                        // Add new agents
-                                        for (name, agent_config) in new_config.agents {
-                                            if !agents.lock().await.contains_key(&name) {
-                                                if let Err(e) =
-                                                    leader.spawn_agent(name, agent_config).await
-                                                {
-                                                    let _ = stream
-                                                        .write_all(
-                                                            format!("Error spawning agent: {}", e)
-                                                                .as_bytes(),
-                                                        )
-                                                        .await;
-                                                }
-                                            }
-                                        }
+                                        leader.apply_config_update(new_config).await;
                                         let _ = stream.write_all(b"Config updated").await;
+                                    }
+                                    Command::ReloadConfig => {
+                                        let config_path = leader.config_path.clone();
+                                        match ag_config::Config::load(&config_path) {
+                                            Ok(reloaded) => {
+                                                leader.apply_config_update(reloaded).await;
+                                                let _ = stream.write_all(b"Config reloaded").await;
+                                            }
+                                            Err(e) => {
+                                                let _ = stream.write_all(
+                                                    format!("Config reload failed: {}", e).as_bytes(),
+                                                ).await;
+                                            }
+                                        }
                                     }
                                     Command::SpawnAgent {
                                         name,
@@ -1009,17 +1078,6 @@ impl Leader {
                                     | Command::SessionDeletePersisted { .. } => {
                                         let resp = leader.handle_session_command(cmd).await;
                                         let _ = stream.write_all(resp.as_bytes()).await;
-                                    }
-                                    _ => {
-                                        let _ = stream
-                                            .write_all(
-                                                format!(
-                                                    "Command Received (Unimplemented: {:?})",
-                                                    cmd
-                                                )
-                                                .as_bytes(),
-                                            )
-                                            .await;
                                     }
                                 }
                             }
