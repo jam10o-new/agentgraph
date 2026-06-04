@@ -757,24 +757,53 @@ async fn run_inference(
                             }
                         }
                         "mp3" | "ogg" | "flac" | "m4a" | "aac" | "opus" => {
-                            match std::fs::read(&p) {
-                                Ok(bytes) => match AudioInput::from_bytes(&bytes) {
+                            let decoded = match std::fs::read(&p) {
+                                Ok(bytes) => AudioInput::from_bytes(&bytes),
+                                Err(e) => Err(anyhow!("read: {}", e)),
+                            };
+                            // For .ogg and .opus, the bundled symphonia may lack the
+                            // opus feature.  Fall back to ffmpeg → WAV conversion.
+                            if decoded.is_ok()
+                                || ext == "mp3"
+                                || ext == "flac"
+                                || ext == "m4a"
+                                || ext == "aac"
+                            {
+                                match decoded {
                                     Ok(audio) => audios.push(audio),
                                     Err(e) => logger
                                         .log(&format!(
                                             "Failed to decode audio {}: {:?}",
-                                            p.display(),
-                                            e
+                                            p.display(), e
                                         ))
                                         .await,
-                                },
-                                Err(e) => logger
+                                }
+                            } else {
+                                logger
                                     .log(&format!(
-                                        "Failed to read audio file {}: {:?}",
-                                        p.display(),
-                                        e
+                                        "symphonia decode failed for {}; falling back to ffmpeg",
+                                        p.display()
                                     ))
-                                    .await,
+                                    .await;
+                                match convert_audio_to_wav(&p).await {
+                                    Ok(wav_path) => {
+                                        match AudioInput::read_wav(&wav_path.to_string_lossy()) {
+                                            Ok(audio) => audios.push(audio),
+                                            Err(e) => logger
+                                                .log(&format!(
+                                                    "Failed to decode ffmpeg-converted WAV {}: {:?}",
+                                                    p.display(), e
+                                                ))
+                                                .await,
+                                        }
+                                    }
+                                    Err(e) => logger
+                                        .log(&format!(
+                                            "ffmpeg conversion failed for {}: {:?}",
+                                            p.display(), e
+                                        ))
+                                        .await,
+                                }
                             }
                         }
                         _ => {}
@@ -1576,4 +1605,40 @@ fn sample_frame_indices(total: usize, n: usize) -> Vec<usize> {
         .map(|i| ((i as f64) * step) as usize)
         .take(total)
         .collect()
+}
+
+/// Convert any audio file to WAV via ffmpeg, returning the path to the
+/// output file.  Used as a fallback for formats that the bundled symphonia
+/// build doesn't support (e.g. Opus in OGG).
+async fn convert_audio_to_wav(path: &Path) -> Result<PathBuf> {
+    let tmpdir = tempfile::tempdir()?;
+    let wav_path = tmpdir.path().join("output.wav");
+    let output = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-v", "error",
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-acodec", "pcm_f32le",
+            "-ar", "16000",
+            "-ac", "1",
+            "-y",
+        ])
+        .arg(&wav_path)
+        .output()
+        .await
+        .context("ffmpeg audio conversion failed")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "ffmpeg audio: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    // Keep the tempdir alive by leaking it — the file will be cleaned up
+    // when the agent completes its turn.
+    let wav = wav_path.clone();
+    std::mem::forget(tmpdir);
+    Ok(wav)
 }

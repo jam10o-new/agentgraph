@@ -103,6 +103,30 @@ async fn ipc_send(socket: &str, cmd: &Command) -> Result<IpcResponse, String> {
     serde_json::from_str::<IpcResponse>(&buf).map_err(|e| format!("deserialize: {e} (raw: {buf})"))
 }
 
+/// Send a raw IPC command that does not produce JSON (Status, RunAgent, etc.).
+/// Returns the raw text response from the leader.
+async fn ipc_send_raw(socket: &str, cmd: &Command) -> Result<String, String> {
+    let mut stream = UnixStream::connect(socket)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let payload = serde_json::to_vec(cmd).map_err(|e| format!("serialize: {e}"))?;
+    stream
+        .write_all(&payload)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|e| format!("shutdown: {e}"))?;
+    let mut buf = String::new();
+    stream
+        .read_to_string(&mut buf)
+        .await
+        .map_err(|e| format!("read: {e}"))?;
+    Ok(buf.trim().to_string())
+}
+
 // ── Telegram API helpers ────────────────────────────────────────────────────
 
 /// Escape Telegram MarkdownV2 special characters with a backslash.
@@ -518,6 +542,8 @@ async fn handle_command(
             "/persist — Save active branch to disk (privileged)\n",
             "/delete — Wipe active tree + persisted archive (privileged)\n",
             "/status — Show leader status (privileged)\n",
+            "/run <agent> [msg] — Trigger an agent turn (privileged)\n",
+            "/stop <agent> — Stop a running agent (privileged)\n",
             "/reload — Reload leader config (privileged)\n",
             "/config — Show agent config\n",
             "/help — This help"
@@ -696,11 +722,8 @@ async fn handle_command(
             if !state.is_privileged(user_id) {
                 "Access denied — status is a privileged command.".into()
             } else {
-                match ipc_send(&state.socket_path, &Command::Status).await {
-                    Ok(resp) if resp.ok => {
-                        resp.data.unwrap_or_else(|| "Leader running.".into())
-                    }
-                    Ok(resp) => resp.error.unwrap_or_else(|| "error".into()),
+                match ipc_send_raw(&state.socket_path, &Command::Status).await {
+                    Ok(text) => text,
                     Err(e) => format!("IPC error: {e}"),
                 }
             }
@@ -715,6 +738,62 @@ async fn handle_command(
                     }
                     Ok(resp) => resp.error.unwrap_or_else(|| "error".into()),
                     Err(e) => format!("IPC error: {e}"),
+                }
+            }
+        }
+        "/config" => {
+            let agent = state.agent_for(chat_id, chat_type).await;
+            format!(
+                "**Session config**\nChat ID: `{chat_id}`\nType: `{chat_type}`\nAgent: `{agent}`\nPrivileged: `{}`",
+                state.is_privileged(user_id)
+            )
+        }
+        "/run" => {
+            if !state.is_privileged(user_id) {
+                "Access denied — run is a privileged command.".into()
+            } else {
+                let args = cmd.strip_prefix("/run").unwrap_or("").trim();
+                if args.is_empty() {
+                    "Usage: /run <agent_name> [message]".into()
+                } else {
+                    let (agent_name, message) = args.split_once(' ')
+                        .map(|(a, m)| (a.to_string(), Some(m.to_string())))
+                        .unwrap_or_else(|| (args.to_string(), None));
+                    match ipc_send_raw(
+                        &state.socket_path,
+                        &Command::RunAgent(agent_name.clone(), message, false),
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            if text.is_empty() {
+                                format!("Agent `{agent_name}` triggered.")
+                            } else {
+                                text
+                            }
+                        }
+                        Err(e) => format!("IPC error: {e}"),
+                    }
+                }
+            }
+        }
+        "/stop" => {
+            if !state.is_privileged(user_id) {
+                "Access denied — stop is a privileged command.".into()
+            } else {
+                let name = cmd.strip_prefix("/stop").unwrap_or("").trim();
+                if name.is_empty() {
+                    "Usage: /stop <agent_name>".into()
+                } else {
+                    match ipc_send_raw(
+                        &state.socket_path,
+                        &Command::StopAgent(name.to_string()),
+                    )
+                    .await
+                    {
+                        Ok(text) => text,
+                        Err(e) => format!("IPC error: {e}"),
+                    }
                 }
             }
         }
