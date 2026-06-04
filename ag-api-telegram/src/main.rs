@@ -373,6 +373,8 @@ async fn handle_command(
             "/reset — Reset active tree (keeps persisted archive)\n",
             "/persist — Save active branch to disk (privileged)\n",
             "/delete — Wipe active tree + persisted archive (privileged)\n",
+            "/status — Show leader status (privileged)\n",
+            "/reload — Reload leader config (privileged)\n",
             "/config — Show agent config\n",
             "/help — This help"
         )
@@ -525,7 +527,7 @@ async fn handle_command(
                 }
             }
         }
-        "/delete" => {
+"/delete" => {
             if !state.is_privileged(user_id) {
                 "Access denied — delete is a privileged command.".into()
             } else {
@@ -541,79 +543,30 @@ async fn handle_command(
                 "Session fully deleted. Persisted history removed.".into()
             }
         }
-        "/config" => {
+        "/status" => {
             if !state.is_privileged(user_id) {
-                "Access denied — config is a privileged command.".into()
+                "Access denied — status is a privileged command.".into()
             } else {
-                let agent = state.agent_for(chat_id, chat_type).await;
-                format!(
-                    "**Session config**\nChat ID: `{chat_id}`\nType: `{chat_type}`\nAgent: `{agent}`"
-                )
+                match ipc_send(&state.socket_path, &Command::Status).await {
+                    Ok(resp) if resp.ok => {
+                        resp.data.unwrap_or_else(|| "Leader running.".into())
+                    }
+                    Ok(resp) => resp.error.unwrap_or_else(|| "error".into()),
+                    Err(e) => format!("IPC error: {e}"),
+                }
             }
         }
-        "/system" => {
-            let agent = state.agent_for(chat_id, chat_type).await;
-            let hist = state
-                .chats
-                .lock()
-                .await
-                .get(&chat_id)
-                .map(|c| c.history.clone())
-                .unwrap_or_default();
-            if let Ok(resp) = ipc_send(
-                &state.socket_path,
-                &Command::SessionBuild {
-                    session_id: format!("tg-{chat_id}"),
-                    steps: hist,
-                    agent_name: Some(agent),
-                },
-            )
-            .await
-            {
-                if resp.ok {
-                    if let Some(data) = &resp.data {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                            let sys_msgs: Vec<&str> = v["system_msgs"]
-                                .as_array()
-                                .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
-                                .unwrap_or_default();
-                            let cfg_msgs: Vec<&str> = v["config_system_msgs"]
-                                .as_array()
-                                .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
-                                .unwrap_or_default();
-                            let mut out = String::new();
-                            if !cfg_msgs.is_empty() {
-                                out.push_str("**System prompt (config)**\n\n");
-                                for (i, msg) in cfg_msgs.iter().enumerate() {
-                                    let snippet: String = msg.chars().take(400).collect();
-                                    out.push_str(&format!("`{i}`: {snippet}\n\n"));
-                                }
-                            }
-                            if !sys_msgs.is_empty() {
-                                if !out.is_empty() {
-                                    out.push_str("**Dynamic messages (/be)**\n\n");
-                                }
-                                for (i, msg) in sys_msgs.iter().enumerate() {
-                                    let snippet: String = msg.chars().take(200).collect();
-                                    out.push_str(&format!("`{i}`: {snippet}\n\n"));
-                                }
-                            }
-                            if out.is_empty() {
-                                "**System dir** — empty (no system messages)".into()
-                            } else {
-                                out
-                            }
-                        } else {
-                            "Failed to parse session state.".into()
-                        }
-                    } else {
-                        "No session data.".into()
-                    }
-                } else {
-                    resp.error.unwrap_or_else(|| "session error".into())
-                }
+        "/reload" => {
+            if !state.is_privileged(user_id) {
+                "Access denied — reload is a privileged command.".into()
             } else {
-                "Failed to reach leader.".into()
+                match ipc_send(&state.socket_path, &Command::ReloadConfig).await {
+                    Ok(resp) if resp.ok => {
+                        resp.data.unwrap_or_else(|| "Config reloaded.".into())
+                    }
+                    Ok(resp) => resp.error.unwrap_or_else(|| "error".into()),
+                    Err(e) => format!("IPC error: {e}"),
+                }
             }
         }
         "/be" => {
