@@ -1,5 +1,5 @@
 use crate::audio::AudioListener;
-use crate::config::{AgentConfig, Config};
+use crate::config::{AgentConfig, Config, SystemPromptMode};
 use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_frontmatter};
 use crate::ipc::Command;
 use crate::leader::ModelAccess;
@@ -374,13 +374,25 @@ async fn run_inference(
     _name: String,
     model: Arc<Model>,
     config: AgentConfig,
-    _global_config: Config,
+    global_config: Config,
     sampling: SamplingParams,
     volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
     logger: AgentLogger,
     model_access: ModelAccess,
 ) -> Result<String> {
     logger.log("Starting inference turn").await;
+
+    // Resolve system prompt mode: agent override > model config > Merged
+    let system_mode = config
+        .system_prompt_mode
+        .clone()
+        .or_else(|| {
+            global_config
+                .models
+                .get(&config.model)
+                .map(|m| m.system_prompt_mode.clone())
+        })
+        .unwrap_or_default();
 
     // Mark model as recently accessed so the idle eviction timer knows it's in use.
     model_access.touch(&config.model).await;
@@ -485,12 +497,19 @@ async fn run_inference(
 
     let mut combined_history = Vec::new();
     if !system_content.is_empty() {
+        // System prompt placement is governed by system_prompt_mode:
+        //   Merged / Frontloaded → turn_index 0, excluded from compression
+        //   Interleaved / Summarized → normal turn_index, may be compressed
+        let (sys_index, sys_excluded) = match system_mode {
+            SystemPromptMode::Merged | SystemPromptMode::Frontloaded => (0, true),
+            SystemPromptMode::Interleaved | SystemPromptMode::Summarized => (0, false),
+        };
         if let Some((n, d, body)) = extract_frontmatter(&system_content) {
             combined_history.push(HistoryTurn {
                 role: HistoryTurnRole::Skill(n, d),
                 content: body,
-                turn_index: 0,
-                excluded_from_compression: true,
+                turn_index: sys_index,
+                excluded_from_compression: sys_excluded,
                 file_key: "_system_".into(),
                 file_path: String::new(),
                 content_hash: String::new(),
@@ -499,8 +518,8 @@ async fn run_inference(
             combined_history.push(HistoryTurn {
                 role: HistoryTurnRole::System,
                 content: system_content,
-                turn_index: 0,
-                excluded_from_compression: true,
+                turn_index: sys_index,
+                excluded_from_compression: sys_excluded,
                 file_key: "_system_".into(),
                 file_path: String::new(),
                 content_hash: String::new(),

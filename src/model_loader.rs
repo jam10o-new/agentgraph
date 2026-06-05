@@ -22,7 +22,7 @@ pub async fn load_models(
             Some("f32") => Some(ModelDType::F32),
             Some("f16") => Some(ModelDType::F16),
             Some("bf16") => Some(ModelDType::BF16),
-            _ => None,
+            _ => Some(ModelDType::Auto),
         };
 
         let model_src = config

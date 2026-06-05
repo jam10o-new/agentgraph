@@ -360,6 +360,7 @@ impl Leader {
                         enable_oom_recovery: true,
                         inference_retry_delay_ms: 500,
                         compression_db_path: None,
+                        system_prompt_mode: None,
                     },
                 );
             }

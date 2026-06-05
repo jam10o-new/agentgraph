@@ -135,6 +135,7 @@ async fn main() {
         compression: Default::default(),
         context_checkpoint_limit,
         compression_db_path: None,
+        system_prompt_mode: None,
         excluded_from_summary,
         tools,
         consume_tool_calls: false,

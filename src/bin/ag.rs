@@ -337,6 +337,7 @@ async fn main() -> Result<()> {
                         inference_retry_delay_ms: inference_retry_delay_ms.unwrap_or(500),
                         enable_oom_recovery,
                         compression_db_path: None,
+                        system_prompt_mode: None,
                     };
                     Command::SpawnAgent { name, config }
                 }

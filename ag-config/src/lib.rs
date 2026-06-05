@@ -1,5 +1,48 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::collections::HashMap;
+
+/// Controls how system prompts are placed in the final prompt array.
+/// Values: "merged" (default), "frontloaded", "interleaved", "summarized".
+#[derive(Debug, Clone, PartialEq)]
+pub enum SystemPromptMode {
+    /// All system content merged into one message placed first.
+    /// (default, safest for templates requiring messages[0] == system)
+    Merged,
+    /// Multiple system messages, all first (turn_index 0, excluded from compression).
+    Frontloaded,
+    /// System messages appear wherever they were inserted; no reordering, no exclusion.
+    Interleaved,
+    /// System messages are ordinary history entries; they may be compressed.
+    Summarized,
+}
+
+impl Default for SystemPromptMode {
+    fn default() -> Self { SystemPromptMode::Merged }
+}
+
+impl Serialize for SystemPromptMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            SystemPromptMode::Merged => "merged",
+            SystemPromptMode::Frontloaded => "frontloaded",
+            SystemPromptMode::Interleaved => "interleaved",
+            SystemPromptMode::Summarized => "summarized",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemPromptMode {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?.to_lowercase();
+        match s.as_str() {
+            "merged" => Ok(SystemPromptMode::Merged),
+            "frontloaded" => Ok(SystemPromptMode::Frontloaded),
+            "interleaved" => Ok(SystemPromptMode::Interleaved),
+            "summarized" => Ok(SystemPromptMode::Summarized),
+            other => Err(de::Error::unknown_variant(other, &["merged", "frontloaded", "interleaved", "summarized"])),
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModelConfig {
@@ -12,6 +55,10 @@ pub struct ModelConfig {
     pub chat_template: Option<String>,
     #[serde(default = "default_max_num_seqs")]
     pub max_num_seqs: usize,
+    /// How system prompts are placed in the message array.
+    /// "merged" (default), "frontloaded", "interleaved", "summarized".
+    #[serde(default)]
+    pub system_prompt_mode: SystemPromptMode,
 }
 
 fn default_max_num_seqs() -> usize {
@@ -128,6 +175,10 @@ pub struct AgentConfig {
     pub inference_retries: u32,
     #[serde(default = "default_inference_retry_delay_ms")]
     pub inference_retry_delay_ms: u64,
+    /// Override the model-level system_prompt_mode.  When set, takes
+    /// precedence over `ModelConfig.system_prompt_mode`.
+    #[serde(default)]
+    pub system_prompt_mode: Option<SystemPromptMode>,
 }
 
 fn default_inference_retries() -> u32 {
