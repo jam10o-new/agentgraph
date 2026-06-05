@@ -397,29 +397,27 @@ async fn run_inference(
     // Mark model as recently accessed so the idle eviction timer knows it's in use.
     model_access.touch(&config.model).await;
 
-    // 1. Collate System Prompts
-    let mut system_content = String::new();
-    // Schema-driven output: if a .schema-{format}.{ext} file exists in the
-    // system directory, use llguidance constrained decoding and a custom
-    // output filename pattern instead of the default out-{timestamp}.txt.
+    // 1. Collate all files (system, input, output, tool) into a unified
+    // list, then apply system_prompt_mode to determine system entry placement.
+    //
+    // Schema detection still scans system dirs for .schema-* files; those
+    // are never treated as prompt content.
+
     let mut output_schema: Option<OutputSchema> = None;
+    let mut schema_file_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    // ── 1a. Schema detection ──────────────────────────────────────────
     for sys_dir in &config.system {
         if let Ok(mut entries) = fs::read_dir(sys_dir).await {
-            let mut files = Vec::new();
             while let Some(entry) = entries.next_entry().await? {
-                let file_name = entry.file_name();
-                let name_str = file_name.to_string_lossy();
-                // Check for schema files before the hidden-file skip
+                let name_str = entry.file_name().to_string_lossy().to_string();
                 if let Some(parsed) = ParsedSchemaName::try_parse(&name_str) {
+                    schema_file_names.insert(name_str.clone());
                     if let Ok(content) = fs::read_to_string(entry.path()).await {
                         let constraint_type =
                             parsed.constraint_hint.as_deref().unwrap_or_else(|| {
-                                // Default: JsonSchema for .json, nothing otherwise
-                                if parsed.extension == "json" {
-                                    "json"
-                                } else {
-                                    ""
-                                }
+                                if parsed.extension == "json" { "json" } else { "" }
                             });
                         let constraint = match constraint_type {
                             "json" => serde_json::from_str::<serde_json::Value>(&content)
@@ -427,15 +425,13 @@ async fn run_inference(
                             "lark" => Ok(Constraint::Lark(content)),
                             "regex" => Ok(Constraint::Regex(content)),
                             "llg" => serde_json::from_str(&content).map(Constraint::Llguidance),
-                            _ => continue, // unknown or no default, skip
+                            _ => continue,
                         };
                         if let Ok(c) = constraint {
-                            logger
-                                .log(&format!(
-                                    "Loaded output schema: .schema-{}.{}",
-                                    parsed.format_str, parsed.extension
-                                ))
-                                .await;
+                            logger.log(&format!(
+                                "Loaded output schema: .schema-{}.{}",
+                                parsed.format_str, parsed.extension
+                            )).await;
                             output_schema = Some(OutputSchema {
                                 format_str: parsed.format_str,
                                 extension: parsed.extension,
@@ -443,46 +439,21 @@ async fn run_inference(
                             });
                         }
                     }
-                    continue; // don't load as system prompt
-                }
-                // Skip hidden files (e.g. tool definitions written by agentgraph)
-                if name_str.starts_with('.') {
-                    continue;
-                }
-                if entry.path().is_file() {
-                    files.push(entry.path());
-                }
-            }
-            files.sort();
-            for f in files {
-                if let Ok(content) = fs::read_to_string(&f).await {
-                    if !system_content.is_empty() {
-                        system_content.push_str("\n\n");
-                    }
-                    system_content.push_str(&content);
                 }
             }
         }
     }
 
-    if let Some(extra_prompt) = &config.prompt {
-        if !system_content.is_empty() {
-            system_content.push_str("\n\n");
-        }
-        system_content.push_str(extra_prompt);
-    }
-
-    // ── Tool discovery (dynamic, per-binary --describe / --help) ──────────
-    // Run early so guidance text is injected into the system prompt before
-    // it gets consumed by the history builder.
+    // ── 1b. Tool discovery ────────────────────────────────────────────
     let mut tool_registry: Option<ToolRegistry> = None;
     let mut tools = vec![];
+    let mut tool_guidance = String::new();
     if !config.tools.is_empty() && output_schema.is_none() {
         match discover_tools(&config.tools, &logger).await {
             Ok(registry) => {
                 if !registry.guidance.is_empty() {
-                    system_content.push_str("\n\n== Tool Usage Guidance ==\n");
-                    system_content.push_str(&registry.guidance);
+                    tool_guidance.push_str("== Tool Usage Guidance ==\n");
+                    tool_guidance.push_str(&registry.guidance);
                 }
                 tools = registry.tools.clone();
                 tool_registry = Some(registry);
@@ -495,36 +466,78 @@ async fn run_inference(
         logger.log("Tools disabled — schema constraint is active (tools conflict with llguidance)").await;
     }
 
-    let mut combined_history = Vec::new();
-    if !system_content.is_empty() {
-        // System prompt placement is governed by system_prompt_mode:
-        //   Merged / Frontloaded → turn_index 0, excluded from compression
-        //   Interleaved / Summarized → normal turn_index, may be compressed
-        let (sys_index, sys_excluded) = match system_mode {
-            SystemPromptMode::Merged | SystemPromptMode::Frontloaded => (0, true),
-            SystemPromptMode::Interleaved | SystemPromptMode::Summarized => (0, false),
-        };
-        if let Some((n, d, body)) = extract_frontmatter(&system_content) {
-            combined_history.push(HistoryTurn {
-                role: HistoryTurnRole::Skill(n, d),
-                content: body,
-                turn_index: sys_index,
-                excluded_from_compression: sys_excluded,
-                file_key: "_system_".into(),
-                file_path: String::new(),
-                content_hash: String::new(),
-            });
-        } else {
-            combined_history.push(HistoryTurn {
-                role: HistoryTurnRole::System,
-                content: system_content,
-                turn_index: sys_index,
-                excluded_from_compression: sys_excluded,
-                file_key: "_system_".into(),
-                file_path: String::new(),
-                content_hash: String::new(),
-            });
+    let mut all_files = Vec::new();
+
+    // ── 1c. Collect system prompt files (per-file, NOT concatenated) ──
+    for sys_dir in &config.system {
+        if let Ok(mut entries) = fs::read_dir(sys_dir).await {
+            let mut sys_files: Vec<PathBuf> = Vec::new();
+            while let Some(entry) = entries.next_entry().await? {
+                let name_str = entry.file_name().to_string_lossy().to_string();
+                if name_str.starts_with('.') || schema_file_names.contains(&name_str) {
+                    continue;
+                }
+                if entry.path().is_file() {
+                    sys_files.push(entry.path());
+                }
+            }
+            sys_files.sort();
+            for f in sys_files {
+                if let Ok(content) = fs::read_to_string(&f).await {
+                    let role = match extract_frontmatter(&content) {
+                        Some((n, d, body)) => {
+                            // Write body back to disk so it overrides the
+                            // frontmatter-included content for this file.
+                            let _ = fs::write(&f, &body).await;
+                            HistoryTurnRole::Skill(n, d)
+                        }
+                        None => HistoryTurnRole::System,
+                    };
+                    let md = fs::metadata(&f).await.ok();
+                    all_files.push(FileEntry {
+                        path: f.clone(),
+                        created: md
+                            .as_ref()
+                            .and_then(|m| m.created().ok())
+                            .unwrap_or(SystemTime::UNIX_EPOCH),
+                        role,
+                        metadata_str: String::new(),
+                        excluded: false, // set later based on mode
+                    });
+                }
+            }
         }
+    }
+
+    // ── 1d. Config prompt as a virtual system entry ───────────────────
+    if let Some(ref extra_prompt) = config.prompt {
+        let tmp = tempfile::tempdir()?;
+        let prompt_path = tmp.path().join("config-prompt.txt");
+        fs::write(&prompt_path, extra_prompt).await?;
+        all_files.push(FileEntry {
+            path: prompt_path,
+            created: SystemTime::UNIX_EPOCH, // always sorts first
+            role: HistoryTurnRole::System,
+            metadata_str: String::new(),
+            excluded: false,
+        });
+        // Leak tempdir so it survives past this scope
+        std::mem::forget(tmp);
+    }
+
+    // ── 1e. Tool guidance as a virtual system entry ───────────────────
+    if !tool_guidance.is_empty() {
+        let tmp = tempfile::tempdir()?;
+        let tg_path = tmp.path().join("tool-guidance.txt");
+        fs::write(&tg_path, &tool_guidance).await?;
+        all_files.push(FileEntry {
+            path: tg_path,
+            created: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            role: HistoryTurnRole::System,
+            metadata_str: String::new(),
+            excluded: false,
+        });
+        std::mem::forget(tmp);
     }
 
     // Build canonical excluded directories for comparison
@@ -536,7 +549,6 @@ async fn run_inference(
     }
 
     // 2. Collate User and Assistant History
-    let mut all_files = Vec::new();
     for input_dir in &config.inputs {
         let input_canonical = fs::canonicalize(input_dir)
             .await
@@ -622,6 +634,62 @@ async fn run_inference(
     }
     all_files.sort_by_key(|f| f.created);
 
+    // ── Apply system_prompt_mode to order / merge system entries ──────
+    let is_system_role = |r: &HistoryTurnRole| -> bool {
+        matches!(r, HistoryTurnRole::System | HistoryTurnRole::Skill(..))
+    };
+    match system_mode {
+        SystemPromptMode::Merged => {
+            // Collect all system entries, merge content, replace with one front entry.
+            let mut merged = String::new();
+            all_files.retain(|f| {
+                if is_system_role(&f.role) {
+                    if let Ok(content) = std::fs::read_to_string(&f.path) {
+                        if !merged.is_empty() {
+                            merged.push_str("\n\n");
+                        }
+                        merged.push_str(&content);
+                    }
+                    false // remove from list
+                } else {
+                    true
+                }
+            });
+            if !merged.is_empty() {
+                let tmp = tempfile::tempdir().expect("temp dir");
+                let mp = tmp.path().join("_system_merged_.txt");
+                let _ = std::fs::write(&mp, &merged);
+                all_files.insert(0, FileEntry {
+                    path: mp,
+                    created: SystemTime::UNIX_EPOCH,
+                    role: HistoryTurnRole::System,
+                    metadata_str: String::new(),
+                    excluded: true,
+                });
+                std::mem::forget(tmp);
+            }
+        }
+        SystemPromptMode::Frontloaded | SystemPromptMode::Summarized => {
+            let excluded = matches!(system_mode, SystemPromptMode::Frontloaded);
+            // Move all system entries to the front (stable by original sort order).
+            let mut sys: Vec<FileEntry> = Vec::new();
+            let mut rest: Vec<FileEntry> = Vec::new();
+            for f in all_files {
+                if is_system_role(&f.role) {
+                    sys.push(FileEntry { excluded, ..f });
+                } else {
+                    rest.push(f);
+                }
+            }
+            all_files = sys;
+            all_files.extend(rest);
+        }
+        SystemPromptMode::Interleaved => {
+            // System entries stay in their natural sort position.
+            // excluded stays false as set during collection.
+        }
+    }
+
     let limit = config.history_limit.unwrap_or(0);
     let start_idx = if limit > 0 && all_files.len() > limit {
         all_files.len() - limit
@@ -629,6 +697,7 @@ async fn run_inference(
         0
     };
 
+    let mut combined_history = Vec::new();
     let mut turn_idx = 1;
     for entry in all_files.iter().skip(start_idx) {
         if let Ok(content) = fs::read_to_string(&entry.path).await {
@@ -638,20 +707,26 @@ async fn run_inference(
                 } else {
                     content
                 };
-            let file_key = {
+            let is_sys = is_system_role(&entry.role);
+            let file_key = if is_sys {
+                "_system_".to_string()
+            } else {
                 let path_str = entry.path.to_string_lossy();
                 format!("{:016x}", xxh3_64(path_str.as_bytes()))
             };
             let content_hash = { format!("{:016x}", xxh3_64(final_content.as_bytes())) };
-            combined_history.push(HistoryTurn {
+            let turn = HistoryTurn {
                 role: entry.role.clone(),
                 content: final_content,
                 turn_index: turn_idx,
                 excluded_from_compression: entry.excluded,
                 file_key,
-                file_path: entry.path.to_string_lossy().to_string(),
+                file_path: if is_sys { String::new() } else { entry.path.to_string_lossy().to_string() },
                 content_hash,
-            });
+            };
+            // Skill role content already has the preamble stripped
+            // (we wrote the body-only version back to disk in 1c).
+            combined_history.push(turn);
             turn_idx += 1;
         }
     }
