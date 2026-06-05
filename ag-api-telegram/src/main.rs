@@ -129,85 +129,185 @@ async fn ipc_send_raw(socket: &str, cmd: &Command) -> Result<String, String> {
 
 // ── Telegram API helpers ────────────────────────────────────────────────────
 
-/// Always-on formatted message helper.  Code fences pass through intact.
-/// The rest is sent as MarkdownV2 (preserving bold/italic/etc.).
-/// On parse error: wraps the plain text inside a single ``` code block
-/// so that raw formatting tags never leak.
-async fn send_message_telegram(
-    client: &reqwest::Client,
-    token: &str,
-    chat_id: i64,
-    text: &str,
-) {
-    if send_message_inner(client, token, chat_id, text, "MarkdownV2").await {
-        return;
-    }
-    // Parse error → wrap entire message in a code block
-    let escaped_text = format!("```\n{text}\n```");
-    if send_message_inner(client, token, chat_id, &escaped_text, "MarkdownV2").await {
-        eprintln!("ag-api-telegram: sendMessage delivered via code-block escape (chat {chat_id})");
-        return;
-    }
-    // Ultimate fallback: plain text
-    let _ = send_message_raw(client, token, chat_id, text, None).await;
-    eprintln!("ag-api-telegram: sendMessage reverted to plain text (chat {chat_id})");
+/// Tracks formatting state across progressive streaming edits.
+/// When model output arrives incrementally, this remembers which
+/// portion of the text is known-safe for Markdown parsing and which
+/// (if any) is currently wrapped in a code block.
+#[derive(Default)]
+struct FmtTracker {
+    /// Byte offset up to which text passed MarkdownV2 parsing.
+    known_safe_len: usize,
+    /// If Some(start), bytes \[start..\} are currently wrapped behind a ``` fence.
+    wrapped_start: Option<usize>,
 }
 
-/// Try to send a message with the given parse_mode.  Returns true on success.
-async fn send_message_inner(
-    client: &reqwest::Client,
-    token: &str,
-    chat_id: i64,
-    text: &str,
-    parse_mode: &str,
-) -> bool {
-    let body = serde_json::json!({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode,
-    });
-    let resp = match client
-        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("ag-api-telegram: sendMessage transport failed (chat {chat_id}): {e}");
-            return false;
-        }
-    };
-    resp.status().is_success()
-}
+// ── Low‑level send / edit helpers ──────────────────────────────────────────
 
-/// Send a message without specifying parse_mode (Telegram sends plain text).
-async fn send_message_raw(
+/// Try to send a message.  Plain‑text when `parse_mode` is `None`.
+async fn try_send_msg(
     client: &reqwest::Client,
     token: &str,
     chat_id: i64,
     text: &str,
     parse_mode: Option<&str>,
 ) -> bool {
+    let mut body = serde_json::json!({"chat_id": chat_id, "text": text});
+    if let Some(pm) = parse_mode {
+        body["parse_mode"] = serde_json::Value::String(pm.to_string());
+    }
+    match client
+        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r.status().is_success(),
+        Err(e) => {
+            eprintln!("ag-api-telegram: sendMessage transport failed (chat {chat_id}): {e}");
+            false
+        }
+    }
+}
+
+/// Try to edit a message.  Plain‑text when `parse_mode` is `None`.
+/// Returns `true` on success *or* when the content is identical.
+async fn try_edit_msg(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    parse_mode: Option<&str>,
+) -> bool {
     let mut body = serde_json::json!({
         "chat_id": chat_id,
+        "message_id": message_id,
         "text": text,
     });
     if let Some(pm) = parse_mode {
         body["parse_mode"] = serde_json::Value::String(pm.to_string());
     }
-    let Ok(resp) = client
-        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+    let resp = match client
+        .post(format!("https://api.telegram.org/bot{token}/editMessageText"))
         .json(&body)
         .send()
         .await
-    else {
-        return false;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "ag-api-telegram: editMessageText transport failed (chat {chat_id}, msg {message_id}): {e}"
+            );
+            return false;
+        }
     };
-    resp.status().is_success()
+    let body_text = resp.text().await.unwrap_or_default();
+    match serde_json::from_str::<serde_json::Value>(&body_text) {
+        Ok(v) if v["ok"].as_bool().unwrap_or(false) => true,
+        Ok(v) => {
+            let desc = v["description"].as_str().unwrap_or("unknown error");
+            if desc.contains("message is not modified") {
+                return true; // duplicate content — not a failure
+            }
+            let is_parse = desc.contains("can't parse entities");
+            if !is_parse {
+                eprintln!(
+                    "ag-api-telegram: editMessageText failed (chat {chat_id}, msg {message_id}): {desc}"
+                );
+                return false;
+            }
+            false // parse error — caller should try next tier
+        }
+        Err(e) => {
+            eprintln!(
+                "ag-api-telegram: editMessageText unparseable response (chat {chat_id}): {e}"
+            );
+            false
+        }
+    }
 }
 
-/// Send a message and return the message_id for subsequent edits.
+// ── Public send / edit API ─────────────────────────────────────────────────
+
+/// Send a new message.  4‑tier fallback:
+///   1. MarkdownV2  →  2. Markdown  →  3. code‑block wrap  →  4. plain text
+async fn send_message_telegram(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) {
+    // Tier 1 & 2 — full text with formatting
+    for pm in [Some("MarkdownV2"), Some("Markdown")] {
+        if try_send_msg(client, token, chat_id, text, pm).await {
+            return;
+        }
+    }
+    // Tier 3 — wrap entire message in a code block
+    let wrapped = format!("```\n{text}\n```");
+    for pm in [Some("MarkdownV2"), Some("Markdown")] {
+        if try_send_msg(client, token, chat_id, &wrapped, pm).await {
+            eprintln!("ag-api-telegram: sendMessage via code‑block escape (chat {chat_id})");
+            return;
+        }
+    }
+    // Tier 4 — plain text
+    let _ = try_send_msg(client, token, chat_id, text, None).await;
+    eprintln!("ag-api-telegram: sendMessage reverted to plain text (chat {chat_id})");
+}
+
+/// Edit an existing message during progressive streaming.
+///
+/// Each `editMessage` strictly appends new content.  `tracker`
+/// remembers the last byte offset that parsed cleanly.  When new
+/// text causes a parse failure only the newly‑appended bytes are
+/// wrapped in a ``` code block.  If a later frame "closes" the
+/// offending formatting (e.g. the model adds a closing `**`) the
+/// full‑text Markdown parse is re‑attempted and on success the
+/// wrapping is removed entirely.
+async fn edit_message_telegram(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    tracker: &mut FmtTracker,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    // Try the full text — a later frame may have closed previously‑dangling formatting.
+    for pm in ["MarkdownV2", "Markdown"] {
+        if try_edit_msg(client, token, chat_id, message_id, text, Some(pm)).await {
+            tracker.known_safe_len = text.len();
+            tracker.wrapped_start = None;
+            return;
+        }
+    }
+
+    // Full text failed.  If we have tracking state, wrap only the problematic suffix.
+    let wrap_start = tracker.wrapped_start.unwrap_or(tracker.known_safe_len);
+
+    if wrap_start < text.len() {
+        let safe = &text[..wrap_start];
+        let problem = &text[wrap_start..];
+        let wrapped = format!("{}{}\n{}\n{}", safe, "```", problem, "```");
+
+        for pm in ["MarkdownV2", "Markdown"] {
+            if try_edit_msg(client, token, chat_id, message_id, &wrapped, Some(pm)).await {
+                tracker.wrapped_start = Some(wrap_start);
+                return;
+            }
+        }
+    }
+
+    // Everything failed — plain text.
+    let _ = try_edit_msg(client, token, chat_id, message_id, text, None).await;
+    eprintln!("ag-api-telegram: editMessageText reverted to plain text (chat {chat_id})");
+}
+
+/// Send a placeholder (e.g. "⏳") and return its message_id.
 async fn send_initial_message(
     client: &reqwest::Client,
     token: &str,
@@ -235,124 +335,6 @@ async fn send_initial_message(
             None
         }
     }
-}
-
-/// Edit an existing message (for progressive streaming updates).
-/// Same strategy as send_message: try MarkdownV2 first, fall back to code-block wrapping.
-async fn edit_message_telegram(
-    client: &reqwest::Client,
-    token: &str,
-    chat_id: i64,
-    message_id: i64,
-    text: &str,
-) {
-    if text.is_empty() {
-        return;
-    }
-    if edit_message_inner(client, token, chat_id, message_id, text, "MarkdownV2").await {
-        return;
-    }
-    // Parse error → wrap in code block
-    let escaped_text = format!("```\n{text}\n```");
-    if edit_message_inner(client, token, chat_id, message_id, &escaped_text, "MarkdownV2").await {
-        eprintln!("ag-api-telegram: editMessageText delivered via code-block escape (chat {chat_id})");
-        return;
-    }
-    // Ultimate fallback: plain text
-    let _ = edit_message_raw(client, token, chat_id, message_id, text, None).await;
-    eprintln!("ag-api-telegram: editMessageText reverted to plain text (chat {chat_id})");
-}
-
-/// Try to edit a message with the given parse_mode.  Returns true on success.
-async fn edit_message_inner(
-    client: &reqwest::Client,
-    token: &str,
-    chat_id: i64,
-    message_id: i64,
-    text: &str,
-    parse_mode: &str,
-) -> bool {
-    let body = serde_json::json!({
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": parse_mode,
-    });
-    let resp = match client
-        .post(format!(
-            "https://api.telegram.org/bot{token}/editMessageText"
-        ))
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "ag-api-telegram: editMessageText transport failed (chat {chat_id}, msg {message_id}): {e}"
-            );
-            return false;
-        }
-    };
-    let body_text = resp.text().await.unwrap_or_default();
-    match serde_json::from_str::<serde_json::Value>(&body_text) {
-        Ok(v) if v["ok"].as_bool().unwrap_or(false) => true,
-        Ok(v) => {
-            let desc = v["description"].as_str().unwrap_or("unknown error");
-            let is_modified = desc.contains("message is not modified");
-            if is_modified {
-                // identical - not a failure
-                return true;
-            }
-            let is_parse = desc.contains("can't parse entities");
-            if !is_parse {
-                eprintln!(
-                    "ag-api-telegram: editMessageText failed (chat {chat_id}, msg {message_id}): {desc}"
-                );
-                return false;
-            }
-            false // parse error → try next tier
-        }
-        Err(e) => {
-            eprintln!(
-                "ag-api-telegram: editMessageText unparseable response (chat {chat_id}): {e}"
-            );
-            false
-        }
-    }
-}
-
-/// Edit a message without specifying parse_mode (plain text).
-async fn edit_message_raw(
-    client: &reqwest::Client,
-    token: &str,
-    chat_id: i64,
-    message_id: i64,
-    text: &str,
-    parse_mode: Option<&str>,
-) -> bool {
-    let mut body = serde_json::json!({
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-    });
-    if let Some(pm) = parse_mode {
-        body["parse_mode"] = serde_json::Value::String(pm.to_string());
-    }
-    let Ok(resp) = client
-        .post(format!(
-            "https://api.telegram.org/bot{token}/editMessageText"
-        ))
-        .json(&body)
-        .send()
-        .await
-    else {
-        return false;
-    };
-    let body_text = resp.text().await.unwrap_or_default();
-    serde_json::from_str::<serde_json::Value>(&body_text)
-        .map(|v| v["ok"].as_bool().unwrap_or(false))
-        .unwrap_or(false)
 }
 
 /// Read the latest content from the stream output file inside `stream_dir`.
@@ -1129,6 +1111,7 @@ send_message_telegram(
                             let mut last_content = String::new();
                             let stream_dir = stream_dir.clone();
                             let mut reads_without_content: u32 = 0;
+                            let mut tracker = FmtTracker::default();
                             loop {
                                 tokio::time::sleep(Duration::from_millis(poll_ms)).await;
 
@@ -1151,6 +1134,7 @@ send_message_telegram(
                                                 chat_id,
                                                 message_id,
                                                 &content,
+                                                &mut tracker,
                                             )
                                             .await;
                                             last_content = content;
