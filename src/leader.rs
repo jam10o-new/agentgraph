@@ -354,6 +354,7 @@ impl Leader {
                         compression: Default::default(),
                         context_checkpoint_limit: Some(10000),
                         excluded_from_summary: vec![],
+                        prepend_file_metadata: false,
                         tools: vec![],
                         enable_thinking: false,
                         inference_retries: 3,

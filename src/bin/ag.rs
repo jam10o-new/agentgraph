@@ -331,6 +331,7 @@ async fn main() -> Result<()> {
                         },
                         context_checkpoint_limit,
                         excluded_from_summary,
+                        prepend_file_metadata: false,
                         tools,
                         enable_thinking,
                         inference_retries: inference_retries.unwrap_or(3),

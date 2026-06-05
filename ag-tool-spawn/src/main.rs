@@ -137,6 +137,7 @@ async fn main() {
         compression_db_path: None,
         system_prompt_mode: None,
         excluded_from_summary,
+        prepend_file_metadata: false,
         tools,
         consume_tool_calls: false,
         enable_thinking: false,

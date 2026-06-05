@@ -781,6 +781,7 @@ impl eframe::App for SnarlApp {
                                 },
                                 context_checkpoint_limit: None,
                                 excluded_from_summary: Vec::new(),
+                                prepend_file_metadata: false,
                                 tools: Vec::new(),
                                 consume_tool_calls: false,
                                 enable_thinking: false,

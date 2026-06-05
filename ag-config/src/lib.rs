@@ -160,6 +160,10 @@ pub struct AgentConfig {
     pub compression_db_path: Option<String>,
     #[serde(default)]
     pub excluded_from_summary: Vec<String>,
+    /// When true, prepend file metadata (`[File: /path | Modified: ts | Size: N bytes]`)
+    /// before each user message's content. When false (default), skip metadata.
+    #[serde(default)]
+    pub prepend_file_metadata: bool,
     /// Tool binaries to make available to this agent. Each entry is the
     /// full binary name (e.g. `ag-tool-bash`, `ag-tool-read`).
     /// An empty list means no tools are available at all.

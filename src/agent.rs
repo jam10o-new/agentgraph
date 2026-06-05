@@ -702,7 +702,7 @@ async fn run_inference(
     for entry in all_files.iter().skip(start_idx) {
         if let Ok(content) = fs::read_to_string(&entry.path).await {
             let final_content =
-                if matches!(entry.role, HistoryTurnRole::User) && !entry.metadata_str.is_empty() {
+                if matches!(entry.role, HistoryTurnRole::User) && !entry.metadata_str.is_empty() && config.prepend_file_metadata {
                     format!("{}\n---\n{}", entry.metadata_str, content)
                 } else {
                     content
