@@ -129,90 +129,82 @@ async fn ipc_send_raw(socket: &str, cmd: &Command) -> Result<String, String> {
 
 // ── Telegram API helpers ────────────────────────────────────────────────────
 
-/// Escape Telegram MarkdownV2 special characters with a backslash.
-/// https://core.telegram.org/bots/api#markdownv2-style
-fn escape_markdown_v2(text: &str) -> String {
-    let special = |c: char| -> bool {
-        matches!(
-            c,
-            '_' | '*'
-                | '['
-                | ']'
-                | '('
-                | ')'
-                | '~'
-                | '`'
-                | '>'
-                | '#'
-                | '+'
-                | '-'
-                | '='
-                | '|'
-                | '{'
-                | '}'
-                | '.'
-                | '!'
-                | '\\'
-        )
-    };
-    let mut result = String::with_capacity(text.len() + text.len() / 8);
-    for c in text.chars() {
-        if special(c) {
-            result.push('\\');
-        }
-        result.push(c);
+/// Always-on formatted message helper.  Code fences pass through intact.
+/// The rest is sent as MarkdownV2 (preserving bold/italic/etc.).
+/// On parse error: wraps the plain text inside a single ``` code block
+/// so that raw formatting tags never leak.
+async fn send_message_telegram(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) {
+    if send_message_inner(client, token, chat_id, text, "MarkdownV2").await {
+        return;
     }
-    result
+    // Parse error → wrap entire message in a code block
+    let escaped_text = format!("```\n{text}\n```");
+    if send_message_inner(client, token, chat_id, &escaped_text, "MarkdownV2").await {
+        eprintln!("ag-api-telegram: sendMessage delivered via code-block escape (chat {chat_id})");
+        return;
+    }
+    // Ultimate fallback: plain text
+    let _ = send_message_raw(client, token, chat_id, text, None).await;
+    eprintln!("ag-api-telegram: sendMessage reverted to plain text (chat {chat_id})");
 }
 
-async fn send_message(client: &reqwest::Client, token: &str, chat_id: i64, text: &str) {
-    // Four-tier fallback: Markdown → MarkdownV2 → escaped MarkdownV2 → plain text.
-    let escaped = escape_markdown_v2(text);
-    let candidates: [(&str, Option<&str>); 4] = [
-        (text, Some("Markdown")), // 0. legacy — forgiving, what the model usually works with
-        (text, Some("MarkdownV2")), // 1. strict V2
-        (&escaped, Some("MarkdownV2")), // 2. escaped — guaranteed safe
-        (text, None),             // 3. plain text — last resort
-    ];
-    for (i, (body_text, pmode)) in candidates.iter().enumerate() {
-        let mut body = serde_json::json!({
-            "chat_id": chat_id,
-            "text": body_text,
-        });
-        if let Some(pm) = pmode {
-            body["parse_mode"] = serde_json::Value::String(pm.to_string());
+/// Try to send a message with the given parse_mode.  Returns true on success.
+async fn send_message_inner(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+    parse_mode: &str,
+) -> bool {
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+    });
+    let resp = match client
+        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("ag-api-telegram: sendMessage transport failed (chat {chat_id}): {e}");
+            return false;
         }
-        let resp = match client
-            .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("ag-api-telegram: sendMessage failed (chat {chat_id}): {e}");
-                return;
-            }
-        };
-        if resp.status().is_success() {
-            if i > 0 {
-                eprintln!("ag-api-telegram: sendMessage delivered via tier {i} (chat {chat_id})");
-            }
-            return;
-        }
-        let status = resp.status();
-        let err_body = resp.text().await.unwrap_or_default();
-        let is_parse_fail = err_body.contains("can't parse entities");
-        if !is_parse_fail || i == candidates.len() - 1 {
-            eprintln!(
-                "ag-api-telegram: sendMessage HTTP {status} (chat {chat_id}): {body}",
-                body = err_body.chars().take(500).collect::<String>()
-            );
-        }
-        if !is_parse_fail {
-            return; // non-parse error, don't retry
-        }
+    };
+    resp.status().is_success()
+}
+
+/// Send a message without specifying parse_mode (Telegram sends plain text).
+async fn send_message_raw(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+    parse_mode: Option<&str>,
+) -> bool {
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+    });
+    if let Some(pm) = parse_mode {
+        body["parse_mode"] = serde_json::Value::String(pm.to_string());
     }
+    let Ok(resp) = client
+        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .json(&body)
+        .send()
+        .await
+    else {
+        return false;
+    };
+    resp.status().is_success()
 }
 
 /// Send a message and return the message_id for subsequent edits.
@@ -246,8 +238,8 @@ async fn send_initial_message(
 }
 
 /// Edit an existing message (for progressive streaming updates).
-/// Falls back gracefully on parse errors (same tiered strategy as send_message).
-async fn edit_message_text(
+/// Same strategy as send_message: try MarkdownV2 first, fall back to code-block wrapping.
+async fn edit_message_telegram(
     client: &reqwest::Client,
     token: &str,
     chat_id: i64,
@@ -255,83 +247,112 @@ async fn edit_message_text(
     text: &str,
 ) {
     if text.is_empty() {
-        return; // nothing to edit
+        return;
     }
-    let elapsed = std::time::Instant::now();
-    let escaped = escape_markdown_v2(text);
-    let candidates: [(&str, Option<&str>); 4] = [
-        (text, Some("Markdown")),
-        (text, Some("MarkdownV2")),
-        (&escaped, Some("MarkdownV2")),
-        (text, None),
-    ];
-    for (i, (body_text, pmode)) in candidates.iter().enumerate() {
-        let mut body = serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": body_text,
-        });
-        if let Some(pm) = pmode {
-            body["parse_mode"] = serde_json::Value::String(pm.to_string());
+    if edit_message_inner(client, token, chat_id, message_id, text, "MarkdownV2").await {
+        return;
+    }
+    // Parse error → wrap in code block
+    let escaped_text = format!("```\n{text}\n```");
+    if edit_message_inner(client, token, chat_id, message_id, &escaped_text, "MarkdownV2").await {
+        eprintln!("ag-api-telegram: editMessageText delivered via code-block escape (chat {chat_id})");
+        return;
+    }
+    // Ultimate fallback: plain text
+    let _ = edit_message_raw(client, token, chat_id, message_id, text, None).await;
+    eprintln!("ag-api-telegram: editMessageText reverted to plain text (chat {chat_id})");
+}
+
+/// Try to edit a message with the given parse_mode.  Returns true on success.
+async fn edit_message_inner(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    parse_mode: &str,
+) -> bool {
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+    });
+    let resp = match client
+        .post(format!(
+            "https://api.telegram.org/bot{token}/editMessageText"
+        ))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "ag-api-telegram: editMessageText transport failed (chat {chat_id}, msg {message_id}): {e}"
+            );
+            return false;
         }
-        let resp = match client
-            .post(format!("https://api.telegram.org/bot{token}/editMessageText"))
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+    };
+    let body_text = resp.text().await.unwrap_or_default();
+    match serde_json::from_str::<serde_json::Value>(&body_text) {
+        Ok(v) if v["ok"].as_bool().unwrap_or(false) => true,
+        Ok(v) => {
+            let desc = v["description"].as_str().unwrap_or("unknown error");
+            let is_modified = desc.contains("message is not modified");
+            if is_modified {
+                // identical - not a failure
+                return true;
+            }
+            let is_parse = desc.contains("can't parse entities");
+            if !is_parse {
                 eprintln!(
-                    "ag-api-telegram: editMessageText transport failed (chat {chat_id}, msg {message_id}): {e}"
+                    "ag-api-telegram: editMessageText failed (chat {chat_id}, msg {message_id}): {desc}"
                 );
-                return;
+                return false;
             }
-        };
-        // Telegram always returns HTTP 200 with ok:true/false in the body.
-        // Check the JSON body instead of relying on HTTP status.
-        let body_text = resp.text().await.unwrap_or_default();
-        match serde_json::from_str::<serde_json::Value>(&body_text) {
-            Ok(v) if v["ok"].as_bool().unwrap_or(false) => {
-                if i > 0 {
-                    eprintln!(
-                        "ag-api-telegram: editMessageText delivered via tier {i} (chat {chat_id})"
-                    );
-                }
-                return;
-            }
-            Ok(v) => {
-                let desc = v["description"].as_str().unwrap_or("unknown error");
-                let is_modified = desc.contains("message is not modified");
-                if is_modified {
-                    // Content identical — not an error, just no-op.
-                    return;
-                }
-                let is_parse = desc.contains("can't parse entities");
-                if !is_parse || i == candidates.len() - 1 {
-                    eprintln!(
-                        "ag-api-telegram: editMessageText failed (chat {chat_id}, msg {message_id}, tier {i}): {desc}"
-                    );
-                }
-                if !is_parse {
-                    return;
-                }
-                // Parse error — try next tier.
-            }
-            Err(e) => {
-                eprintln!(
-                    "ag-api-telegram: editMessageText unparseable response (chat {chat_id}): {e} — {body}",
-                    body = &body_text.chars().take(300).collect::<String>()
-                );
-                return;
-            }
+            false // parse error → try next tier
+        }
+        Err(e) => {
+            eprintln!(
+                "ag-api-telegram: editMessageText unparseable response (chat {chat_id}): {e}"
+            );
+            false
         }
     }
-    eprintln!(
-        "ag-api-telegram: editMessageText all tiers exhausted (chat {chat_id}, msg {message_id}, {} chars, took {}ms)",
-        text.len(),
-        elapsed.elapsed().as_millis(),
-    );
+}
+
+/// Edit a message without specifying parse_mode (plain text).
+async fn edit_message_raw(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    parse_mode: Option<&str>,
+) -> bool {
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    });
+    if let Some(pm) = parse_mode {
+        body["parse_mode"] = serde_json::Value::String(pm.to_string());
+    }
+    let Ok(resp) = client
+        .post(format!(
+            "https://api.telegram.org/bot{token}/editMessageText"
+        ))
+        .json(&body)
+        .send()
+        .await
+    else {
+        return false;
+    };
+    let body_text = resp.text().await.unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(&body_text)
+        .map(|v| v["ok"].as_bool().unwrap_or(false))
+        .unwrap_or(false)
 }
 
 /// Read the latest content from the stream output file inside `stream_dir`.
@@ -823,7 +844,7 @@ async fn handle_command(
         _ => "Unknown command. Type /help for available commands.".into(),
     };
 
-    send_message(client, token, chat_id, &response).await;
+    send_message_telegram(client, token, chat_id, &response).await;
 }
 
 // ── Tree display helper ──────────────────────────────────────────────────
@@ -1014,7 +1035,7 @@ async fn main() {
                 // Access control
                 if !state.tg.allowed_users.is_empty() && !state.tg.allowed_users.contains(&user_id)
                 {
-                    send_message(&client, token, chat_id, "Access denied.").await;
+                    send_message_telegram(&client, token, chat_id, "Access denied.").await;
                     continue;
                 }
 
@@ -1065,14 +1086,14 @@ async fn main() {
                     Ok(resp) => {
                         if !resp.ok {
                             let err = resp.error.unwrap_or_else(|| "unknown error".into());
-                            send_message(&client, token, chat_id, &format!("Error: {err}")).await;
+                            send_message_telegram(&client, token, chat_id, &format!("Error: {err}")).await;
                             continue;
                         }
                         // Parse the SessionChatResponse from data
                         let data = match &resp.data {
                             Some(d) => d,
                             None => {
-                                send_message(&client, token, chat_id, "_(empty response)_").await;
+                                send_message_telegram(&client, token, chat_id, "_(empty response)_").await;
                                 continue;
                             }
                         };
@@ -1080,7 +1101,7 @@ async fn main() {
                             match serde_json::from_str(data) {
                                 Ok(r) => r,
                                 Err(e) => {
-                                    send_message(
+send_message_telegram(
                                         &client,
                                         token,
                                         chat_id,
@@ -1124,7 +1145,7 @@ async fn main() {
                                                 "ag-api-telegram: streaming update (chat {chat_id}, {} chars)",
                                                 content.len(),
                                             );
-                                            edit_message_text(
+                                            edit_message_telegram(
                                                 &client,
                                                 token,
                                                 chat_id,
@@ -1167,7 +1188,7 @@ async fn main() {
                             }
                         } else if let Some(reply) = sc_resp.content {
                             // ── Blocking path ───────────────────────────
-                            send_message(&client, token, chat_id, &reply).await;
+                            send_message_telegram(&client, token, chat_id, &reply).await;
                             let mut chats = state.chats.lock().await;
                             if let Some(chat) = chats.get_mut(&chat_id) {
                                 chat.history.push(SessionStep {
@@ -1177,11 +1198,11 @@ async fn main() {
                                 });
                             }
                         } else {
-                            send_message(&client, token, chat_id, "_(empty response)_").await;
+                            send_message_telegram(&client, token, chat_id, "_(empty response)_").await;
                         }
                     }
                     Err(e) => {
-                        send_message(&client, token, chat_id, &format!("IPC error: {e}")).await;
+                        send_message_telegram(&client, token, chat_id, &format!("IPC error: {e}")).await;
                     }
                 }
             }
