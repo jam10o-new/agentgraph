@@ -21,7 +21,7 @@ notify = "6"
 base64 = "0.22"
 walkdir = "2"
 image = "0.25"
-mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs" }
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "47ec459c" }
 either = "1"
 humantime = "2.3.0"
 serde = "1"

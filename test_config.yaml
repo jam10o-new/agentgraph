@@ -1,4 +1,4 @@
 
 models: {}
 agents: {}
-shutdown_on_idle: false
+shutdown_on_idle: ~

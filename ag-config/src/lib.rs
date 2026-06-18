@@ -59,10 +59,32 @@ pub struct ModelConfig {
     /// "merged" (default), "frontloaded", "interleaved", "summarized".
     #[serde(default)]
     pub system_prompt_mode: SystemPromptMode,
+    /// Override the auto-detected model loader type.
+    /// For multimodal models, this maps to mistralrs `MultimodalLoaderType`
+    /// (e.g., "gemma4", "phi3v", "qwen2vl").  When set, bypasses the
+    /// HuggingFace config.json `architectures` field lookup, which is
+    /// useful when HF renamed a class but the underlying architecture
+    /// hasn't changed.
+    #[serde(default)]
+    pub loader_type: Option<String>,
+    /// Enable online calibration for K-quant ISQ types.
+    /// When true (default), the model will:
+    ///   1. Load a previously-saved importance matrix if one exists
+    ///      at ~/.config/agentgraph/imatrix/{alias}.cimatrix
+    ///   2. Begin collecting activation statistics from live inference
+    ///   3. Apply and save the collected imatrix when the model is
+    ///      unloaded due to idle timeout
+    /// Set to false to disable calibration entirely.
+    #[serde(default = "default_calibration_enabled")]
+    pub calibration_enabled: bool,
 }
 
 fn default_max_num_seqs() -> usize {
     32
+}
+
+fn default_calibration_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -118,8 +140,13 @@ fn default_telegram_agent() -> String {
 pub struct Config {
     pub models: HashMap<String, ModelConfig>,
     pub agents: HashMap<String, AgentConfig>,
+    /// When set to a number of seconds, the leader will spawn a cold
+    /// replacement process and exit after all models have been idle
+    /// for at least this long.  The new leader starts with no model
+    /// loaded, loading it on the first request (reducing idle VRAM
+    /// consumption to zero between uses).
     #[serde(default)]
-    pub shutdown_on_idle: bool,
+    pub shutdown_on_idle: Option<u64>,
     #[serde(default)]
     pub model_idle_secs: Option<u64>,
 

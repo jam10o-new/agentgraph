@@ -80,7 +80,6 @@ agents:
     history_limit: 10
     tools: []
     sampling:
-    sampling:
       temperature: 0.7
       top_p: 0.9
       max_len: 1024
@@ -164,4 +163,4 @@ api-telegram:
     "-100987654321": "channel_agent"
 
 # 5. Global Settings
-shutdown_on_idle: false
+shutdown_on_idle: ~

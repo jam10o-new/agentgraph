@@ -41,7 +41,7 @@ pub struct Leader {
     /// the on-disk binary has been replaced (e.g. by a new build)
     /// so the leader can self-restart with the updated version.
     pub binary_mtime: SystemTime,
-    pub model: Option<Arc<mistralrs::Model>>,
+    pub model: Arc<tokio::sync::Mutex<Option<Arc<mistralrs::Model>>>>,
     pub agents: Arc<Mutex<HashMap<String, AgentEntry>>>,
     pub model_access: ModelAccess,
     /// Shared session-tree state accessible via IPC by API frontends.
@@ -53,7 +53,8 @@ impl Leader {
         let model = if config.models.is_empty() {
             None
         } else {
-            Some(Arc::new(load_models(&config.models).await?))
+            // Start cold — model loads on first request.
+            None
         };
 
         let binary_mtime = std::env::current_exe()
@@ -66,7 +67,7 @@ impl Leader {
             config: Arc::new(Mutex::new(config)),
             config_path,
             binary_mtime,
-            model,
+            model: Arc::new(tokio::sync::Mutex::new(model)),
             agents: Arc::new(Mutex::new(HashMap::new())),
             model_access: ModelAccess::default(),
             sessions: Arc::new(RemoteSessionState::new()),
@@ -93,10 +94,19 @@ impl Leader {
             }
         }
 
-        let model = self
-            .model
-            .as_ref()
-            .ok_or_else(|| anyhow!("No models loaded in leader. Cannot spawn agent {}.", name))?;
+        // Lazy-load the model if it hasn't been loaded yet (cold start).
+        let model = {
+            let mut model_guard = self.model.lock().await;
+            if let Some(ref m) = *model_guard {
+                m.clone()
+            } else {
+                println!("Model not yet loaded — loading now for agent '{}'...", name);
+                let cfg = self.config.lock().await;
+                let loaded = Arc::new(load_models(&cfg.models).await?);
+                *model_guard = Some(loaded.clone());
+                loaded
+            }
+        };
 
         let sampling = SamplingParams {
             temperature: agent_config.sampling.temperature,
@@ -277,6 +287,13 @@ impl Leader {
                     .spawn();
             }
         }
+    }
+
+    fn shutdown_on_idle() {
+        let _ = std::fs::remove_file(LEADER_PID_FILE);
+        // Exit so systemd restarts us fresh with zero VRAM.
+        // The new leader starts cold (model loads on first request).
+        std::process::exit(0);
     }
 
     /// Process a single pending command (called on startup after a restart).
@@ -594,11 +611,19 @@ impl Leader {
             }
         }
 
-        let model_arc = self
-            .model
-            .as_ref()
-            .ok_or_else(|| anyhow!("no model loaded"))?
-            .clone();
+        let model_arc = {
+            let mut model_guard = self.model.lock().await;
+            if let Some(ref m) = *model_guard {
+                m.clone()
+            } else {
+                // Cold start — load on first session chat.
+                println!("Model not yet loaded — loading now...");
+                let cfg = self.config.lock().await;
+                let loaded = Arc::new(load_models(&cfg.models).await?);
+                *model_guard = Some(loaded.clone());
+                loaded
+            }
+        };
 
         let sampling = SamplingParams {
             temperature: isolated_config.sampling.temperature,
@@ -898,10 +923,98 @@ impl Leader {
         let pipe_path_clone = pipe_path.clone();
 
         let agents = self.agents.clone();
-        let model_opt = self.model.clone();
+        let model_lock = self.model.clone();
         let config_mutex = self.config.clone();
         let sessions = self.sessions.clone();
         let leader_for_ipc = Arc::new(self);
+
+        // ── 5a. Idle model unload watchdog ───────────────────────────
+        //
+        // Periodically checks whether each model alias has been unused for
+        // `model_idle_secs` seconds.  If so, calls `model.unload_model(alias)`
+        // which frees GPU/CPU memory while preserving the loader config.
+        // mistralrs auto-reloads the model on the next inference request.
+        //
+        // Also checks `shutdown_on_idle`: when ALL tracked aliases have been
+        // idle for that many seconds, spawns a cold replacement leader and
+        // exits so the new process starts with zero VRAM.
+        //
+        // Enabled when `model_idle_secs` is set to a non-zero value in config.
+        {
+            let leader = leader_for_ipc.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+
+                    let (model_idle_secs, shutdown_idle_secs) = {
+                        let cfg = leader.config.lock().await;
+                        (cfg.model_idle_secs, cfg.shutdown_on_idle)
+                    };
+
+                    let now = tokio::time::Instant::now();
+                    let access = leader.model_access.last_access.read().await;
+                    let idle_aliases: Vec<String> = access
+                        .iter()
+                        .filter(|(_alias, last)| {
+                            now.saturating_duration_since(**last)
+                                >= Duration::from_secs(model_idle_secs.unwrap_or(u64::MAX))
+                        })
+                        .map(|(alias, _last)| alias.clone())
+                        .collect();
+                    let any_access = !access.is_empty();
+                    let idle_durs: Vec<_> = access
+                        .values()
+                        .map(|last| now.saturating_duration_since(*last))
+                        .collect();
+                    drop(access);
+                    let all_idle =
+                        any_access && idle_durs.iter().all(|d| *d >= Duration::from_secs(shutdown_idle_secs.unwrap_or(u64::MAX)));
+
+                    // ── Model-level unload ───────────────────────────
+                    if let Some(idle_secs) = model_idle_secs {
+                        for alias in &idle_aliases {
+                            let mut model_guard = leader.model.lock().await;
+                            if let Some(ref model) = *model_guard {
+                                if model.is_model_loaded(alias).unwrap_or(false) {
+                                    match model.unload_model(alias) {
+                                        Ok(()) => {
+                                            println!(
+                                                "Model '{}' idle for >= {}s — unloaded",
+                                                alias, idle_secs
+                                            );
+                                            if let Ok(cfg) =
+                                                model.config_with_model(Some(alias))
+                                            {
+                                                let _ = cfg.device.synchronize();
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Failed to unload model '{}': {e}",
+                                                alias
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Leader-level idle shutdown ───────────────────
+                    if let Some(shutdown_secs) = shutdown_idle_secs {
+                        if any_access && all_idle {
+                            println!(
+                                "All models idle for >= {}s — shutting down (systemd will restart)",
+                                shutdown_secs
+                            );
+
+                            Leader::shutdown_on_idle();
+                            return; // exit the watchdog task (leader process exits)
+                        }
+                    }
+                }
+            });
+        }
 
         // Accept loop — polls the shared listener; handles None (during
         // socket recovery) by sleeping briefly and retrying.
@@ -931,7 +1044,7 @@ impl Leader {
                     };
 
                     let agents = agents.clone();
-                    let model_opt = model_opt.clone();
+                    let model_lock = model_lock.clone();
                     let _config_mutex = config_mutex.clone();
                     let leader = leader_for_ipc.clone();
                     let sessions = sessions.clone();
@@ -1066,10 +1179,11 @@ impl Leader {
                                     }
                                     Command::Status => {
                                         let agents_map = agents.lock().await;
+                                        let model_loaded = model_lock.lock().await.is_some();
                                         let status = format!(
                                             "Active Agents: {:?}\nModels Loaded: {}",
                                             agents_map.keys().collect::<Vec<_>>(),
-                                            model_opt.is_some()
+                                            model_loaded
                                         );
                                         let _ = stream.write_all(status.as_bytes()).await;
                                     }

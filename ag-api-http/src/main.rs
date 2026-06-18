@@ -9,8 +9,8 @@ use ag_utils::find_leader_socket;
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use clap::Parser;
@@ -193,10 +193,56 @@ async fn list_models(
     }))
 }
 
+/// Build an SSE response that delivers the full content as a single chunk.
+/// This satisfies clients that request `stream: true` without requiring
+/// token-by-token streaming from the leader.
+fn sse_chunk_response(id: &str, created: u64, model: &str, content: &str) -> Response {
+    let content_event = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "content": content
+            },
+            "finish_reason": null
+        }]
+    });
+
+    let stop_event = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    });
+
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        content_event, stop_event
+    );
+
+    let mut response = Response::new(axum::body::Body::from(body));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+    response
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<axum::response::Response, StatusCode> {
+) -> Result<Response, StatusCode> {
     let start_time = SystemTime::now();
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = start_time
@@ -214,60 +260,64 @@ async fn chat_completions(
         })
         .collect();
 
-    // Check if leader socket is available
-    let leader_ready = find_leader_socket().await.is_some();
+    if find_leader_socket().await.is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
 
-    if leader_ready {
-        let cmd = Command::SessionChat {
-            session_id: format!("http-{}", req.model),
-            steps,
-            model: req.model.clone(),
-            stream: req.stream,
-        };
+    // Always force non-streaming to the leader so we get the full content.
+    // If the client requested streaming we wrap it in SSE ourselves.
+    let cmd = Command::SessionChat {
+        session_id: format!("http-{}", req.model),
+        steps,
+        model: req.model.clone(),
+        stream: false,
+    };
 
-        match ipc(&state.socket, &cmd).await {
-            Ok(resp) => {
-                if resp.ok {
-                    // Parse the SessionChatResponse from the IPC response
-                    let sc_resp: SessionChatResponse = resp
-                        .data
-                        .as_deref()
-                        .and_then(|d| serde_json::from_str(d).ok())
-                        .unwrap_or_else(|| SessionChatResponse {
-                            ok: true,
-                            content: resp.data.clone(),
-                            stream_path: None,
-                            error: None,
-                        });
-                    let content = sc_resp.content.unwrap_or_default();
-
-                    Ok(Json(ChatCompletionResponse {
-                        id,
-                        object: "chat.completion".into(),
-                        created,
-                        model: req.model,
-                        choices: vec![Choice {
-                            index: 0,
-                            message: MessageResponse {
-                                role: "assistant".into(),
-                                content,
-                            },
-                            finish_reason: "stop".into(),
-                        }],
-                    })
-                    .into_response())
-                } else {
-                    let _err = resp.error.unwrap_or_else(|| "unknown error".into());
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
-            Err(e) => {
-                eprintln!("IPC error: {e}");
-                Err(StatusCode::SERVICE_UNAVAILABLE)
-            }
+    let resp = match ipc(&state.socket, &cmd).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("IPC error: {e}");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
+    };
+
+    if !resp.ok {
+        let err_msg = resp.error.unwrap_or_else(|| "unknown error".into());
+        eprintln!("chat error: {err_msg}");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let sc_resp: SessionChatResponse = resp
+        .data
+        .as_deref()
+        .and_then(|d| serde_json::from_str(d).ok())
+        .unwrap_or_else(|| SessionChatResponse {
+            ok: true,
+            content: resp.data.clone(),
+            stream_path: None,
+            error: None,
+        });
+
+    let content = sc_resp.content.unwrap_or_default();
+
+    if req.stream {
+        Ok(sse_chunk_response(&id, created, &req.model, &content))
     } else {
-        Err(StatusCode::SERVICE_UNAVAILABLE)
+        Ok(Json(ChatCompletionResponse {
+            id,
+            object: "chat.completion".into(),
+            created,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: MessageResponse {
+                    role: "assistant".into(),
+                    content,
+                },
+                finish_reason: "stop".into(),
+            }],
+        })
+        .into_response())
     }
 }
 

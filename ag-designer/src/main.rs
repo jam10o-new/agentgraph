@@ -513,7 +513,7 @@ struct SnarlApp {
     style: SnarlStyle,
     hf_models: Vec<String>,
     status: String,
-    shutdown_on_idle: bool,
+    shutdown_on_idle: u64,
 }
 
 impl SnarlApp {
@@ -523,7 +523,7 @@ impl SnarlApp {
             style: SnarlStyle::new(),
             hf_models: scan_hf_cache(),
             status: "Ready".to_string(),
-            shutdown_on_idle: false,
+            shutdown_on_idle: 0,
         }
     }
 
@@ -531,7 +531,11 @@ impl SnarlApp {
         let mut config = Config {
             models: HashMap::new(),
             agents: HashMap::new(),
-            shutdown_on_idle: self.shutdown_on_idle,
+            shutdown_on_idle: if self.shutdown_on_idle > 0 {
+                Some(self.shutdown_on_idle)
+            } else {
+                None
+            },
             model_idle_secs: None,
             plugins: HashMap::new(),
         };
@@ -637,7 +641,7 @@ impl SnarlApp {
         {
             let config = Config::load(&path)?;
             self.snarl = Snarl::new();
-            self.shutdown_on_idle = config.shutdown_on_idle;
+            self.shutdown_on_idle = config.shutdown_on_idle.unwrap_or(0);
 
             let mut model_alias_to_id = HashMap::new();
             let mut agent_name_to_id = HashMap::new();
@@ -753,6 +757,9 @@ impl eframe::App for SnarlApp {
                                 builder: "vision".to_string(),
                                 chat_template: None,
                                 max_num_seqs: 32,
+                                system_prompt_mode: Default::default(),
+                                loader_type: None,
+                                calibration_enabled: true,
                             },
                         },
                     );
@@ -796,7 +803,12 @@ impl eframe::App for SnarlApp {
                 }
 
                 ui.separator();
-                ui.checkbox(&mut self.shutdown_on_idle, "Shutdown on Idle");
+                ui.label("Shutdown on Idle (s):");
+                ui.add(
+                    egui::DragValue::new(&mut self.shutdown_on_idle)
+                        .speed(10.0)
+                        .range(0..=86400),
+                );
                 ui.separator();
                 if ui.button("🚀 Spawn").clicked() {
                     let config = self.export_config();

@@ -206,19 +206,28 @@ async fn main() -> Result<()> {
 
     // Check if we are already in the background
     if std::env::var("AGENTGRAPH_BACKGROUND").is_ok() {
-        if let Commands::Leader { config, pending_command } = cli.command {
+        if let Commands::Leader {
+            config,
+            pending_command,
+            ..
+        } = cli.command
+        {
             let resolved = resolve_config_path(config.as_deref());
             let config_obj = Config::load(&resolved)?;
             let config_path = std::path::absolute(&resolved)
                 .unwrap_or_else(|_| std::path::PathBuf::from(&resolved));
-            let leader = Leader::new(config_obj, config_path.to_string_lossy().to_string()).await?;
+            let leader = Leader::new(config_obj, config_path.to_string_lossy().to_string())
+                .await?;
             leader.run(pending_command).await?;
             return Ok(());
         }
     }
 
     match cli.command {
-        Commands::Leader { config, .. } => {
+        Commands::Leader {
+            config,
+            pending_command: _,
+        } => {
             let resolved = resolve_config_path(config.as_deref());
             match is_leader_alive().await {
                 LeaderStatus::Ready { .. } => {

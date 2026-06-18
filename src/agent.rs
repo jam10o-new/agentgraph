@@ -907,6 +907,26 @@ async fn run_inference(
         }
     }
 
+    // Check if the model supports audio — if not, drop audio inputs
+    // so they don't trigger a processor-level error downstream.
+    if !audios.is_empty() {
+        let cfg = model.config_with_model(Some(&config.model)).ok();
+        let supports_audio = cfg
+            .as_ref()
+            .and_then(|c| Some(c.modalities.input.contains(&mistralrs::core::SupportedModality::Audio)))
+            .unwrap_or(false);
+        if !supports_audio {
+            logger
+                .log(&format!(
+                    "Model '{}' does not support audio — dropping {} audio input(s)",
+                    config.model,
+                    audios.len()
+                ))
+                .await;
+            audios.clear();
+        }
+    }
+
     let effective_user_text =
         if latest_user_input.is_empty()
             && (!images.is_empty() || !audios.is_empty() || !videos.is_empty())
