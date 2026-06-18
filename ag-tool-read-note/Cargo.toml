@@ -1,0 +1,14 @@
+[package]
+name = "ag-tool-read-note"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ag-tool-read-note"
+path = "src/main.rs"
+
+[dependencies]
+ag-tool-common = { path = "../ag-tool-common" }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "macros", "io-util", "fs"] }

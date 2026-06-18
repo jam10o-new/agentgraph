@@ -323,12 +323,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "ag-tool-mcp-bridge"
+version = "0.1.0"
+dependencies = [
+ "ag-tool-common",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ag-tool-read"
 version = "0.1.0"
 dependencies = [
  "ag-tool-common",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ag-tool-read-note"
+version = "0.1.0"
+dependencies = [
+ "ag-tool-common",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -348,6 +368,16 @@ dependencies = [
  "ag-ipc",
  "ag-tool-common",
  "ag-utils",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "ag-tool-write-note"
+version = "0.1.0"
+dependencies = [
+ "ag-tool-common",
  "serde",
  "serde_json",
  "tokio",

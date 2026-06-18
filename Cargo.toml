@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "ag-designer", "ag-config", "ag-ipc", "ag-api-http", "ag-api-telegram", "ag-api-debug-ui", "ag-api-bluesky", "ag-api-matrix", "ag-api-signal", "ag-api-whatsapp", "ag-utils", "ag-tool-common", "ag-tool-read", "ag-tool-bash", "ag-tool-ls", "ag-tool-skills", "ag-tool-load-skill", "ag-tool-loadctx", "ag-tool-spawn"]
+members = [".", "ag-designer", "ag-config", "ag-ipc", "ag-api-http", "ag-api-telegram", "ag-api-debug-ui", "ag-api-bluesky", "ag-api-matrix", "ag-api-signal", "ag-api-whatsapp", "ag-utils", "ag-tool-common", "ag-tool-read", "ag-tool-bash", "ag-tool-ls", "ag-tool-skills", "ag-tool-load-skill", "ag-tool-loadctx", "ag-tool-spawn", "ag-tool-write-note", "ag-tool-read-note", "ag-tool-mcp-bridge"]
 
 [package]
 name = "agentgraph"
