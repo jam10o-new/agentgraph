@@ -1393,7 +1393,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://github.com/huggingface/candle.git?rev=e020e8a#e020e8a42766c497c795c29df25c2ba2ef0e1480"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -1423,20 +1423,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "candle-flash-attn"
-version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
-dependencies = [
- "anyhow",
- "candle-core",
- "cudaforge",
- "half",
-]
-
-[[package]]
 name = "candle-kernels"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://github.com/huggingface/candle.git?rev=e020e8a#e020e8a42766c497c795c29df25c2ba2ef0e1480"
 dependencies = [
  "cudaforge",
 ]
@@ -1444,7 +1433,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://github.com/huggingface/candle.git?rev=e020e8a#e020e8a42766c497c795c29df25c2ba2ef0e1480"
 dependencies = [
  "block2 0.6.2",
  "half",
@@ -1459,7 +1448,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://github.com/huggingface/candle.git?rev=e020e8a#e020e8a42766c497c795c29df25c2ba2ef0e1480"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -1478,7 +1467,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://github.com/huggingface/candle.git?rev=e020e8a#e020e8a42766c497c795c29df25c2ba2ef0e1480"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -4921,8 +4910,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs"
-version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=47ec459c#47ec459cbd6d5b0d6c9035bb79d8cf1e37ee14a0"
+version = "0.8.21"
+source = "git+https://github.com/EricLBuehler/mistral.rs#3ee69a72bb1b80d4ae14263905babe7cd7a831ea"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -4948,8 +4937,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-audio"
-version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=47ec459c#47ec459cbd6d5b0d6c9035bb79d8cf1e37ee14a0"
+version = "0.8.21"
+source = "git+https://github.com/EricLBuehler/mistral.rs#3ee69a72bb1b80d4ae14263905babe7cd7a831ea"
 dependencies = [
  "anyhow",
  "apodize",
@@ -4959,8 +4948,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=47ec459c#47ec459cbd6d5b0d6c9035bb79d8cf1e37ee14a0"
+version = "0.8.21"
+source = "git+https://github.com/EricLBuehler/mistral.rs#3ee69a72bb1b80d4ae14263905babe7cd7a831ea"
 dependencies = [
  "ahash",
  "akin",
@@ -4973,7 +4962,6 @@ dependencies = [
  "bytemuck",
  "bytemuck_derive",
  "candle-core",
- "candle-flash-attn",
  "candle-metal-kernels",
  "candle-nn",
  "cfgrammar",
@@ -5006,6 +4994,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "mistralrs-audio",
+ "mistralrs-flash-attn",
  "mistralrs-mcp",
  "mistralrs-paged-attn",
  "mistralrs-quant",
@@ -5059,9 +5048,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mistralrs-flash-attn"
+version = "0.8.21"
+source = "git+https://github.com/EricLBuehler/mistral.rs#3ee69a72bb1b80d4ae14263905babe7cd7a831ea"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "cudaforge",
+ "half",
+]
+
+[[package]]
 name = "mistralrs-macros"
-version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=47ec459c#47ec459cbd6d5b0d6c9035bb79d8cf1e37ee14a0"
+version = "0.8.21"
+source = "git+https://github.com/EricLBuehler/mistral.rs#3ee69a72bb1b80d4ae14263905babe7cd7a831ea"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -5071,8 +5071,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-mcp"
-version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=47ec459c#47ec459cbd6d5b0d6c9035bb79d8cf1e37ee14a0"
+version = "0.8.21"
+source = "git+https://github.com/EricLBuehler/mistral.rs#3ee69a72bb1b80d4ae14263905babe7cd7a831ea"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5092,8 +5092,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-paged-attn"
-version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=47ec459c#47ec459cbd6d5b0d6c9035bb79d8cf1e37ee14a0"
+version = "0.8.21"
+source = "git+https://github.com/EricLBuehler/mistral.rs#3ee69a72bb1b80d4ae14263905babe7cd7a831ea"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -5109,8 +5109,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-quant"
-version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=47ec459c#47ec459cbd6d5b0d6c9035bb79d8cf1e37ee14a0"
+version = "0.8.21"
+source = "git+https://github.com/EricLBuehler/mistral.rs#3ee69a72bb1b80d4ae14263905babe7cd7a831ea"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -5119,10 +5119,12 @@ dependencies = [
  "cudaforge",
  "dispatch2",
  "float8",
+ "futures",
  "half",
  "hf-hub",
  "indicatif 0.18.4",
  "lazy_static",
+ "libc",
  "memmap2",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
@@ -5140,8 +5142,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-sandbox"
-version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=47ec459c#47ec459cbd6d5b0d6c9035bb79d8cf1e37ee14a0"
+version = "0.8.21"
+source = "git+https://github.com/EricLBuehler/mistral.rs#3ee69a72bb1b80d4ae14263905babe7cd7a831ea"
 dependencies = [
  "anyhow",
  "itoa",
@@ -5157,8 +5159,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-vision"
-version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=47ec459c#47ec459cbd6d5b0d6c9035bb79d8cf1e37ee14a0"
+version = "0.8.21"
+source = "git+https://github.com/EricLBuehler/mistral.rs#3ee69a72bb1b80d4ae14263905babe7cd7a831ea"
 dependencies = [
  "candle-core",
  "image",
