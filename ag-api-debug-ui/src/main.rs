@@ -268,6 +268,7 @@ async fn session_chat(
             steps,
             model: "api".to_string(),
             stream: false,
+            enable_thinking: None,
         },
     )
     .await

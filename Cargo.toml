@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "ag-designer", "ag-config", "ag-ipc", "ag-api-http", "ag-api-telegram", "ag-api-debug-ui", "ag-api-bluesky", "ag-api-matrix", "ag-api-signal", "ag-api-whatsapp", "ag-utils", "ag-tool-common", "ag-tool-read", "ag-tool-bash", "ag-tool-ls", "ag-tool-skills", "ag-tool-load-skill", "ag-tool-loadctx", "ag-tool-spawn", "ag-tool-write-note", "ag-tool-read-note", "ag-tool-mcp-bridge"]
+members = [".", "ag-designer", "ag-config", "ag-ipc", "ag-api-http", "ag-api-telegram", "ag-api-debug-ui", "ag-api-bluesky", "ag-api-matrix", "ag-api-signal", "ag-api-whatsapp", "ag-utils", "ag-tool-common", "ag-tool-read", "ag-tool-bash", "ag-tool-ls", "ag-tool-skills", "ag-tool-load-skill", "ag-tool-loadctx", "ag-tool-spawn", "ag-tool-write-note", "ag-tool-read-note", "ag-tool-mcp-bridge", "ag-tool-generate", "ag-tool-remote-contacts", "ag-provider-types", "ag-provider-openai", "ag-provider-common", "ag-provider-python", "ag-provider-mistralrs"]
 
 [package]
 name = "agentgraph"
@@ -18,44 +18,37 @@ path = "src/bin/ag.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 notify = "6"
-base64 = "0.22"
+cpal = { version = "0.18", features = ["pipewire"], git = "https://github.com/RustAudio/cpal", optional = true }
 walkdir = "2"
 image = "0.25"
-mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs" }
 either = "1"
 humantime = "2.3.0"
 serde = "1"
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros", "process"] }
 rand = { version = "0.10.0" }
 chrono = { version = "0.4.44", features = ["serde"] }
 futures = "0.3.32"
-cpal = { version = "0.18", features = ["pipewire"], git = "https://github.com/RustAudio/cpal" }
 flume = "0.12.0"
 bytemuck = "1.25.0"
-bitflags = "2.11.0"
 serde_yaml = "0.9.34"
 ag-config = { path = "ag-config" }
 ag-ipc = { path = "ag-ipc" }
 ag-utils = { path = "ag-utils" }
+ag-provider-types = { path = "ag-provider-types" }
+ag-provider-openai = { path = "ag-provider-openai" }
+ag-provider-common = { path = "ag-provider-common" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 hound = "3.5.1"
 uuid = { version = "1", features = ["v4"] }
 which = "7"
+async-trait = "0.1"
+tokio-stream = "0.1"
 
 [features]
-default = ["cuda", "cudnn", "flash-attn"]
-cuda = ["mistralrs/cuda"]
-cudnn = ["mistralrs/cudnn"]
-metal = ["mistralrs/metal"]
-flash-attn = ["mistralrs/flash-attn"]
-accelerate = ["mistralrs/accelerate"]
-mkl = ["mistralrs/mkl"]
-nccl = ["mistralrs/nccl"]
-ring = ["mistralrs/ring"]
-
+audio = ["cpal"]
 [dev-dependencies]
 chrono = { version = "0.4.44", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "macros"] }

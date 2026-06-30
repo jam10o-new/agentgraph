@@ -15,9 +15,9 @@
 # 1. Model Definitions
 models:
   primary:
-    id: "gemma-4-E4B"
+    id: "gemma4-12B"
     builder: "vision"
-    path: "google/gemma-4-E4B-it"
+    path: "google/gemma-4-12B-it"
     isq: "4"
     # Optional: Path to a .json chat template or a literal Jinja string, which overrides any provided template.
     # Defaults to model-provided if available.
@@ -83,6 +83,24 @@ agents:
       temperature: 0.7
       top_p: 0.9
       max_len: 1024
+
+  # Example: thinking agent with chain-of-thought / extended reasoning enabled.
+  # This agent has no tools; it's useful for validation and testing reasoning.
+  thinker:
+    inputs:
+      - "agents/thinker/input"
+    output: "agents/thinker/output"
+    stream_output: "agents/thinker/stream"
+    system:
+      - "agents/thinker/system"
+    model: "primary"
+    enable_thinking: true
+    history_limit: 10
+    tools: []
+    sampling:
+      temperature: 0.7
+      top_p: 0.9
+      max_len: 2048
 
   # Example: pure tool-execution agent (no output files at all, just runs tools)
   tool_runner:

@@ -1,21 +1,22 @@
+#[cfg(feature = "audio")]
 use crate::audio::AudioListener;
 use crate::config::{AgentConfig, Config, SystemPromptMode};
 use crate::context::{CompressionManager, HistoryTurn, HistoryTurnRole, extract_frontmatter};
-use crate::ipc::Command;
-use crate::leader::ModelAccess;
+use crate::inference_provider::{
+    ChatMessage, ChatRequest, GuidanceConstraint, InferenceProvider, ProviderEvent, Role,
+    SamplingConfig as ProviderSamplingConfig, ToolCall, ToolCallDelta, ToolChoice as ProviderToolChoice,
+    ToolDef,
+};
+use crate::ipc::{Command, HeavyToolState};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
 use crate::utils::AgentLogger;
 use crate::utils::find_leader_socket;
 use anyhow::{Context, Result, anyhow};
-use mistralrs::{
-    AudioInput, Constraint, Function, Model, MultimodalMessages, RequestBuilder, Response,
-    SamplingParams, TextMessageRole, Tool, ToolCallResponse, ToolChoice, ToolType, VideoInput,
-};
 use notify::{Event, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,12 +41,10 @@ pub struct Agent {
     pub name: String,
     pub config: AgentConfig,
     pub global_config: Config,
-    pub model: Arc<Model>,
-    pub sampling: SamplingParams,
-    pub volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
+    pub volatile_context: Arc<Mutex<Vec<(Role, String)>>>,
     pub output_forwarder: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
     pub logger: AgentLogger,
-    pub model_access: ModelAccess,
+    pub provider: Arc<dyn InferenceProvider>,
 }
 
 impl Agent {
@@ -53,22 +52,19 @@ impl Agent {
         name: String,
         config: AgentConfig,
         global_config: Config,
-        model: Arc<Model>,
-        sampling: SamplingParams,
-        model_access: ModelAccess,
+        provider: Arc<dyn InferenceProvider>,
     ) -> Self {
         Self {
             name: name.clone(),
             config,
             global_config,
-            model,
-            sampling,
             volatile_context: Arc::new(Mutex::new(Vec::new())),
             output_forwarder: Arc::new(Mutex::new(None)),
             logger: AgentLogger::new(&name),
-            model_access,
+            provider,
         }
     }
+
 
     pub async fn run_loop(&self) -> Result<()> {
         let (tx, mut rx) = mpsc::channel(100);
@@ -116,6 +112,7 @@ impl Agent {
             .log(&format!("Watching inputs: {:?}", canonical_inputs))
             .await;
 
+        #[cfg(feature = "audio")]
         if self.config.realtime_audio {
             let listener = AudioListener::new(self.name.clone(), canonical_inputs[0].clone());
             tokio::spawn(async move {
@@ -160,22 +157,23 @@ impl Agent {
                     }
                     self.logger.log("Triggering inference after debounce").await;
 
-                    let model = self.model.clone();
                     let config = self.config.clone();
                     let global_config = self.global_config.clone();
-                    let sampling = self.sampling.clone();
                     let agent_name = name.clone();
                     let log_name = name.clone();
                     let volatile_context = self.volatile_context.clone();
                     let forwarder = self.output_forwarder.clone();
                     let logger = AgentLogger::new(&name);
-                    let model_access = self.model_access.clone();
                     let done_tx = inference_done_tx.clone();
 
                     inference_in_progress = true;
                     retrigger_pending = false;
+
+                    let provider = self.provider.clone();
                     tokio::spawn(async move {
-                        let result = run_inference(agent_name, model, config, global_config, sampling, volatile_context, logger, model_access).await;
+                        let result = run_inference_with_provider(
+                            agent_name, provider, config, global_config, volatile_context, logger,
+                        ).await;
                         match result {
                             Ok(content) => {
                                 if let Some(tx) = forwarder.lock().await.take() {
@@ -201,21 +199,22 @@ impl Agent {
                         while let Ok(_) = rx.try_recv() {}
                         self.logger.log("Retriggering inference for pending input").await;
 
-                        let model = self.model.clone();
                         let config = self.config.clone();
                         let global_config = self.global_config.clone();
-                        let sampling = self.sampling.clone();
                         let agent_name = name.clone();
                         let log_name = name.clone();
                         let volatile_context = self.volatile_context.clone();
                         let forwarder = self.output_forwarder.clone();
                         let logger = AgentLogger::new(&name);
                         let done_tx = inference_done_tx.clone();
-                        let ma = self.model_access.clone();
 
                         inference_in_progress = true;
+
+                        let provider = self.provider.clone();
                         tokio::spawn(async move {
-                            let result = run_inference(agent_name, model, config, global_config, sampling, volatile_context, logger, ma).await;
+                            let result = run_inference_with_provider(
+                                agent_name, provider, config, global_config, volatile_context, logger,
+                            ).await;
                             match result {
                                 Ok(content) => {
                                     if let Some(tx) = forwarder.lock().await.take() {
@@ -242,6 +241,8 @@ struct FileEntry {
     role: HistoryTurnRole,
     metadata_str: String,
     excluded: bool,
+    /// For Tool-role entries, the tool_call_id parsed from the filename.
+    tool_call_id: Option<String>,
 }
 
 fn format_file_metadata(path: &Path, metadata: &std::fs::Metadata) -> String {
@@ -263,28 +264,17 @@ fn format_file_metadata(path: &Path, metadata: &std::fs::Metadata) -> String {
 
 /// Heuristic to detect OOM-like errors from their string representation.
 /// Matches common patterns from CUDA, Metal, and general allocation failures.
-fn looks_like_oom(err_str: &str) -> bool {
-    let lower = err_str.to_lowercase();
-    lower.contains("out of memory")
-        || lower.contains("oom")
-        || lower.contains("allocation failed")
-        || lower.contains("not enough memory")
-        || lower.contains("cuda error")
-        || lower.contains("metal error")
-        || lower.contains("cannot allocate")
-        || lower.contains("memory exhausted")
-}
 
 /// Parsed output schema from a `.schema-{format}.{ext}[@{constraint}]`
 /// file in the system directory. The `{ext}` is the output file extension.
 /// The optional `@{constraint}` suffix overrides the constraint type:
 ///
-/// | Constraint | Meaning                |
+/// | GuidanceConstraint | Meaning                |
 /// |------------|------------------------|
-/// | `json`     | `Constraint::JsonSchema` (default for .json) |
-/// | `lark`     | `Constraint::Lark`     |
-/// | `regex`    | `Constraint::Regex`    |
-/// | `llg`      | `Constraint::Llguidance` |
+/// | `json`     | `GuidanceConstraint::JsonSchema` (default for .json) |
+/// | `lark`     | `GuidanceConstraint::Lark`     |
+/// | `regex`    | `GuidanceConstraint::Regex`    |
+/// | `llg`      | `GuidanceConstraint::Llguidance` |
 ///
 /// Examples:
 /// - `.schema-rating.json` → JsonSchema, output `rating_N.json`
@@ -294,7 +284,7 @@ fn looks_like_oom(err_str: &str) -> bool {
 struct OutputSchema {
     format_str: String,
     extension: String,
-    constraint: Constraint,
+    constraint: GuidanceConstraint,
 }
 
 /// Intermediate parse result before reading the file content.
@@ -370,1053 +360,12 @@ fn count_matching_files(dir: &str, format_str: &str, extension: &str) -> usize {
     count
 }
 
-async fn run_inference(
-    _name: String,
-    model: Arc<Model>,
-    config: AgentConfig,
-    global_config: Config,
-    sampling: SamplingParams,
-    volatile_context: Arc<Mutex<Vec<(TextMessageRole, String)>>>,
-    logger: AgentLogger,
-    model_access: ModelAccess,
-) -> Result<String> {
-    logger.log("Starting inference turn").await;
-
-    // Resolve system prompt mode: agent override > model config > Merged
-    let system_mode = config
-        .system_prompt_mode
-        .clone()
-        .or_else(|| {
-            global_config
-                .models
-                .get(&config.model)
-                .map(|m| m.system_prompt_mode.clone())
-        })
-        .unwrap_or_default();
-
-    // Mark model as recently accessed so the idle eviction timer knows it's in use.
-    model_access.touch(&config.model).await;
-
-    // 1. Collate all files (system, input, output, tool) into a unified
-    // list, then apply system_prompt_mode to determine system entry placement.
-    //
-    // Schema detection still scans system dirs for .schema-* files; those
-    // are never treated as prompt content.
-
-    let mut output_schema: Option<OutputSchema> = None;
-    let mut schema_file_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-
-    // ── 1a. Schema detection ──────────────────────────────────────────
-    for sys_dir in &config.system {
-        if let Ok(mut entries) = fs::read_dir(sys_dir).await {
-            while let Some(entry) = entries.next_entry().await? {
-                let name_str = entry.file_name().to_string_lossy().to_string();
-                if let Some(parsed) = ParsedSchemaName::try_parse(&name_str) {
-                    schema_file_names.insert(name_str.clone());
-                    if let Ok(content) = fs::read_to_string(entry.path()).await {
-                        let constraint_type =
-                            parsed.constraint_hint.as_deref().unwrap_or_else(|| {
-                                if parsed.extension == "json" { "json" } else { "" }
-                            });
-                        let constraint = match constraint_type {
-                            "json" => serde_json::from_str::<serde_json::Value>(&content)
-                                .map(Constraint::JsonSchema),
-                            "lark" => Ok(Constraint::Lark(content)),
-                            "regex" => Ok(Constraint::Regex(content)),
-                            "llg" => serde_json::from_str(&content).map(Constraint::Llguidance),
-                            _ => continue,
-                        };
-                        if let Ok(c) = constraint {
-                            logger.log(&format!(
-                                "Loaded output schema: .schema-{}.{}",
-                                parsed.format_str, parsed.extension
-                            )).await;
-                            output_schema = Some(OutputSchema {
-                                format_str: parsed.format_str,
-                                extension: parsed.extension,
-                                constraint: c,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ── 1b. Tool discovery ────────────────────────────────────────────
-    let mut tool_registry: Option<ToolRegistry> = None;
-    let mut tools = vec![];
-    let mut tool_guidance = String::new();
-    if !config.tools.is_empty() && output_schema.is_none() {
-        match discover_tools(&config.tools, &logger).await {
-            Ok(registry) => {
-                if !registry.guidance.is_empty() {
-                    tool_guidance.push_str("== Tool Usage Guidance ==\n");
-                    tool_guidance.push_str(&registry.guidance);
-                }
-                tools = registry.tools.clone();
-                tool_registry = Some(registry);
-            }
-            Err(e) => {
-                logger.log(&format!("Tool discovery error: {e}")).await;
-            }
-        }
-    } else if output_schema.is_some() && !config.tools.is_empty() {
-        logger.log("Tools disabled — schema constraint is active (tools conflict with llguidance)").await;
-    }
-
-    let mut all_files = Vec::new();
-
-    // ── 1c. Collect system prompt files (per-file, NOT concatenated) ──
-    for sys_dir in &config.system {
-        if let Ok(mut entries) = fs::read_dir(sys_dir).await {
-            let mut sys_files: Vec<PathBuf> = Vec::new();
-            while let Some(entry) = entries.next_entry().await? {
-                let name_str = entry.file_name().to_string_lossy().to_string();
-                if name_str.starts_with('.') || schema_file_names.contains(&name_str) {
-                    continue;
-                }
-                if entry.path().is_file() {
-                    sys_files.push(entry.path());
-                }
-            }
-            sys_files.sort();
-            for f in sys_files {
-                if let Ok(content) = fs::read_to_string(&f).await {
-                    let role = match extract_frontmatter(&content) {
-                        Some((n, d, body)) => {
-                            // Write body back to disk so it overrides the
-                            // frontmatter-included content for this file.
-                            let _ = fs::write(&f, &body).await;
-                            HistoryTurnRole::Skill(n, d)
-                        }
-                        None => HistoryTurnRole::System,
-                    };
-                    let md = fs::metadata(&f).await.ok();
-                    all_files.push(FileEntry {
-                        path: f.clone(),
-                        created: md
-                            .as_ref()
-                            .and_then(|m| m.created().ok())
-                            .unwrap_or(SystemTime::UNIX_EPOCH),
-                        role,
-                        metadata_str: String::new(),
-                        excluded: false, // set later based on mode
-                    });
-                }
-            }
-        }
-    }
-
-    // ── 1d. Config prompt as a virtual system entry ───────────────────
-    if let Some(ref extra_prompt) = config.prompt {
-        let tmp = tempfile::tempdir()?;
-        let prompt_path = tmp.path().join("config-prompt.txt");
-        fs::write(&prompt_path, extra_prompt).await?;
-        all_files.push(FileEntry {
-            path: prompt_path,
-            created: SystemTime::UNIX_EPOCH, // always sorts first
-            role: HistoryTurnRole::System,
-            metadata_str: String::new(),
-            excluded: false,
-        });
-        // Leak tempdir so it survives past this scope
-        std::mem::forget(tmp);
-    }
-
-    // ── 1e. Tool guidance as a virtual system entry ───────────────────
-    if !tool_guidance.is_empty() {
-        let tmp = tempfile::tempdir()?;
-        let tg_path = tmp.path().join("tool-guidance.txt");
-        fs::write(&tg_path, &tool_guidance).await?;
-        all_files.push(FileEntry {
-            path: tg_path,
-            created: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-            role: HistoryTurnRole::System,
-            metadata_str: String::new(),
-            excluded: false,
-        });
-        std::mem::forget(tmp);
-    }
-
-    // Build canonical excluded directories for comparison
-    let mut excluded_canonical = Vec::new();
-    for ex in &config.excluded_from_summary {
-        if let Ok(c) = fs::canonicalize(ex).await {
-            excluded_canonical.push(c);
-        }
-    }
-
-    // 2. Collate User and Assistant History
-    for input_dir in &config.inputs {
-        let input_canonical = fs::canonicalize(input_dir)
-            .await
-            .unwrap_or_else(|_| PathBuf::from(input_dir));
-        let is_excluded = excluded_canonical
-            .iter()
-            .any(|ex| input_canonical.starts_with(ex) || ex.starts_with(&input_canonical));
-        if let Ok(mut entries) = fs::read_dir(input_dir).await {
-            while let Some(entry) = entries.next_entry().await? {
-                let p = entry.path();
-                if p.is_file() {
-                    let p_display = p.display().to_string();
-                    let metadata = fs::metadata(&p).await.context(format!(
-                        "Failed to read metadata for input file: {}",
-                        p_display
-                    ))?;
-                    let meta_str = format_file_metadata(&p, &metadata);
-                    all_files.push(FileEntry {
-                        path: p,
-                        created: metadata.created().map_err(|e| {
-                            anyhow!("Failed to get creation time for {}: {e}", p_display)
-                        })?,
-                        role: HistoryTurnRole::User,
-                        metadata_str: meta_str,
-                        excluded: is_excluded,
-                    });
-                }
-            }
-        }
-    }
-    for output in &config.output {
-        if let Ok(mut entries) = fs::read_dir(output).await {
-            while let Some(entry) = entries.next_entry().await? {
-                let p = entry.path();
-                if p.is_file() {
-                    let p_display = p.display().to_string();
-                    let metadata = fs::metadata(&p).await.context(format!(
-                        "Failed to read metadata for output file: {}",
-                        p_display
-                    ))?;
-                    all_files.push(FileEntry {
-                        path: p,
-                        created: metadata.created().map_err(|e| {
-                            anyhow!("Failed to get creation time for {}: {e}", p_display)
-                        })?,
-                        role: HistoryTurnRole::Assistant,
-                        metadata_str: String::new(),
-                        excluded: false,
-                    });
-                }
-            }
-        }
-    }
-    // Tool outputs are loaded as assistant history so the model sees its own prior tool results.
-    // When tool_output is not explicitly set, default to the "tool_output" subdirectory
-    // within the first output directory.
-    let effective_tool_dir = config
-        .tool_output
-        .clone()
-        .or_else(|| config.output.first().map(|o| format!("{}/tool_output", o)));
-    if let Some(ref tool_dir) = effective_tool_dir {
-        if let Ok(mut entries) = fs::read_dir(tool_dir).await {
-            while let Some(entry) = entries.next_entry().await? {
-                let p = entry.path();
-                if p.is_file() {
-                    let p_display = p.display().to_string();
-                    let metadata = fs::metadata(&p).await.context(format!(
-                        "Failed to read metadata for tool output file: {}",
-                        p_display
-                    ))?;
-                    all_files.push(FileEntry {
-                        path: p,
-                        created: metadata.created().map_err(|e| {
-                            anyhow!("Failed to get creation time for {}: {e}", p_display)
-                        })?,
-                        role: HistoryTurnRole::Tool,
-                        metadata_str: String::new(),
-                        excluded: false,
-                    });
-                }
-            }
-        }
-    }
-    all_files.sort_by_key(|f| f.created);
-
-    // ── Apply system_prompt_mode to order / merge system entries ──────
-    let is_system_role = |r: &HistoryTurnRole| -> bool {
-        matches!(r, HistoryTurnRole::System | HistoryTurnRole::Skill(..))
-    };
-    match system_mode {
-        SystemPromptMode::Merged => {
-            // Collect all system entries, merge content, replace with one front entry.
-            let mut merged = String::new();
-            all_files.retain(|f| {
-                if is_system_role(&f.role) {
-                    if let Ok(content) = std::fs::read_to_string(&f.path) {
-                        if !merged.is_empty() {
-                            merged.push_str("\n\n");
-                        }
-                        merged.push_str(&content);
-                    }
-                    false // remove from list
-                } else {
-                    true
-                }
-            });
-            if !merged.is_empty() {
-                let tmp = tempfile::tempdir().expect("temp dir");
-                let mp = tmp.path().join("_system_merged_.txt");
-                let _ = std::fs::write(&mp, &merged);
-                all_files.insert(0, FileEntry {
-                    path: mp,
-                    created: SystemTime::UNIX_EPOCH,
-                    role: HistoryTurnRole::System,
-                    metadata_str: String::new(),
-                    excluded: true,
-                });
-                std::mem::forget(tmp);
-            }
-        }
-        SystemPromptMode::Frontloaded | SystemPromptMode::Summarized => {
-            let excluded = matches!(system_mode, SystemPromptMode::Frontloaded);
-            // Move all system entries to the front (stable by original sort order).
-            let mut sys: Vec<FileEntry> = Vec::new();
-            let mut rest: Vec<FileEntry> = Vec::new();
-            for f in all_files {
-                if is_system_role(&f.role) {
-                    sys.push(FileEntry { excluded, ..f });
-                } else {
-                    rest.push(f);
-                }
-            }
-            all_files = sys;
-            all_files.extend(rest);
-        }
-        SystemPromptMode::Interleaved => {
-            // System entries stay in their natural sort position.
-            // excluded stays false as set during collection.
-        }
-    }
-
-    let limit = config.history_limit.unwrap_or(0);
-    let start_idx = if limit > 0 && all_files.len() > limit {
-        all_files.len() - limit
-    } else {
-        0
-    };
-
-    let mut combined_history = Vec::new();
-    let mut turn_idx = 1;
-    for entry in all_files.iter().skip(start_idx) {
-        if let Ok(content) = fs::read_to_string(&entry.path).await {
-            let final_content =
-                if matches!(entry.role, HistoryTurnRole::User) && !entry.metadata_str.is_empty() && config.prepend_file_metadata {
-                    format!("{}\n---\n{}", entry.metadata_str, content)
-                } else {
-                    content
-                };
-            let is_sys = is_system_role(&entry.role);
-            let file_key = if is_sys {
-                "_system_".to_string()
-            } else {
-                let path_str = entry.path.to_string_lossy();
-                format!("{:016x}", xxh3_64(path_str.as_bytes()))
-            };
-            let content_hash = { format!("{:016x}", xxh3_64(final_content.as_bytes())) };
-            let turn = HistoryTurn {
-                role: entry.role.clone(),
-                content: final_content,
-                turn_index: turn_idx,
-                excluded_from_compression: entry.excluded,
-                file_key,
-                file_path: if is_sys { String::new() } else { entry.path.to_string_lossy().to_string() },
-                content_hash,
-            };
-            // Skill role content already has the preamble stripped
-            // (we wrote the body-only version back to disk in 1c).
-            combined_history.push(turn);
-            turn_idx += 1;
-        }
-    }
-
-    let (history, latest_user_input) = if let Some(last_turn) = combined_history.last() {
-        if matches!(last_turn.role, HistoryTurnRole::User) {
-            let latest = last_turn.content.clone();
-            let mut h = combined_history.clone();
-            h.pop();
-            (h, latest)
-        } else {
-            (combined_history.clone(), String::new())
-        }
-    } else {
-        (combined_history.clone(), String::new())
-    };
-
-    // Determine fallback text for multimodal messages that have no text content.
-    // This uses the metadata of the actual latest user file, even if it is binary.
-    let latest_user_file = all_files
-        .iter()
-        .filter(|f| matches!(f.role, HistoryTurnRole::User))
-        .last();
-    let fallback_text = latest_user_file
-        .map(|f| f.metadata_str.clone())
-        .unwrap_or_default();
-
-    // 3. Compression
-    let checkpoint_base = config
-        .output
-        .first()
-        .and_then(|o| PathBuf::from(o).parent().map(|p| p.to_path_buf()))
-        .or_else(|| {
-            config
-                .stream_output
-                .as_ref()
-                .and_then(|s| PathBuf::from(s).parent().map(|p| p.to_path_buf()))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    // Save for potential OOM recovery rebuild
-    let oom_db_path = config
-        .compression_db_path
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            checkpoint_base
-                .join(".agent_context")
-                .join("compression.db")
-        });
-    let oom_compression_config = config.compression.clone();
-    let comp_mgr = CompressionManager::new(&oom_db_path, &config.compression)?;
-    // Snapshot of uncompressed history so OOM recovery can re-compress
-    // with more aggressive checkpoint limits without losing turns.
-    let uncompressed_history: Vec<HistoryTurn> = history.clone();
-    let mut history_mut = history;
-    let compressed_context = comp_mgr
-        .get_compressed_context(
-            model.clone(),
-            &mut history_mut,
-            &latest_user_input,
-            sampling.clone(),
-            config.context_checkpoint_limit,
-        )
-        .await?;
-
-    // 4. Build Request
-    let mut multimodal = MultimodalMessages::new().enable_thinking(config.enable_thinking);
-    for (role, content) in &compressed_context {
-        multimodal = multimodal.add_message(role.clone(), content.as_str());
-    }
-    // Drain volatile context and save for potential OOM rebuild
-    let volatile_drained: Vec<(TextMessageRole, String)> = {
-        let mut v_ctx = volatile_context.lock().await;
-        v_ctx.drain(..).collect()
-    };
-    for (role, content) in &volatile_drained {
-        multimodal = multimodal.add_message(role.clone(), content.as_str());
-    }
-
-    let mut images = Vec::new();
-    let mut audios: Vec<AudioInput> = Vec::new();
-    let mut videos: Vec<VideoInput> = Vec::new();
-    for input_dir in &config.inputs {
-        if let Ok(mut entries) = fs::read_dir(input_dir).await {
-            while let Some(entry) = entries.next_entry().await? {
-                let p = entry.path();
-                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    match ext.to_lowercase().as_str() {
-                        "jpg" | "jpeg" | "png" | "webp" => {
-                            if let Ok(img) = image::open(&p) {
-                                images.push(img);
-                            }
-                        }
-                        "mp4" | "avi" | "mov" | "mkv" | "webm" | "m4v" | "gif" => {
-                            logger
-                                .log(&format!(
-                                    "Decoding video {} via ffmpeg",
-                                    p.display()
-                                ))
-                                .await;
-                            match decode_video(&p).await {
-                                Ok(video) => videos.push(video),
-                                Err(e) => logger
-                                    .log(&format!(
-                                        "Failed to decode video {}: {:?}",
-                                        p.display(),
-                                        e
-                                    ))
-                                    .await,
-                            }
-                        }
-                        "wav" => {
-                            match AudioInput::read_wav(&p.to_string_lossy()) {
-                                Ok(audio) => audios.push(audio),
-                                Err(e) => logger
-                                    .log(&format!(
-                                        "Failed to decode WAV {}: {:?}",
-                                        p.display(),
-                                        e
-                                    ))
-                                    .await,
-                            }
-                        }
-                        "mp3" | "ogg" | "flac" | "m4a" | "aac" | "opus" => {
-                            let decoded = match std::fs::read(&p) {
-                                Ok(bytes) => AudioInput::from_bytes(&bytes),
-                                Err(e) => Err(anyhow!("read: {}", e)),
-                            };
-                            // For .ogg and .opus, the bundled symphonia may lack the
-                            // opus feature.  Fall back to ffmpeg → WAV conversion.
-                            if decoded.is_ok()
-                                || ext == "mp3"
-                                || ext == "flac"
-                                || ext == "m4a"
-                                || ext == "aac"
-                            {
-                                match decoded {
-                                    Ok(audio) => audios.push(audio),
-                                    Err(e) => logger
-                                        .log(&format!(
-                                            "Failed to decode audio {}: {:?}",
-                                            p.display(), e
-                                        ))
-                                        .await,
-                                }
-                            } else {
-                                logger
-                                    .log(&format!(
-                                        "symphonia decode failed for {}; falling back to ffmpeg",
-                                        p.display()
-                                    ))
-                                    .await;
-                                match convert_audio_to_wav(&p).await {
-                                    Ok(wav_path) => {
-                                        match AudioInput::read_wav(&wav_path.to_string_lossy()) {
-                                            Ok(audio) => audios.push(audio),
-                                            Err(e) => logger
-                                                .log(&format!(
-                                                    "Failed to decode ffmpeg-converted WAV {}: {:?}",
-                                                    p.display(), e
-                                                ))
-                                                .await,
-                                        }
-                                    }
-                                    Err(e) => logger
-                                        .log(&format!(
-                                            "ffmpeg conversion failed for {}: {:?}",
-                                            p.display(), e
-                                        ))
-                                        .await,
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    // Check if the model supports audio — if not, drop audio inputs
-    // so they don't trigger a processor-level error downstream.
-    if !audios.is_empty() {
-        let cfg = model.config_with_model(Some(&config.model)).ok();
-        let supports_audio = cfg
-            .as_ref()
-            .and_then(|c| Some(c.modalities.input.contains(&mistralrs::core::SupportedModality::Audio)))
-            .unwrap_or(false);
-        if !supports_audio {
-            logger
-                .log(&format!(
-                    "Model '{}' does not support audio — dropping {} audio input(s)",
-                    config.model,
-                    audios.len()
-                ))
-                .await;
-            audios.clear();
-        }
-    }
-
-    let effective_user_text =
-        if latest_user_input.is_empty()
-            && (!images.is_empty() || !audios.is_empty() || !videos.is_empty())
-        {
-            fallback_text
-        } else {
-            latest_user_input
-        };
-    // Save for potential OOM recovery recompression
-    let oom_latest_input = effective_user_text.clone();
-
-    if !images.is_empty() || !audios.is_empty() || !videos.is_empty() {
-        if !images.is_empty() {
-            logger
-                .log(&format!("Adding {} images to request", images.len()))
-                .await;
-        }
-        if !audios.is_empty() {
-            logger
-                .log(&format!("Adding {} audio inputs to request", audios.len()))
-                .await;
-        }
-        if !videos.is_empty() {
-            logger
-                .log(&format!("Adding {} video inputs to request", videos.len()))
-                .await;
-        }
-        multimodal = multimodal.add_multimodal_message(
-            TextMessageRole::User,
-            &effective_user_text,
-            images.clone(),
-            audios.clone(),
-            videos.clone(),
-        );
-    } else {
-        multimodal = multimodal.add_message(TextMessageRole::User, &effective_user_text);
-    }
-
-    // When not consuming tool calls (distillation mode), write the tool
-    // definitions to a well-known hidden file in the first system directory
-    // so downstream harnesses know what tools the model had access to.
-    if !config.consume_tool_calls && !tools.is_empty() {
-        if let Some(ref sys_dir) = config.system.first() {
-            let tools_path = PathBuf::from(sys_dir).join(".agentgraph_tools.json");
-            if let Ok(json) = serde_json::to_string_pretty(&tools) {
-                let _ = fs::write(&tools_path, &json).await;
-            }
-        }
-    }
-
-    let timestamp = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
-    let output_file_path: Option<PathBuf> = config.output.first().map(|o| {
-        if let Some(ref schema) = output_schema {
-            PathBuf::from(o).join(schema.build_filename(o, timestamp))
-        } else {
-            PathBuf::from(o).join(format!("out-{}.txt", timestamp))
-        }
-    });
-
-    let mut stream_file = if let Some(ref stream_dir) = config.stream_output {
-        let stream_path = PathBuf::from(stream_dir).join(format!("out-{}.txt", timestamp));
-        fs::create_dir_all(stream_dir).await?;
-        logger
-            .log(&format!(
-                "Streaming enabled, creating stream output file: {:?}",
-                stream_path
-            ))
-            .await;
-        Some(fs::File::create(&stream_path).await.context(format!(
-            "Failed to create stream output file: {}",
-            stream_path.display()
-        ))?)
-    } else {
-        logger
-            .log("Streaming disabled, will create output file after completion")
-            .await;
-        None
-    };
-
-    let mut request = RequestBuilder::from(multimodal)
-        .set_sampling(sampling.clone())
-        .set_tools(tools.clone())
-        .set_tool_choice(ToolChoice::Auto);
-    if let Some(ref schema) = output_schema {
-        request = request.set_constraint(schema.constraint.clone());
-    }
-
-    let retry_limit = config.inference_retries;
-    let retry_delay = Duration::from_millis(config.inference_retry_delay_ms);
-
-    // OOM recovery state: when the normal-strength context OOMs the GPU,
-    // we re-compress with a halved context_checkpoint_limit and retry the
-    // entire turn. This preserves more history than dropping everything.
-    let mut oom_recompression_done = false;
-    let mut oom_recovery_pending = false;
-    let oom_aggressive_limit = config.context_checkpoint_limit.map(|l| (l / 2).max(1));
-
-    let mut final_output = String::new();
-    let mut tools_executed = false;
-    let mut nudged = false; // prevent more than one empty-output nudge
-    loop {
-        // If the previous turn failed with OOM, recompress the original
-        // uncompressed history with tighter limits before rebuilding the
-        // request.
-        if oom_recovery_pending {
-            logger
-                .log("Recompressing context with aggressive limits after OOM")
-                .await;
-            let oom_comp_mgr = CompressionManager::new(&oom_db_path, &oom_compression_config)?;
-            let mut history_retry = uncompressed_history.clone();
-            let recompr_context = match oom_comp_mgr
-                .get_compressed_context(
-                    model.clone(),
-                    &mut history_retry,
-                    &oom_latest_input,
-                    sampling.clone(),
-                    oom_aggressive_limit,
-                )
-                .await
-            {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    logger
-                        .log(&format!("OOM recompression failed: {:?}", e))
-                        .await;
-                    break; // give up
-                }
-            };
-            // Rebuild the request from the re-compressed context
-            let mut new_multimodal =
-                MultimodalMessages::new().enable_thinking(config.enable_thinking);
-            for (role, content) in &recompr_context {
-                new_multimodal = new_multimodal.add_message(role.clone(), content.as_str());
-            }
-            for (role, content) in &volatile_drained {
-                new_multimodal = new_multimodal.add_message(role.clone(), content.as_str());
-            }
-            if !images.is_empty() || !audios.is_empty() || !videos.is_empty() {
-                new_multimodal = new_multimodal.add_multimodal_message(
-                    TextMessageRole::User,
-                    &effective_user_text,
-                    images.clone(),
-                    audios.clone(),
-                    videos.clone(),
-                );
-            } else {
-                new_multimodal =
-                    new_multimodal.add_message(TextMessageRole::User, &effective_user_text);
-            }
-            request = RequestBuilder::from(new_multimodal)
-                .set_sampling(sampling.clone())
-                .set_tools(tools.clone())
-                .set_tool_choice(ToolChoice::Auto);
-            oom_recovery_pending = false;
-            oom_recompression_done = true;
-        }
-
-        let base_request = request.clone();
-        let mut accumulated_content = String::new();
-        let mut current_tool_calls = Vec::new();
-        let mut remaining_retries = retry_limit;
-        let mut empty_retry_count: u32 = 0;
-        let mut oom_recompression_needed = false;
-
-        // Retry loop: wraps the streaming inference call so that
-        // recoverable errors (OOMs, timeouts) trigger a retry with
-        // the partial response prefilled.
-        loop {
-            let mut retry_request = base_request.clone();
-            if !accumulated_content.is_empty() {
-                retry_request = retry_request
-                    .add_message(TextMessageRole::Assistant, accumulated_content.clone());
-                logger
-                    .log(&format!(
-                        "Retrying inference with {} chars of prefill content",
-                        accumulated_content.len()
-                    ))
-                    .await;
-            }
-
-            let mut model_stream = match model.stream_chat_request(retry_request.clone()).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    logger
-                        .log(&format!(
-                            "Inference error: {} (retries left: {})",
-                            err_str, remaining_retries
-                        ))
-                        .await;
-                    if remaining_retries > 0 {
-                        // On OOM-like errors, flag the outer loop to
-                        // re-compress with more aggressive checkpoint limits.
-                        if config.enable_oom_recovery
-                            && looks_like_oom(&err_str)
-                            && accumulated_content.is_empty()
-                            && !oom_recompression_done
-                        {
-                            oom_recompression_needed = true;
-                        }
-                        let attempt = retry_limit - remaining_retries;
-                        let delay = retry_delay * 2u32.pow(attempt as u32);
-                        remaining_retries -= 1;
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    // Final failure — remove any incomplete stream file
-                    if let Some(ref stream_dir) = config.stream_output {
-                        let stream_path =
-                            PathBuf::from(stream_dir).join(format!("out-{}.txt", timestamp));
-                        let _ = fs::remove_file(&stream_path).await;
-                    }
-                    // Drop the stream file handle so we don't leave a
-                    // dangling fd; the file is already cleaned above.
-                    drop(stream_file.take());
-                    return Err(e.into());
-                }
-            };
-
-            // Consume stream chunks. Track whether we received a
-            // finish_reason so we can distinguish a completed response
-            // from a prematurely-closed channel.
-            let mut got_finish = false;
-            let mut stream_error: Option<String> = None;
-
-            while let Some(chunk) = model_stream.next().await {
-                match chunk {
-                    Response::Chunk(c) => {
-                        if let Some(choice) = c.choices.first() {
-                            if choice.finish_reason.is_some() {
-                                got_finish = true;
-                            }
-                            if let Some(ref content) = choice.delta.content {
-                                accumulated_content.push_str(content);
-                                if let Some(ref mut f) = stream_file {
-                                    if let Err(e) = f.write_all(content.as_bytes()).await {
-                                        logger.log(&format!("Stream write error: {:?}", e)).await;
-                                    }
-                                    let _ = f.flush().await;
-                                }
-                            }
-                            if let Some(ref tcs) = choice.delta.tool_calls {
-                                current_tool_calls.extend(tcs.clone());
-                                // When tool calls are unconsumed, write them
-                                // to the stream file so the caller can see
-                                // what the model is doing in real time.
-                                if !config.consume_tool_calls {
-                                    if let Some(ref mut f) = stream_file {
-                                        for tc in tcs {
-                                            if let Ok(json) = serde_json::to_string(tc) {
-                                                let _ = f.write_all(json.as_bytes()).await;
-                                                let _ = f.write_all(b"\n").await;
-                                            }
-                                        }
-                                        let _ = f.flush().await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Response::ModelError(msg, _) => {
-                        stream_error = Some(format!("Model error during streaming: {}", msg));
-                        break;
-                    }
-                    Response::InternalError(e) => {
-                        stream_error = Some(format!("Internal error during streaming: {}", e));
-                        break;
-                    }
-                    // Done, CompletionDone, etc. — stream is ending normally
-                    _ => {}
-                }
-            }
-
-            // Check for errors or premature termination and retry if possible.
-            if let Some(ref err_msg) = stream_error {
-                logger
-                    .log(&format!(
-                        "{} (retries left: {})",
-                        err_msg, remaining_retries
-                    ))
-                    .await;
-                if remaining_retries > 0 {
-                    let attempt = retry_limit - remaining_retries;
-                    let delay = retry_delay * 2u32.pow(attempt as u32);
-                    remaining_retries -= 1;
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-                // Final failure — remove incomplete stream file and bail
-                if let Some(ref stream_dir) = config.stream_output {
-                    let stream_path =
-                        PathBuf::from(stream_dir).join(format!("out-{}.txt", timestamp));
-                    let _ = fs::remove_file(&stream_path).await;
-                }
-                drop(stream_file.take());
-                // If OOM was the likely cause and we haven't tried
-                // aggressive compression yet, don't give up — recompress
-                // and retry the outer turn loop.
-                if oom_recompression_needed {
-                    oom_recovery_pending = true;
-                    break; // exit inner retry loop, trigger recompression in outer loop
-                }
-                return Err(anyhow!("{}", err_msg));
-            }
-
-            if !got_finish {
-                // Stream ended without receiving a finish_reason — the
-                // channel was likely closed mid-generation. Retry with
-                // the partial content as a prefill so the model can
-                // continue from where it left off.
-                if !accumulated_content.is_empty() {
-                    logger
-                        .log(&format!(
-                            "Stream ended prematurely with {} chars (retries left: {})",
-                            accumulated_content.len(),
-                            remaining_retries
-                        ))
-                        .await;
-                    if remaining_retries > 0 {
-                        let attempt = retry_limit - remaining_retries;
-                        let delay = retry_delay * 2u32.pow(attempt as u32);
-                        remaining_retries -= 1;
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    // All retries exhausted — write whatever partial content
-                    // we have as best-effort fallback.
-                    logger
-                        .log("All retries exhausted on incomplete stream; writing partial output")
-                        .await;
-                } else {
-                    // Empty response — the model streamed nothing at all.
-                    // Common for Qwen3.5/Gemma models that emit empty
-                    // chunks before real tokens, or concurrent mistralrs
-                    // streams that return empty for non-active inferers.
-                    // Retry immediately — this is not an error condition.
-                    empty_retry_count += 1;
-                    logger
-                        .log(&format!(
-                            "Empty response (attempt {}); retrying immediately",
-                            empty_retry_count,
-                        ))
-                        .await;
-                    continue;
-                }
-            }
-
-            // Streaming completed cleanly for this attempt
-            break;
-        }
-
-        // Prepare output content.  When consume_tool_calls is false, tool
-        // call JSON is appended so downstream agents (e.g. distillation
-        // harness) can see the raw structured output.  Tool call deltas
-        // are deduplicated by ID (the last occurrence per ID carries the
-        // completed state).
-        let mut output_content = accumulated_content.clone();
-        if !config.consume_tool_calls && !current_tool_calls.is_empty() && output_schema.is_none() {
-            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut deduped: Vec<&ToolCallResponse> = Vec::new();
-            for tc in current_tool_calls.iter().rev() {
-                if seen_ids.insert(tc.id.clone()) {
-                    deduped.push(tc);
-                }
-            }
-            deduped.reverse();
-            if !output_content.is_empty() {
-                output_content.push_str("\n\n");
-            }
-            for tc in &deduped {
-                if let Ok(json) = serde_json::to_string(tc) {
-                    output_content.push_str(&json);
-                    output_content.push('\n');
-                }
-            }
-        }
-
-        final_output = output_content.clone();
-
-        if current_tool_calls.is_empty() {
-            // If the model went silent after executing tools, inject a
-            // nudge and retry once instead of writing empty output.
-            if output_content.is_empty() && tools_executed && !nudged {
-                nudged = true;
-                logger
-                    .log("Empty output after tool execution; nudging model to respond")
-                    .await;
-                request = request.add_message(
-                    TextMessageRole::System,
-                    "Tool execution complete. Provide your response based on the tool results.",
-                );
-                continue;
-            }
-            // Turn is complete — write the output file so that downstream
-            // watchers (wait_for_output, the streaming background task)
-            // can detect completion.
-            if let Some(ref output_path) = output_file_path {
-                logger
-                    .log(&format!("Turn complete, writing {} chars to: {:?}", output_content.len(), output_path))
-                    .await;
-                if let Err(e) = fs::write(output_path, &output_content).await {
-                    logger
-                        .log(&format!("Failed to write output file: {:?}", e))
-                        .await;
-                }
-            }
-            break;
-        }
-
-        logger
-            .log(&format!(
-                "Executing {} tool calls",
-                current_tool_calls.len()
-            ))
-            .await;
-        request = request.add_message_with_tool_call(
-            TextMessageRole::Assistant,
-            &accumulated_content,
-            current_tool_calls.clone(),
-        );
-        for (tool_idx, tc) in current_tool_calls.iter().enumerate() {
-            let result = if let Some(ref registry) = tool_registry {
-                if let Some(binary_name) = registry.name_to_binary.get(&tc.function.name) {
-                    match execute_tool_binary(binary_name, &tc.function.arguments).await {
-                        Ok(output) => {
-                            // load_into_context has special semantics: store
-                            // output in volatile context for the next turn.
-                            if tc.function.name == "load_into_context" {
-                                volatile_context.lock().await.push((
-                                    TextMessageRole::System,
-                                    output,
-                                ));
-                                "Files loaded into context for next turn.".into()
-                            } else {
-                                output
-                            }
-                        }
-                        Err(e) => {
-                            format!("Error executing {}: {}", tc.function.name, e)
-                        }
-                    }
-                } else {
-                    format!("Unknown tool: {}", tc.function.name)
-                }
-            } else {
-                "Tools are not enabled for this agent.".into()
-            };
-
-            // Persist tool result to the dedicated tool_output directory if configured.
-            // When tool_output is not explicitly set, default to a "tool_output"
-            // subdirectory within the first output directory so tool results don't
-            // pollute the main output (which would confuse downstream agents).
-            let tool_dest_dir = config.tool_output.clone().unwrap_or_else(|| {
-                config
-                    .output
-                    .first()
-                    .map(|o| format!("{}/tool_output", o))
-                    .unwrap_or_else(|| "/tmp/agentgraph_tool_output".to_string())
-            });
-            if let Err(e) = fs::create_dir_all(&tool_dest_dir).await {
-                logger
-                    .log(&format!("Failed to create tool output dir: {:?}", e))
-                    .await;
-            }
-            let tool_output_path = PathBuf::from(tool_dest_dir).join(format!(
-                "tool-{}-{}-{}.txt",
-                tc.function.name, tool_idx, timestamp
-            ));
-            if let Err(e) = fs::write(&tool_output_path, &result).await {
-                logger
-                    .log(&format!("Failed to write tool output: {:?}", e))
-                    .await;
-            }
-
-            request = request.add_tool_message(result, tc.id.clone());
-        }
-        tools_executed = true;
-    }
-
-    logger.log("Inference turn complete").await;
-    Ok(final_output)
-}
 
 // ── Tool plugin system ──────────────────────────────────────────────────
 
 /// Cached tool schema + guidance, keyed by binary name.
 struct CachedTool {
-    tool: Tool,
+    tool: ToolDef,
     guidance: String,
 }
 
@@ -1426,7 +375,7 @@ static TOOL_CACHE: LazyLock<StdMutex<HashMap<String, CachedTool>>> =
 
 /// Built tool registry for a single inference run.
 struct ToolRegistry {
-    tools: Vec<Tool>,
+    tools: Vec<ToolDef>,
     guidance: String,
     /// Maps function name (e.g. `read_file`) → binary name (e.g. `ag-tool-read`).
     name_to_binary: HashMap<String, String>,
@@ -1449,7 +398,7 @@ async fn discover_tools(
             if let Some(cached) = cache.get(name) {
                 tools.push(cached.tool.clone());
                 guidance_parts.push(cached.guidance.clone());
-                let func_name = cached.tool.function.name.clone();
+                let func_name = cached.tool.name.clone();
                 name_to_binary.insert(func_name, name.clone());
             }
         }
@@ -1479,31 +428,31 @@ async fn discover_tools(
             .arg("--describe")
             .output()
             .await;
-        let (func_name, tool) = match describe {
+        let (func_name, tool): (String, ToolDef) = match describe {
             Ok(out) if out.status.success() => {
                 let raw = String::from_utf8_lossy(&out.stdout);
                 match serde_json::from_str::<serde_json::Value>(&raw) {
                     Ok(schema) => {
                         let fn_name =
                             schema["name"].as_str().unwrap_or(name).to_string();
-                        let tool = Tool {
-                            tp: ToolType::Function,
-                            function: Function {
-                                name: fn_name.clone(),
-                                description: schema["description"]
-                                    .as_str()
-                                    .map(String::from),
-                                parameters: schema
-                                    .get("parameters")
-                                    .and_then(|p| p.as_object())
-                                    .map(|obj| {
-                                        obj.iter()
-                                            .map(|(k, v)| (k.clone(), v.clone()))
-                                            .collect::<HashMap<String, serde_json::Value>>()
-                                    }),
-                                strict: None,
-                            },
-                        };
+                        let params = schema
+                            .get("parameters")
+                            .and_then(|p| p.as_object())
+                            .map(|obj| {
+                                obj.iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect::<serde_json::Map<String, serde_json::Value>>()
+                            })
+                            .unwrap_or_default();
+                        let description = schema["description"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        let tool = ToolDef::new(
+                            &fn_name,
+                            description,
+                            serde_json::Value::Object(params),
+                        );
                         (fn_name, tool)
                     }
                     Err(e) => {
@@ -1557,6 +506,59 @@ async fn discover_tools(
         guidance: guidance_parts.join("\n\n"),
         name_to_binary,
     })
+}
+
+/// Save heavy tool state to disk for the heavy-tool-runner to pick up.
+/// Returns the path to the saved state file.
+fn save_heavy_tool_state(
+    agent_name: &str,
+    config: &AgentConfig,
+    global_config: &Config,
+    tool_binary: &str,
+    tool_name: &str,
+    tool_args: &str,
+    tool_call_id: &str,
+    accumulated_content: &str,
+    timestamp: u128,
+) -> anyhow::Result<String> {
+    let resume_dir = home_dir().join(".agentgraph").join("resume").join(agent_name);
+    std::fs::create_dir_all(&resume_dir)?;
+    let path = resume_dir.join(format!("heavy_tool_{}.json", timestamp));
+    let state = HeavyToolState {
+        agent_name: agent_name.to_string(),
+        agent_config: config.clone(),
+        global_config: global_config.clone(),
+        tool_binary: tool_binary.to_string(),
+        tool_name: tool_name.to_string(),
+        tool_args: tool_args.to_string(),
+        tool_call_id: tool_call_id.to_string(),
+        accumulated_content: accumulated_content.to_string(),
+        timestamp,
+    };
+    let json = serde_json::to_string_pretty(&state)?;
+    std::fs::write(&path, &json)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Write a signal file that tells the leader's watchdog to persist
+/// sessions and hand off to the heavy-tool-runner.
+fn write_heavy_tool_signal(agent_name: &str, state_path: &str) {
+    let signal_dir = PathBuf::from("/tmp/agentgraph");
+    let _ = std::fs::create_dir_all(&signal_dir);
+    let signal_path = signal_dir.join(format!("heavy_tool_signal_{}.json", agent_name));
+    let signal = serde_json::json!({
+        "agent": agent_name,
+        "state_path": state_path,
+    });
+    if let Ok(json) = serde_json::to_string(&signal) {
+        let _ = std::fs::write(&signal_path, &json);
+    }
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
 /// Execute a tool by spawning its binary, writing arguments to stdin,
@@ -1626,133 +628,568 @@ async fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
 
 /// Decode a video file into a `VideoInput` by shelling out to FFmpeg.
 /// Extracts 32 uniformly sampled frames.
-async fn decode_video(path: &Path) -> Result<VideoInput> {
-    // Probe FPS and total frames with ffprobe
-    let probe = tokio::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=r_frame_rate,nb_frames",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .await
-        .ok();
-
-    let fps: f64 = probe
-        .as_ref()
-        .and_then(|o| String::from_utf8(o.stdout.clone()).ok())
-        .and_then(|s| {
-            s.lines()
-                .next()
-                .and_then(|l| {
-                    let mut parts = l.split('/');
-                    let num: f64 = parts.next()?.parse().ok()?;
-                    let den: f64 = parts.next()?.parse().ok()?;
-                    if den == 0.0 { None } else { Some(num / den) }
-                })
-        })
-        .unwrap_or(24.0);
-
-    let total_frames: usize = probe
-        .as_ref()
-        .and_then(|o| String::from_utf8(o.stdout.clone()).ok())
-        .and_then(|s| s.lines().nth(1)?.parse().ok())
-        .unwrap_or(0);
-
-    let num_frames = 32usize;
-    let sampled_indices: Vec<usize> = sample_frame_indices(total_frames, num_frames);
-
-    // Extract frames as PNG with ffmpeg
-    let tmpdir = tempfile::tempdir()?;
-    let tmp_path = tmpdir.path().join("frame_%04d.png");
-    let select_expr = sampled_indices
-        .iter()
-        .map(|i| format!("eq(n,{})", i))
-        .collect::<Vec<_>>()
-        .join("+");
-    let output = tokio::process::Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args(["-vf", &format!("select='{}'", select_expr), "-vsync", "vfr"])
-        .arg(tmp_path.to_str().unwrap())
-        .output()
-        .await
-        .context("ffmpeg frame extraction failed")?;
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "ffmpeg failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    // Read extracted frames
-    let mut frames: Vec<image::DynamicImage> = Vec::new();
-    for i in 1..=(num_frames as u32) {
-        let frame_path = tmpdir.path().join(format!("frame_{:04}.png", i));
-        match image::open(&frame_path) {
-            Ok(img) => frames.push(img),
-            Err(_) => break,
-        }
-    }
-    if frames.is_empty() {
-        return Err(anyhow!("No frames extracted from video"));
-    }
-
-    Ok(VideoInput::from_frames(frames, fps, Some(sampled_indices)))
-}
 
 /// Uniformly sample `n` frame indices from `total` frames.
 /// Mimics torch.arange(0, total, total/n).int()
-fn sample_frame_indices(total: usize, n: usize) -> Vec<usize> {
-    if total == 0 || n == 0 {
-        return Vec::new();
-    }
-    let step = total as f64 / n as f64;
-    (0..n)
-        .map(|i| ((i as f64) * step) as usize)
-        .take(total)
-        .collect()
-}
 
 /// Convert any audio file to WAV via ffmpeg, returning the path to the
 /// output file.  Used as a fallback for formats that the bundled symphonia
 /// build doesn't support (e.g. Opus in OGG).
-async fn convert_audio_to_wav(path: &Path) -> Result<PathBuf> {
-    let tmpdir = tempfile::tempdir()?;
-    let wav_path = tmpdir.path().join("output.wav");
-    let output = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-v", "error",
-            "-i",
-        ])
-        .arg(path)
-        .args([
-            "-acodec", "pcm_f32le",
-            "-ar", "16000",
-            "-ac", "1",
-            "-y",
-        ])
-        .arg(&wav_path)
-        .output()
-        .await
-        .context("ffmpeg audio conversion failed")?;
 
-    if !output.status.success() {
-        return Err(anyhow!(
-            "ffmpeg audio: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+// ── Provider-based inference ───────────────────────────────────────────
+
+/// Run a single inference turn using an [`InferenceProvider`].
+/// Builds provider-agnostic [`ChatRequest`] values and processes
+/// [`ProviderEvent`] streams.
+async fn run_inference_with_provider(
+    name: String,
+    provider: Arc<dyn InferenceProvider>,
+    config: AgentConfig,
+    global_config: Config,
+    volatile_context: Arc<Mutex<Vec<(Role, String)>>>,
+    logger: AgentLogger,
+) -> Result<String> {
+    logger.log("Starting inference turn (provider)").await;
+
+    // Resolve system prompt mode: agent override > model config > Merged
+    let system_mode = config
+        .system_prompt_mode
+        .clone()
+        .or_else(|| {
+            global_config
+                .models
+                .get(&config.model)
+                .map(|m| m.system_prompt_mode.clone())
+        })
+        .unwrap_or_default();
+
+    // ── 1. Schema detection ──────────────────────────────────────────
+    let mut output_schema: Option<(String, String, GuidanceConstraint)> = None;
+    let mut schema_file_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for sys_dir in &config.system {
+        if let Ok(mut entries) = fs::read_dir(sys_dir).await {
+            while let Some(entry) = entries.next_entry().await? {
+                let name_str = entry.file_name().to_string_lossy().to_string();
+                if let Some(parsed) = ParsedSchemaName::try_parse(&name_str) {
+                    schema_file_names.insert(name_str.clone());
+                    if let Ok(content) = fs::read_to_string(entry.path()).await {
+                        let constraint_type =
+                            parsed.constraint_hint.as_deref().unwrap_or_else(|| {
+                                if parsed.extension == "json" { "json" } else { "" }
+                            });
+                        let constraint = match constraint_type {
+                            "json" => serde_json::from_str::<serde_json::Value>(&content)
+                                .map(GuidanceConstraint::JsonSchema),
+                            "lark" => Ok(GuidanceConstraint::Lark(content)),
+                            "regex" => Ok(GuidanceConstraint::Regex(content)),
+                            "llg" => Ok(GuidanceConstraint::Llguidance(content)),
+                            _ => continue,
+                        };
+                        if let Ok(c) = constraint {
+                            logger.log(&format!(
+                                "Loaded output schema: .schema-{}.{}",
+                                parsed.format_str, parsed.extension
+                            )).await;
+                            output_schema = Some((
+                                parsed.format_str,
+                                parsed.extension,
+                                c,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
-    // Keep the tempdir alive by leaking it — the file will be cleaned up
-    // when the agent completes its turn.
-    let wav = wav_path.clone();
-    std::mem::forget(tmpdir);
-    Ok(wav)
+
+    // ── 2. Tool discovery ────────────────────────────────────────────
+    let mut tool_registry: Option<ToolRegistry> = None;
+    let mut tools: Vec<ToolDef> = vec![];
+    let mut tool_guidance = String::new();
+
+    let mut all_tool_names: Vec<String> = config.tools.clone();
+    for ht in &config.heavy_tools {
+        if !all_tool_names.contains(ht) {
+            all_tool_names.push(ht.clone());
+        }
+    }
+
+    if !all_tool_names.is_empty() && output_schema.is_none() {
+        match discover_tools(&all_tool_names, &logger).await {
+            Ok(registry) => {
+                if !registry.guidance.is_empty() {
+                    tool_guidance.push_str("== Tool Usage Guidance ==\n");
+                    tool_guidance.push_str(&registry.guidance);
+                }
+                for t in &registry.tools {
+                    tools.push(t.clone());
+                }
+                tool_registry = Some(registry);
+            }
+            Err(e) => {
+                logger.log(&format!("Tool discovery error: {e}")).await;
+            }
+        }
+    } else if output_schema.is_some() && !config.tools.is_empty() {
+        logger.log("Tools disabled — schema constraint is active").await;
+    }
+
+    // ── 3. File collation ────────────────────────────────────────────
+    let mut all_files = Vec::new();
+
+    for sys_dir in &config.system {
+        if let Ok(mut entries) = fs::read_dir(sys_dir).await {
+            let mut sys_files: Vec<PathBuf> = Vec::new();
+            while let Some(entry) = entries.next_entry().await? {
+                let name_str = entry.file_name().to_string_lossy().to_string();
+                if name_str.starts_with('.') || schema_file_names.contains(&name_str) {
+                    continue;
+                }
+                if entry.path().is_file() {
+                    sys_files.push(entry.path());
+                }
+            }
+            sys_files.sort();
+            for f in sys_files {
+                if let Ok(content) = fs::read_to_string(&f).await {
+                    let role = match extract_frontmatter(&content) {
+                        Some((n, d, body)) => {
+                            let _ = fs::write(&f, &body).await;
+                            HistoryTurnRole::Skill(n, d)
+                        }
+                        None => HistoryTurnRole::System,
+                    };
+                    let md = fs::metadata(&f).await.ok();
+                    all_files.push(FileEntry {
+                        path: f.clone(),
+                        created: md.as_ref().and_then(|m| m.created().ok()).unwrap_or(SystemTime::UNIX_EPOCH),
+                        role,
+                        metadata_str: String::new(),
+                        excluded: false,
+                        tool_call_id: None,
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(ref extra_prompt) = config.prompt {
+        let tmp = tempfile::tempdir()?;
+        let prompt_path = tmp.path().join("config-prompt.txt");
+        fs::write(&prompt_path, extra_prompt).await?;
+        all_files.push(FileEntry {
+            path: prompt_path,
+            created: SystemTime::UNIX_EPOCH,
+            role: HistoryTurnRole::System,
+            metadata_str: String::new(),
+            excluded: false,
+            tool_call_id: None,
+        });
+        std::mem::forget(tmp);
+    }
+
+    if !tool_guidance.is_empty() {
+        let tmp = tempfile::tempdir()?;
+        let tg_path = tmp.path().join("tool-guidance.txt");
+        fs::write(&tg_path, &tool_guidance).await?;
+        all_files.push(FileEntry {
+            path: tg_path,
+            created: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            role: HistoryTurnRole::System,
+            metadata_str: String::new(),
+            excluded: false,
+            tool_call_id: None,
+        });
+        std::mem::forget(tmp);
+    }
+
+    let mut excluded_canonical = Vec::new();
+    for ex in &config.excluded_from_summary {
+        if let Ok(c) = fs::canonicalize(ex).await {
+            excluded_canonical.push(c);
+        }
+    }
+
+    // Collect User / Assistant / Tool files
+    for input_dir in &config.inputs {
+        let input_canonical = fs::canonicalize(input_dir).await.unwrap_or_else(|_| PathBuf::from(input_dir));
+        let is_excluded = excluded_canonical.iter().any(|ex| {
+            input_canonical.starts_with(ex) || ex.starts_with(&input_canonical)
+        });
+        if let Ok(mut entries) = fs::read_dir(input_dir).await {
+            while let Some(entry) = entries.next_entry().await? {
+                let p = entry.path();
+                if p.is_file() {
+                    let metadata = fs::metadata(&p).await?;
+                    let meta_str = format_file_metadata(&p, &metadata);
+                    all_files.push(FileEntry {
+                        path: p,
+                        created: metadata.created()?,
+                        role: HistoryTurnRole::User,
+                        metadata_str: meta_str,
+                        excluded: is_excluded,
+                        tool_call_id: None,
+                    });
+                }
+            }
+        }
+    }
+    for output in &config.output {
+        if let Ok(mut entries) = fs::read_dir(output).await {
+            while let Some(entry) = entries.next_entry().await? {
+                let p = entry.path();
+                if p.is_file() {
+                    let metadata = fs::metadata(&p).await?;
+                    all_files.push(FileEntry {
+                        path: p,
+                        created: metadata.created()?,
+                        role: HistoryTurnRole::Assistant,
+                        metadata_str: String::new(),
+                        excluded: false,
+                        tool_call_id: None,
+                    });
+                }
+            }
+        }
+    }
+    let effective_tool_dir = config.tool_output.clone()
+        .or_else(|| config.output.first().map(|o| format!("{}/tool_output", o)));
+    if let Some(ref tool_dir) = effective_tool_dir {
+        if let Ok(mut entries) = fs::read_dir(tool_dir).await {
+            while let Some(entry) = entries.next_entry().await? {
+                let p = entry.path();
+                if p.is_file() {
+                    let metadata = fs::metadata(&p).await?;
+                    let tool_call_id = p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|stem| {
+                            let parts: Vec<&str> = stem.rsplitn(4, '-').collect();
+                            if parts.len() >= 4 { Some(parts[0].to_string()) } else { None }
+                        });
+                    all_files.push(FileEntry {
+                        path: p,
+                        created: metadata.created()?,
+                        role: HistoryTurnRole::Tool,
+                        metadata_str: String::new(),
+                        excluded: false,
+                        tool_call_id,
+                    });
+                }
+            }
+        }
+    }
+    all_files.sort_by_key(|f| f.created);
+
+    // ── 4. Apply system_prompt_mode ──────────────────────────────────
+    let is_system_role = |r: &HistoryTurnRole| -> bool {
+        matches!(r, HistoryTurnRole::System | HistoryTurnRole::Skill(..))
+    };
+    match system_mode {
+        SystemPromptMode::Merged => {
+            let mut merged = String::new();
+            all_files.retain(|f| {
+                if is_system_role(&f.role) {
+                    if let Ok(content) = std::fs::read_to_string(&f.path) {
+                        if !merged.is_empty() { merged.push_str("\n\n"); }
+                        merged.push_str(&content);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            if !merged.is_empty() {
+                let tmp = tempfile::tempdir().expect("temp dir");
+                let mp = tmp.path().join("_system_merged_.txt");
+                let _ = std::fs::write(&mp, &merged);
+                all_files.insert(0, FileEntry {
+                    path: mp,
+                    created: SystemTime::UNIX_EPOCH,
+                    role: HistoryTurnRole::System,
+                    metadata_str: String::new(),
+                    excluded: true,
+                    tool_call_id: None,
+                });
+                std::mem::forget(tmp);
+            }
+        }
+        SystemPromptMode::Frontloaded | SystemPromptMode::Summarized => {
+            let excluded = matches!(system_mode, SystemPromptMode::Frontloaded);
+            let mut sys: Vec<FileEntry> = Vec::new();
+            let mut rest: Vec<FileEntry> = Vec::new();
+            for f in all_files {
+                if is_system_role(&f.role) {
+                    sys.push(FileEntry { excluded, ..f });
+                } else {
+                    rest.push(f);
+                }
+            }
+            all_files = sys;
+            all_files.extend(rest);
+        }
+        SystemPromptMode::Interleaved => {}
+    }
+
+    let limit = config.history_limit.unwrap_or(0);
+    let start_idx = if limit > 0 && all_files.len() > limit {
+        all_files.len() - limit
+    } else {
+        0
+    };
+
+    // ── 5. Build history turns ───────────────────────────────────────
+    let mut combined_history = Vec::new();
+    let mut turn_idx = 1;
+    for entry in all_files.iter().skip(start_idx) {
+        if let Ok(content) = fs::read_to_string(&entry.path).await {
+            let final_content = if matches!(entry.role, HistoryTurnRole::User)
+                && !entry.metadata_str.is_empty()
+                && config.prepend_file_metadata
+            {
+                format!("{}\n---\n{}", entry.metadata_str, content)
+            } else {
+                content
+            };
+            let file_key = if is_system_role(&entry.role) {
+                "_system_".to_string()
+            } else {
+                format!("{:016x}", xxh3_64(entry.path.to_string_lossy().as_bytes()))
+            };
+            combined_history.push(HistoryTurn {
+                role: entry.role.clone(),
+                content: final_content,
+                turn_index: turn_idx,
+                excluded_from_compression: entry.excluded,
+                file_key,
+                file_path: if is_system_role(&entry.role) { String::new() } else { entry.path.to_string_lossy().to_string() },
+                content_hash: String::new(),
+            });
+            turn_idx += 1;
+        }
+    }
+
+    let (history, latest_user_input) = if let Some(last_turn) = combined_history.last() {
+        if matches!(last_turn.role, HistoryTurnRole::User) {
+            let latest = last_turn.content.clone();
+            let mut h = combined_history.clone();
+            h.pop();
+            (h, latest)
+        } else {
+            (combined_history.clone(), String::new())
+        }
+    } else {
+        (combined_history.clone(), String::new())
+    };
+
+    // ── 6. Compression ───────────────────────────────────────────────
+    let checkpoint_base = config.output.first()
+        .and_then(|o| PathBuf::from(o).parent().map(|p| p.to_path_buf()))
+        .or_else(|| config.stream_output.as_ref()
+            .and_then(|s| PathBuf::from(s).parent().map(|p| p.to_path_buf())))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let oom_db_path = config.compression_db_path.as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| checkpoint_base.join(".agent_context").join("compression.db"));
+    let oom_compression_config = config.compression.clone();
+    let comp_mgr = CompressionManager::new(&oom_db_path, &config.compression)?;
+    let uncompressed_history: Vec<HistoryTurn> = history.clone();
+    let mut history_mut = history;
+    let provider_max_seq_len = config.provider.as_ref().and_then(|p| match p {
+        crate::config::ProviderConfig::OpenAi { max_seq_len, .. } => *max_seq_len,
+        crate::config::ProviderConfig::Plugin { max_seq_len, .. } => *max_seq_len,
+    });
+    let compressed_context = comp_mgr
+        .get_compressed_context(
+            provider.as_ref(),
+            &mut history_mut,
+            &latest_user_input,
+            config.context_checkpoint_limit,
+            provider_max_seq_len,
+        )
+        .await?;
+
+    // ── 7. Drain volatile context ────────────────────────────────────
+    let volatile_drained: Vec<(Role, String)> = {
+        let mut v_ctx = volatile_context.lock().await;
+        v_ctx.drain(..).collect()
+    };
+
+    // ── 8. Build ChatRequest ─────────────────────────────────────────
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    for (role, content) in &compressed_context {
+        messages.push(ChatMessage {
+            role: role.clone(),
+            content: content.clone(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    for (role, content) in &volatile_drained {
+        messages.push(ChatMessage {
+            role: role.clone(),
+            content: content.clone(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    messages.push(ChatMessage {
+        role: Role::User,
+        content: latest_user_input,
+        tool_calls: None,
+        tool_call_id: None,
+    });
+
+    let sampling = ProviderSamplingConfig::new(None);
+
+    // ── 9. Prepare output paths ──────────────────────────────────────
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let output_file_path: Option<PathBuf> = config.output.first().map(|o| {
+        PathBuf::from(o).join(format!("out-{}.txt", timestamp))
+    });
+
+    let mut stream_file = if let Some(ref stream_dir) = config.stream_output {
+        let stream_path = PathBuf::from(stream_dir).join(format!("out-{}.txt", timestamp));
+        fs::create_dir_all(stream_dir).await?;
+        Some(fs::File::create(&stream_path).await?)
+    } else {
+        None
+    };
+
+    // ── 10. Constraint ───────────────────────────────────────────────
+    let constraint = output_schema.map(|(_, _, c)| c);
+
+    let tool_choice = if tools.is_empty() {
+        ProviderToolChoice::None
+    } else {
+        ProviderToolChoice::Auto
+    };
+
+    // ── 11. Inference loop ───────────────────────────────────────────
+    let mut final_output = String::new();
+    let mut tools_executed = false;
+
+    loop {
+        let request = ChatRequest {
+            messages: messages.clone(),
+            sampling: sampling.clone(),
+            tools: if tools.is_empty() { None } else { Some(tools.clone()) },
+            tool_choice: tool_choice.clone(),
+            constraint: constraint.clone(),
+            enable_thinking: config.enable_thinking,
+            images: Vec::new(),
+            audios: Vec::new(),
+            videos: Vec::new(),
+            model: None,
+        };
+
+        let mut accumulated_content = String::new();
+        let mut current_tool_calls: Vec<ToolCallDelta> = Vec::new();
+        let mut stream = provider.stream_chat(request).await?;
+
+        use futures::StreamExt;
+        while let Some(event) = stream.next().await {
+            match event? {
+                ProviderEvent::Chunk(text) => {
+                    accumulated_content.push_str(&text);
+                    if let Some(ref mut f) = stream_file {
+                        let _ = f.write_all(text.as_bytes()).await;
+                        let _ = f.flush().await;
+                    }
+                }
+                ProviderEvent::Reasoning(reasoning) => {
+                    if let Some(ref mut f) = stream_file {
+                        let _ = f.write_all(reasoning.as_bytes()).await;
+                        let _ = f.flush().await;
+                    }
+                }
+                ProviderEvent::ToolCall(tc) => {
+                    current_tool_calls.push(tc);
+                }
+                ProviderEvent::Error(msg) => {
+                    logger.log(&format!("Provider error: {}", msg)).await;
+                }
+                ProviderEvent::Done => break,
+            }
+        }
+
+        final_output = accumulated_content.clone();
+
+        // ── 12. Tool calls ───────────────────────────────────────────
+        if current_tool_calls.is_empty() {
+            if !final_output.is_empty() {
+                if let Some(ref output_path) = output_file_path {
+                    logger.log(&format!("Turn complete, writing {} chars to: {:?}", final_output.len(), output_path)).await;
+                    let _ = fs::write(output_path, &final_output).await;
+                }
+            }
+            break;
+        }
+
+        logger.log(&format!("Executing {} tool calls", current_tool_calls.len())).await;
+
+        // Add assistant message with tool calls
+        let tc_response: Vec<ToolCall> = current_tool_calls.iter().map(|tc| ToolCall {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            arguments: tc.arguments.clone(),
+        }).collect();
+        messages.push(ChatMessage {
+            role: Role::Assistant,
+            content: accumulated_content,
+            tool_calls: Some(tc_response),
+            tool_call_id: None,
+        });
+
+        // Execute each tool
+        for (tool_idx, tc) in current_tool_calls.iter().enumerate() {
+            let result = if let Some(ref registry) = tool_registry {
+                if let Some(binary_name) = registry.name_to_binary.get(&tc.name) {
+                    match execute_tool_binary(binary_name, &tc.arguments).await {
+                        Ok(output) => {
+                            if tc.name == "load_into_context" {
+                                volatile_context.lock().await.push((
+                                    Role::System,
+                                    output,
+                                ));
+                                "Files loaded into context for next turn.".into()
+                            } else {
+                                output
+                            }
+                        }
+                        Err(e) => format!("Error executing {}: {}", tc.name, e),
+                    }
+                } else {
+                    format!("Unknown tool: {}", tc.name)
+                }
+            } else {
+                "Tools are not enabled for this agent.".into()
+            };
+
+            let tool_dest_dir = config.tool_output.clone().unwrap_or_else(|| {
+                config.output.first()
+                    .map(|o| format!("{}/tool_output", o))
+                    .unwrap_or_else(|| "/tmp/agentgraph_tool_output".to_string())
+            });
+            let _ = fs::create_dir_all(&tool_dest_dir).await;
+            let tool_output_path = PathBuf::from(tool_dest_dir).join(format!(
+                "tool-{}-{}-{}-{}.txt",
+                tc.name, tool_idx, timestamp, tc.id
+            ));
+            let _ = fs::write(&tool_output_path, &result).await;
+
+            messages.push(ChatMessage {
+                role: Role::Tool,
+                content: result,
+                tool_calls: None,
+                tool_call_id: Some(tc.id.clone()),
+            });
+        }
+        tools_executed = true;
+    }
+
+    logger.log("Inference turn complete (provider)").await;
+    Ok(final_output)
 }

@@ -485,6 +485,123 @@ async fn send_chat_action(client: &reqwest::Client, token: &str, chat_id: i64, a
     }
 }
 
+/// Classify a file extension into a Telegram media type.
+fn classify_media(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "png" | "webp" => "photo",
+        "mp4" | "webm" | "mov" | "avi" | "mkv" | "m4v" => "video",
+        "ogg" | "opus" => "voice",
+        "mp3" | "wav" | "flac" | "aac" | "m4a" => "audio",
+        "gif" => "animation",
+        _ => "document",
+    }
+}
+
+/// Send a media file to a Telegram chat using the appropriate API method.
+async fn send_media_telegram(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    file_path: &str,
+    caption: Option<&str>,
+) {
+    let path = std::path::Path::new(file_path);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+    let media_type = classify_media(ext);
+
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "ag-api-telegram: failed to read media file {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("file.{}", ext));
+
+    let api_method = match media_type {
+        "photo" => "sendPhoto",
+        "video" => "sendVideo",
+        "voice" => "sendVoice",
+        "audio" => "sendAudio",
+        "animation" => "sendAnimation",
+        _ => "sendDocument",
+    };
+
+    let field_name = match media_type {
+        "photo" => "photo",
+        "video" => "video",
+        "voice" => "voice",
+        "audio" => "audio",
+        "animation" => "animation",
+        _ => "document",
+    };
+
+    let mut form = reqwest::multipart::Form::new()
+        .part(
+            field_name,
+            reqwest::multipart::Part::bytes(bytes)
+                .file_name(fname)
+                .mime_str(match media_type {
+                    "photo" => "image/jpeg",
+                    "video" => "video/mp4",
+                    "voice" => "audio/ogg",
+                    "audio" => "audio/mpeg",
+                    "animation" => "video/mp4",
+                    _ => "application/octet-stream",
+                })
+                .unwrap_or_else(|_| reqwest::multipart::Part::bytes(vec![])),
+        )
+        .text("chat_id", chat_id.to_string());
+
+    if let Some(cap) = caption {
+        form = form.text("caption", cap.to_string());
+    }
+
+    let url = format!("https://api.telegram.org/bot{token}/{api_method}");
+    match client.post(&url).multipart(form).send().await {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                eprintln!(
+                    "ag-api-telegram: {api_method} failed (chat {chat_id}): {body}"
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "ag-api-telegram: {api_method} transport error (chat {chat_id}): {e}"
+            );
+        }
+    }
+}
+
+/// Send multiple media files to a Telegram chat.
+/// The first file's caption is used (if provided), subsequent files get no caption.
+async fn send_media_batch_telegram(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    media_paths: &[String],
+    first_caption: Option<&str>,
+) {
+    for (i, path) in media_paths.iter().enumerate() {
+        let cap = if i == 0 { first_caption } else { None };
+        send_media_telegram(client, token, chat_id, path, cap).await;
+        // Small delay between media sends to avoid rate limiting
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 async fn write_access_request(user_id: i64, chat_id: i64, chat_type: &str, agent: &str, message: &str) {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -1061,6 +1178,7 @@ async fn main() {
                         steps: steps.clone(),
                         model: agent,
                         stream: use_stream,
+                        enable_thinking: None,
                     },
                 )
                 .await
@@ -1156,6 +1274,30 @@ send_message_telegram(
                                         "ag-api-telegram: streaming done (chat {chat_id}, final {} chars)",
                                         last_content.len(),
                                     );
+
+                                    // Check for .media file and send any media
+                                    let media_path = PathBuf::from(&stream_dir).join(".media");
+                                    if let Ok(media_json) =
+                                        tokio::fs::read_to_string(&media_path).await
+                                    {
+                                        if let Ok(media_files) =
+                                            serde_json::from_str::<Vec<String>>(&media_json)
+                                        {
+                                            eprintln!(
+                                                "ag-api-telegram: sending {} media file(s) (chat {chat_id})",
+                                                media_files.len(),
+                                            );
+                                            send_media_batch_telegram(
+                                                &client,
+                                                token,
+                                                chat_id,
+                                                &media_files,
+                                                None,
+                                            )
+                                            .await;
+                                        }
+                                    }
+
                                     break;
                                 }
                             }
@@ -1172,7 +1314,21 @@ send_message_telegram(
                             }
                         } else if let Some(reply) = sc_resp.content {
                             // ── Blocking path ───────────────────────────
+                            // Send text first, then media
                             send_message_telegram(&client, token, chat_id, &reply).await;
+
+                            // Send any media files returned in the response
+                            if !sc_resp.media.is_empty() {
+                                send_media_batch_telegram(
+                                    &client,
+                                    token,
+                                    chat_id,
+                                    &sc_resp.media,
+                                    None,
+                                )
+                                .await;
+                            }
+
                             let mut chats = state.chats.lock().await;
                             if let Some(chat) = chats.get_mut(&chat_id) {
                                 chat.history.push(SessionStep {
@@ -1181,6 +1337,16 @@ send_message_telegram(
                                     media: Vec::new(),
                                 });
                             }
+                        } else if !sc_resp.media.is_empty() {
+                            // No text, but we have media to send
+                            send_media_batch_telegram(
+                                &client,
+                                token,
+                                chat_id,
+                                &sc_resp.media,
+                                None,
+                            )
+                            .await;
                         } else {
                             send_message_telegram(&client, token, chat_id, "_(empty response)_").await;
                         }

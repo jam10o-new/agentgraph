@@ -63,11 +63,13 @@ pub enum Command {
 
     /// High-level command: run a chat turn within a session. The leader handles
     /// all session management, agent spawning, inference, and caching internally.
+    /// `enable_thinking` optionally overrides the agent config's value per-turn.
     SessionChat {
         session_id: String,
         steps: Vec<SessionStep>,
         model: String,
         stream: bool,
+        enable_thinking: Option<bool>,
     },
 
     /// List all children of a given node hash. Returns JSON array of
@@ -103,6 +105,32 @@ pub enum Command {
     SessionDeletePersisted {
         session_id: String,
     },
+
+    /// Resume inference after a heavy tool has completed.  The leader reads
+    /// the state file, writes the tool result and accumulated content to
+    /// the agent's directories, and re-triggers inference.
+    ResumeHeavyTool {
+        path: String,
+    },
+
+    /// Initiate a remote session with a contact from the contact book.
+    /// The leader looks up the contact, creates a session tree, and
+    /// returns the session ID.
+    SessionContactInitiate {
+        contact: String,
+        message: String,
+    },
+
+    /// List contacts from the contact book.
+    SessionContactList,
+
+    /// Send a message (with optional media) to a contact's session.
+    /// Media paths are local file paths to media to attach.
+    SessionContactSendMessage {
+        contact: String,
+        message: String,
+        media: Vec<String>,
+    },
 }
 
 /// Response from a SessionChat command.
@@ -111,6 +139,10 @@ pub struct SessionChatResponse {
     pub ok: bool,
     pub content: Option<String>,
     pub stream_path: Option<String>,
+    /// File paths to media files (images, video, audio, documents) generated
+    /// during inference that the API frontend should deliver to the user.
+    #[serde(default)]
+    pub media: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -124,6 +156,23 @@ pub struct SessionStep {
     /// input directories before triggering inference.
     #[serde(default)]
     pub media: Vec<String>,
+}
+
+/// State persisted to disk when offloading a heavy-tool call.
+/// The leader saves this before exiting; the heavy-tool runner
+/// reads it to know what to execute and how to resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeavyToolState {
+    pub agent_name: String,
+    pub agent_config: ag_config::AgentConfig,
+    pub global_config: ag_config::Config,
+    pub tool_binary: String,
+    pub tool_name: String,
+    pub tool_args: String,
+    pub tool_call_id: String,
+    /// Assistant content accumulated before the tool call was emitted.
+    pub accumulated_content: String,
+    pub timestamp: u128,
 }
 
 /// Structured response returned by session commands over IPC.

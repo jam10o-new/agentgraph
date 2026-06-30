@@ -1,0 +1,19 @@
+[package]
+name = "ag-provider-openai"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ag-provider-types = { path = "../ag-provider-types" }
+ag-config = { path = "../ag-config" }
+ag-utils = { path = "../ag-utils" }
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "time", "io-util"] }
+tracing = "0.1"
+bytes = "1"
+tokio-stream = "0.1"

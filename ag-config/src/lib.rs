@@ -77,6 +77,17 @@ pub struct ModelConfig {
     /// Set to false to disable calibration entirely.
     #[serde(default = "default_calibration_enabled")]
     pub calibration_enabled: bool,
+    /// Maximum sequence length for the auto device map.
+    /// If unset, mistralrs defaults to 4096 for multimodal models.
+    /// Set to a larger value (e.g. 32768) to allow longer context.
+    #[serde(default)]
+    pub max_seq_len: Option<usize>,
+    /// Optional inference provider.  When set, this model uses the
+    /// provider plugin instead of loading via mistralrs.  Agents that
+    /// reference this model will automatically inherit the provider
+    /// (unless the agent explicitly overrides with its own provider).
+    #[serde(default)]
+    pub provider: Option<ProviderConfig>,
 }
 
 fn default_max_num_seqs() -> usize {
@@ -160,6 +171,63 @@ pub struct Config {
     pub plugins: HashMap<String, serde_yaml::Value>,
 }
 
+/// Provider configuration for an agent.
+///
+/// When set, the agent uses an external inference provider (e.g. an
+/// OpenAI-compatible API) instead of loading a model directly via
+/// mistralrs.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(tag = "type")]
+pub enum ProviderConfig {
+    /// OpenAI-compatible HTTP API (ag-provider-openai crate).
+    #[serde(rename = "openai")]
+    OpenAi {
+        /// Base URL of the OpenAI-compatible API.
+        #[serde(default = "default_provider_api_base")]
+        api_base: String,
+        /// API key (empty for local servers that don't require auth).
+        #[serde(default)]
+        api_key: String,
+        /// Model name to use in API requests.
+        #[serde(default = "default_provider_model")]
+        model: String,
+        /// Shell command to start the server automatically.
+        /// The provider will spawn this as a subprocess and wait for
+        /// the API to become healthy before servicing requests.
+        #[serde(default)]
+        server_command: Option<String>,
+        /// Override max sequence length (for context window management).
+        #[serde(default)]
+        max_seq_len: Option<usize>,
+        /// Timeout in seconds waiting for the server to become healthy
+        /// after spawning `server_command`.
+        #[serde(default = "default_startup_timeout")]
+        startup_timeout_secs: u64,
+    },
+    /// External plugin binary discovered via `config.plugins.provider-{name}`.
+    /// The binary name is `ag-provider-{name}` (found on PATH).
+    #[serde(rename = "plugin")]
+    Plugin {
+        /// Plugin name — maps to `ag-provider-{name}` on PATH.
+        name: String,
+        /// Override max sequence length.
+        #[serde(default)]
+        max_seq_len: Option<usize>,
+    },
+}
+
+fn default_provider_api_base() -> String {
+    "http://127.0.0.1:8338".into()
+}
+
+fn default_provider_model() -> String {
+    "default".into()
+}
+
+fn default_startup_timeout() -> u64 {
+    300
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct AgentConfig {
     pub inputs: Vec<String>,
@@ -187,6 +255,11 @@ pub struct AgentConfig {
     pub compression_db_path: Option<String>,
     #[serde(default)]
     pub excluded_from_summary: Vec<String>,
+    /// Inference provider to use instead of loading a model via mistralrs.
+    /// When set, `model` is still required (it controls agent config lookup),
+    /// but the model is not loaded into memory — the provider serves inference.
+    #[serde(default)]
+    pub provider: Option<ProviderConfig>,
     /// When true, prepend file metadata (`[File: /path | Modified: ts | Size: N bytes]`)
     /// before each user message's content. When false (default), skip metadata.
     #[serde(default)]
@@ -196,6 +269,14 @@ pub struct AgentConfig {
     /// An empty list means no tools are available at all.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Heavy tool binaries.  When the model calls a tool whose binary
+    /// name appears in this list, the leader offloads the call to a
+    /// background process (unloading the model first), then respawns
+    /// and resumes inference once the tool completes.  This avoids GPU
+    /// memory contention between the LLM and tools that also need
+    /// accelerator resources (e.g. image generation, video processing).
+    #[serde(default)]
+    pub heavy_tools: Vec<String>,
     #[serde(default)]
     pub consume_tool_calls: bool,
     #[serde(default = "default_true")]

@@ -271,6 +271,7 @@ async fn chat_completions(
         steps,
         model: req.model.clone(),
         stream: false,
+        enable_thinking: None,
     };
 
     let resp = match ipc(&state.socket, &cmd).await {
@@ -295,6 +296,7 @@ async fn chat_completions(
             ok: true,
             content: resp.data.clone(),
             stream_path: None,
+            media: Vec::new(),
             error: None,
         });
 

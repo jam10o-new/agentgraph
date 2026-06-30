@@ -385,6 +385,81 @@ impl RemoteSessionState {
         }
     }
 
+    /// Persist all active tempdir-based sessions to disk so they survive
+    /// a leader restart (e.g. after heavy-tool offloading).  Sessions that
+    /// already have a persistent root are skipped.
+    pub async fn persist_all_trees(&self) {
+        let sessions = self.sessions.lock().await;
+        let mut index = read_index().await;
+        let mut changed = false;
+
+        for (session_id, entry) in sessions.iter() {
+            // Only persist sessions with a tempdir (ephemeral trees).
+            if entry.active.temp_cleanup.is_some() {
+                let agent = entry
+                    .archive
+                    .as_ref()
+                    .map(|a| a.agent.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                let dest_root = archive_path(&agent, session_id);
+                let tree = &entry.active;
+
+                // Copy all node directories to the persistent location.
+                let nodes = tree.nodes.lock().await;
+                let mut archive_nodes = HashMap::new();
+                for (hash, meta) in nodes.iter() {
+                    let dir_name = meta
+                        .dir
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let dest = dest_root.join(&dir_name);
+                    if !dest.exists() {
+                        if let Err(e) = copy_dir(&meta.dir, &dest).await {
+                            eprintln!(
+                                "[remote_session] Failed to copy {} to {}: {}",
+                                meta.dir.display(),
+                                dest.display(),
+                                e
+                            );
+                        }
+                    }
+                    archive_nodes.insert(
+                        hash.clone(),
+                        NodeMeta {
+                            dir: dest,
+                            role: meta.role.clone(),
+                            parent_hash: meta.parent_hash.clone(),
+                        },
+                    );
+                }
+                drop(nodes);
+
+                // Write meta.json.
+                if let Ok(json) = serde_json::to_string(&archive_nodes) {
+                    let _ = std::fs::write(dest_root.join("meta.json"), &json);
+                }
+
+                // Update index.
+                index.sessions.insert(
+                    session_id.clone(),
+                    IndexEntry {
+                        agent: agent.clone(),
+                        path: dest_root.to_string_lossy().to_string(),
+                    },
+                );
+                changed = true;
+            }
+        }
+
+        drop(sessions);
+        if changed {
+            write_index(&index).await;
+        }
+    }
+
     /// Delete: remove the active tree AND the persistent archive from disk
     /// + index.  The entire session entry is removed.
     pub async fn delete_tree(&self, id: &str) {

@@ -1,12 +1,14 @@
 use crate::agent::Agent;
 use crate::config::{AgentConfig, Config};
 use crate::ipc::{Command, IpcResponse, SessionChatResponse, SessionStep};
-use crate::provider_registry::ProviderRegistry;
+use crate::inference_provider::{create_provider_from_config, Role};
+use crate::plugin_provider::PluginProvider;
+use crate::provider_registry::{ProviderPluginInfo, ProviderRegistry};
 use crate::remote_session::{ConversationStep, RemoteSessionState};
 use crate::utils::{LEADER_PID_FILE, LeaderStatus, is_leader_alive};
 use anyhow::{Context, Result, anyhow};
-use crate::inference_provider::{create_provider_from_config, Role};
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -14,14 +16,41 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
+/// Media file extensions that should be automatically detected in output dirs.
+fn is_media_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "gif"
+            | "mp4" | "webm" | "mov" | "avi" | "mkv" | "m4v"
+            | "ogg" | "opus" | "mp3" | "wav" | "flac" | "aac" | "m4a"
+            | "pdf" | "doc" | "docx" | "txt" | "csv" | "json" | "zip" | "tar" | "gz"
+    )
+}
+
+/// Scan a directory for media files and return their absolute paths.
+fn scan_media_files(dir: &Path) -> Vec<String> {
+    let mut media = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if is_media_extension(ext) {
+                        media.push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+    media
+}
+
 pub struct AgentEntry {
     pub handle: tokio::task::JoinHandle<()>,
     pub volatile_context: Arc<Mutex<Vec<(Role, String)>>>,
     pub output_forwarder: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
     pub trigger_path: PathBuf,
 }
-
-
 
 pub struct Leader {
     pub config: Arc<Mutex<Config>>,
@@ -76,35 +105,52 @@ impl Leader {
         }
 
         let config = self.config.lock().await.clone();
+
         // Resolve provider: agent-level config takes precedence, then
         // model-level config as fallback.
         let effective_provider_config = agent_config
             .provider
             .as_ref()
             .or_else(|| config.models.get(&agent_config.model).and_then(|m| m.provider.as_ref()));
-        let provider: Arc<dyn crate::InferenceProvider> =
-            if let Some(pc) = effective_provider_config {
-                match pc {
-                    crate::config::ProviderConfig::Plugin { name, max_seq_len } => {
-                        self.provider_registry.get(name)
-                            .map(|info| {
-                                Arc::new(crate::plugin_provider::PluginProvider::new(
-                                    info.binary_path, *max_seq_len,
-                                )) as Arc<dyn crate::InferenceProvider>
-                            })
-                            .unwrap_or_else(|| panic!(
-                                "Provider plugin '{}' not found in registry", name
-                            ))
-                    }
-                    _ => {
-                        create_provider_from_config(pc).await
-                            .expect("Failed to create provider")
-                            .expect("No provider created for config")
+
+        let provider = if let Some(pc) = effective_provider_config {
+            match pc {
+                crate::config::ProviderConfig::Plugin { name, max_seq_len } => {
+                    match self.provider_registry.get(name) {
+                        Some(info) => {
+                            Some(Arc::new(PluginProvider::new(
+                                info.binary_path,
+                                *max_seq_len,
+                            )) as Arc<dyn crate::InferenceProvider>)
+                        }
+                        None => {
+                            eprintln!(
+                                "Leader: provider plugin '{}' not found in registry \
+                                 (binary ag-provider-{} not on PATH?), \
+                                 plugin not found for agent {}",
+                                name, name, name
+                            );
+                            None
+                        }
                     }
                 }
-            } else {
-                panic!("No provider configured for agent")
-            };
+                _ => {
+                    match create_provider_from_config(pc).await {
+                        Ok(Some(p)) => Some(p),
+                        Ok(None) => {
+                            eprintln!("No provider created for config {:?}", pc);
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to create provider: {:?}", e);
+                            None
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
         let mut agent = Agent::new(
             name.clone(),
             agent_config.clone(),
@@ -352,7 +398,6 @@ impl Leader {
                         prepend_file_metadata: false,
                         tools: vec![],
                         heavy_tools: vec![],
-                        provider: None,
                         enable_thinking: false,
                         inference_retries: 3,
                         enable_oom_recovery: true,
@@ -466,9 +511,11 @@ impl Leader {
                 steps,
                 model,
                 stream,
-                enable_thinking: _,
+                enable_thinking,
             } => {
-                let resp = self.run_session_chat(&session_id, &steps, &model, stream).await;
+                let resp = self
+                    .run_session_chat(&session_id, &steps, &model, stream, enable_thinking)
+                    .await;
                 match resp {
                     Ok(sc) => IpcResponse::ok_json(&sc),
                     Err(e) => IpcResponse::err(e.to_string()),
@@ -504,6 +551,95 @@ impl Leader {
                 self.sessions.delete_tree(&session_id).await;
                 IpcResponse::ok_str("deleted")
             }
+            Command::ResumeHeavyTool { path: _ } => {
+                // The actual heavy-tool resume is handled by the
+                // heavy-tool-runner CLI subcommand which writes files
+                // and spawns a fresh leader.  This IPC path exists for
+                // programmatic callers that want an acknowledgement.
+                IpcResponse::ok_str("heavy_tool_acknowledged")
+            }
+            Command::SessionContactInitiate { contact, message } => {
+                use crate::contacts::ContactBook;
+                let book = ContactBook::load();
+                if let Some(entry) = book.get(&contact) {
+                    let session_id = entry.remote_id.clone();
+                    // Create a tree for this contact.
+                    let tree = self.sessions.get_or_create_tree(&session_id).await;
+                    // Walk the message as a single user step.
+                    let step = crate::remote_session::ConversationStep {
+                        role: "user".into(),
+                        content: message,
+                    };
+                    match crate::remote_session::build_conversation(&tree, &[step]).await {
+                        Ok(state) => IpcResponse::ok_json(&serde_json::json!({
+                            "session_id": session_id,
+                            "current_hash": state.current_hash,
+                            "user_dirs": state.user_dirs,
+                        })),
+                        Err(e) => IpcResponse::err(format!("build_conversation: {e}")),
+                    }
+                } else {
+                    IpcResponse::err(format!("contact '{}' not found in contact book", contact))
+                }
+            }
+            Command::SessionContactList => {
+                use crate::contacts::ContactBook;
+                let book = ContactBook::load();
+                let entries: Vec<_> = book
+                    .list()
+                    .into_iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "name": e.name,
+                            "remote_id": e.remote_id,
+                            "metadata": e.metadata,
+                        })
+                    })
+                    .collect();
+                IpcResponse::ok_json(&entries)
+            }
+            Command::SessionContactSendMessage {
+                contact,
+                message,
+                media,
+            } => {
+                use crate::contacts::ContactBook;
+                let book = ContactBook::load();
+                if let Some(entry) = book.get(&contact) {
+                    let session_id = entry.remote_id.clone();
+                    let tree = self.sessions.get_or_create_tree(&session_id).await;
+                    let step = crate::remote_session::ConversationStep {
+                        role: "user".into(),
+                        content: message.clone(),
+                    };
+                    // If media files exist, copy them into the session's user dir
+                    if !media.is_empty() {
+                        let tree2 = tree.clone();
+                        let state = crate::remote_session::build_conversation(&tree2, &[step]).await;
+                        if let Ok(state) = state {
+                            if let Some(last_user_dir) = state.user_dirs.last() {
+                                let dest_dir = PathBuf::from(last_user_dir);
+                                let _ = std::fs::create_dir_all(&dest_dir);
+                                for media_path in &media {
+                                    let src = Path::new(media_path);
+                                    if let Some(fname) = src.file_name() {
+                                        let dest = dest_dir.join(fname);
+                                        let _ = std::fs::copy(src, &dest);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let _ = crate::remote_session::build_conversation(&tree, &[step]).await;
+                    }
+                    IpcResponse::ok_str(format!(
+                        "Message sent to contact '{}' (session {})",
+                        contact, session_id
+                    ))
+                } else {
+                    IpcResponse::err(format!("contact '{}' not found in contact book", contact))
+                }
+            }
             _ => IpcResponse::err("unexpected command in session handler"),
         };
         serde_json::to_string(&resp)
@@ -526,6 +662,7 @@ impl Leader {
         steps: &[SessionStep],
         model: &str,
         stream: bool,
+        enable_thinking: Option<bool>,
     ) -> Result<SessionChatResponse> {
         let config = self.config.lock().await;
         let base_agent = config
@@ -563,10 +700,13 @@ impl Leader {
 
         // Build isolated agent config
         let mut isolated_config = base_agent.clone();
+        if let Some(et) = enable_thinking {
+            isolated_config.enable_thinking = et;
+        }
         isolated_config.inputs = state.user_dirs.clone();
         let mut output_dirs = vec![response_dir.to_string_lossy().to_string()];
         output_dirs.extend(state.assistant_dirs);
-        isolated_config.output = output_dirs;
+        isolated_config.output = output_dirs.clone();
         isolated_config.system = if state.system_msgs.is_empty() {
             base_agent.system.clone()
         } else {
@@ -592,36 +732,31 @@ impl Leader {
             }
         }
 
-        // Resolve a provider for the session agent.
+        let agent_name = format!("session-{}-{}", session_id, uuid::Uuid::new_v4());
+
+        // Create a provider for the session agent.
         let provider_config = base_agent
             .provider
             .as_ref()
-            .or_else(|| global_config.models.get(&base_agent.model).and_then(|m| m.provider.as_ref()));
-        let provider: Arc<dyn crate::InferenceProvider> =
-            if let Some(pc) = provider_config {
-                match pc {
-                    crate::config::ProviderConfig::Plugin { name, max_seq_len } => {
-                        self.provider_registry.get(name)
-                            .map(|info| {
-                                Arc::new(crate::plugin_provider::PluginProvider::new(
-                                    info.binary_path, *max_seq_len,
-                                )) as Arc<dyn crate::InferenceProvider>
-                            })
-                            .unwrap_or_else(|| panic!(
-                                "Provider plugin '{}' not found in registry for session chat", name
-                            ))
-                    }
-                    _ => {
-                        create_provider_from_config(pc).await
-                            .expect("Failed to create provider")
-                            .expect("No provider created for config")
-                    }
+            .or_else(|| global_config.models.get(model).and_then(|m| m.provider.as_ref()))
+            .cloned();
+        let provider: Arc<dyn crate::InferenceProvider> = match provider_config {
+            Some(crate::config::ProviderConfig::Plugin { name, max_seq_len }) => {
+                match self.provider_registry.get(&name) {
+                    Some(info) => Arc::new(PluginProvider::new(info.binary_path, max_seq_len))
+                        as Arc<dyn crate::InferenceProvider>,
+                    None => anyhow::bail!(
+                        "Provider plugin '{}' not found in registry for session chat", name
+                    ),
                 }
-            } else {
-                panic!("No provider configured for model '{}' in session chat", model)
-            };
+            }
+            Some(pc) => {
+                create_provider_from_config(&pc).await?
+                    .ok_or_else(|| anyhow::anyhow!("No provider for session chat"))?
+            }
+            None => anyhow::bail!("No provider configured for model '{}'", model),
+        };
 
-        let agent_name = format!("session-{}-{}", session_id, uuid::Uuid::new_v4());
         let agent = crate::Agent::new(
             agent_name,
             isolated_config,
@@ -657,17 +792,26 @@ impl Leader {
         if use_stream {
             // ── Streaming path ───────────────────────────────────────────
             // Spawn a background task that waits for completion, caches the
-            // response, and writes a .done marker so the caller knows when
-            // to stop polling the stream directory.
+            // response, writes a .done marker and a .media file so the
+            // caller knows when to stop polling and what media to send.
             let bg_tree = tree.clone();
             let bg_response_dir = response_dir.to_string_lossy().to_string();
             let bg_stream_dir = stream_dir.to_string_lossy().to_string();
             let bg_hash = state.current_hash.clone();
+            let bg_output_dirs = output_dirs.clone();
 
             tokio::spawn(async move {
                 let after = SystemTime::now();
-                match wait_for_output(Some(bg_response_dir.clone()), after).await {
+                let (_text, _media_files) = match wait_for_output(Some(bg_response_dir.clone()), after).await {
                     Ok(text) => {
+                        // Scan output dirs for media files
+                        let mut media = Vec::new();
+                        for dir in &bg_output_dirs {
+                            let dir_path = Path::new(dir);
+                            if dir_path.exists() {
+                                media.extend(scan_media_files(dir_path));
+                            }
+                        }
                         crate::remote_session::cache_response(
                             &bg_tree,
                             &bg_hash,
@@ -680,6 +824,17 @@ impl Leader {
                             &text,
                         )
                         .await;
+                        // Write media file paths so the caller can send them
+                        if !media.is_empty() {
+                            if let Ok(json) = serde_json::to_string(&media) {
+                                let _ = tokio::fs::write(
+                                    PathBuf::from(&bg_stream_dir).join(".media"),
+                                    &json,
+                                )
+                                .await;
+                            }
+                        }
+                        (text, media)
                     }
                     Err(e) => {
                         eprintln!("Session streaming error: {:?}", e);
@@ -688,15 +843,16 @@ impl Leader {
                             format!("error: {}", e),
                         )
                         .await;
+                        (String::new(), Vec::new())
                     }
-                }
+                };
             });
 
             Ok(SessionChatResponse {
                 ok: true,
                 content: None,
                 stream_path: Some(stream_dir.to_string_lossy().to_string()),
-                media: vec![],
+                media: Vec::new(),
                 error: None,
             })
         } else {
@@ -713,15 +869,24 @@ impl Leader {
                 &tree,
                 &state.current_hash,
                 &content,
-                response_dir,
+                response_dir.clone(),
             )
             .await;
+
+            // Scan response dir and assistant dirs for media files
+            let mut media_files = Vec::new();
+            for dir in &output_dirs {
+                let dir_path = Path::new(dir);
+                if dir_path.exists() {
+                    media_files.extend(scan_media_files(dir_path));
+                }
+            }
 
             Ok(SessionChatResponse {
                 ok: true,
                 content: Some(content),
                 stream_path: None,
-                media: vec![],
+                media: media_files,
                 error: None,
             })
         }
@@ -733,36 +898,41 @@ async fn wait_for_output(
     output_dir_maybe: Option<String>,
     after: SystemTime,
 ) -> anyhow::Result<String> {
+    use tokio::time::timeout;
     if let Some(output_dir) = output_dir_maybe {
         let output_path = PathBuf::from(output_dir);
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let mut candidates = Vec::new();
-            if let Ok(mut entries) = tokio::fs::read_dir(&output_path).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Ok(metadata) = entry.metadata().await {
-                            let modified = metadata
-                                .modified()
-                                .or_else(|_| metadata.created())
-                                .map_err(|e| anyhow!("mtime: {}: {}", path.display(), e))?;
-                            if modified >= after {
-                                candidates.push((modified, path));
+        timeout(Duration::from_secs(120), async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut candidates = Vec::new();
+                if let Ok(mut entries) = tokio::fs::read_dir(&output_path).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Ok(metadata) = entry.metadata().await {
+                                let modified = metadata
+                                    .modified()
+                                    .or_else(|_| metadata.created())
+                                    .map_err(|e| anyhow!("mtime: {}: {}", path.display(), e))?;
+                                if modified >= after {
+                                    candidates.push((modified, path));
+                                }
                             }
                         }
                     }
                 }
+                if let Some((_, path)) = candidates.into_iter().max_by_key(|(t, _)| *t) {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    return anyhow::Result::Ok(
+                        tokio::fs::read_to_string(&path)
+                            .await
+                            .map_err(|e| anyhow!("read output: {}", e))?,
+                    );
+                }
             }
-            if let Some((_, path)) = candidates.into_iter().max_by_key(|(t, _)| *t) {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                return anyhow::Result::Ok(
-                    tokio::fs::read_to_string(&path)
-                        .await
-                        .map_err(|e| anyhow!("read output: {}", e))?,
-                );
-            }
-        }
+        })
+        .await
+        .map_err(|_| anyhow!("Timeout waiting for agent output"))?
     } else {
         Err(anyhow!("No output directory configured"))
     }
@@ -821,7 +991,76 @@ impl Leader {
         }
     }
 
+    /// Discover provider plugin binaries via the `provider-*` config convention.
+    ///
+    /// Scans `config.plugins` for keys matching `provider-*`.  For each found key,
+    /// looks up `ag-provider-{name}` on PATH and runs it with `--describe` to
+    /// learn its capabilities.  The result is cached in [`ProviderRegistry`].
+    /// Missing binaries log a warning but never prevent startup.
+    async fn discover_provider_plugins(&self) {
+        let config = self.config.lock().await;
+        for (key, value) in &config.plugins {
+            let provider_name = match key.strip_prefix("provider-") {
+                Some(s) => s,
+                None => continue,
+            };
+            let binary_name = format!("ag-provider-{}", provider_name);
+
+            let binary_path = match which::which(&binary_name) {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!(
+                        "Leader: {} not found in PATH — provider-{} unavailable",
+                        binary_name, provider_name
+                    );
+                    continue;
+                }
+            };
+
+            // Run `--describe` to learn capabilities
+            match std::process::Command::new(&binary_path)
+                .arg("--describe")
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Ok(desc) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                        self.provider_registry.register(
+                            provider_name.to_string(),
+                            ProviderPluginInfo {
+                                binary_path,
+                                description: desc,
+                            },
+                        );
+                        println!(
+                            "Leader: discovered provider plugin {} ({})",
+                            binary_name, provider_name
+                        );
+                    } else {
+                        eprintln!(
+                            "Leader: {} --describe returned invalid JSON: {}",
+                            binary_name, stdout
+                        );
+                    }
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!(
+                        "Leader: {} --describe failed ({}): {}",
+                        binary_name, output.status, stderr
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Leader: failed to run {} --describe: {}", binary_name, e);
+                }
+            }
+        }
+    }
+
     pub async fn run(self, pending_command_path: Option<String>) -> Result<()> {
+        // 0. Discover provider plugins before anything else.
+        self.discover_provider_plugins().await;
+
         // 1. Ensure Leader Uniqueness
         let status = is_leader_alive().await;
         match status {
@@ -898,8 +1137,76 @@ impl Leader {
         let pipe_path_clone = pipe_path.clone();
 
         let agents = self.agents.clone();
+        let config_mutex = self.config.clone();
         let sessions = self.sessions.clone();
         let leader_for_ipc = Arc::new(self);
+
+        // ── 5a. Idle model unload & heavy-tool watchdog ────────────
+        //
+        // Periodically watches for heavy-tool signal files written by the
+        // agent when it encounters a heavy tool call.  When detected, the
+        // watchdog persists all remote sessions, spawns the heavy-tool-runner,
+        // and exits the leader so the model is unloaded before the tool runs.
+        {
+            let leader = leader_for_ipc.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+
+                    // ── Heavy-tool signal check ─────────────────────
+                    let signal_dir = PathBuf::from("/tmp/agentgraph");
+                    if let Ok(mut entries) = tokio::fs::read_dir(&signal_dir).await {
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            let fname = entry.file_name();
+                            let fname_str = fname.to_string_lossy();
+                            if fname_str.starts_with("heavy_tool_signal_") && fname_str.ends_with(".json") {
+                                if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
+                                    if let Ok(signal) = serde_json::from_str::<serde_json::Value>(&content) {
+                                        let agent_name = signal["agent"].as_str().unwrap_or("unknown");
+                                        let state_path = signal["state_path"].as_str().unwrap_or("");
+                                        println!(
+                                            "Heavy tool signal for agent '{}' — persisting sessions and spawning runner",
+                                            agent_name
+                                        );
+
+                                        // Persist all remote sessions to disk.
+                                        leader.sessions.persist_all_trees().await;
+
+                                        // Spawn the heavy-tool-runner.
+                                        if let Ok(exe) = std::env::current_exe() {
+                                            let log_dir = PathBuf::from("/tmp/agentgraph");
+                                            let _ = std::fs::create_dir_all(&log_dir);
+                                            let state_path_owned = state_path.to_string();
+                                            if let Ok(log_file) = std::fs::OpenOptions::new()
+                                                .create(true)
+                                                .append(true)
+                                                .open(log_dir.join("leader.log"))
+                                            {
+                                                let _ = std::process::Command::new(&exe)
+                                                    .arg("heavy-tool-runner")
+                                                    .arg("--state-file")
+                                                    .arg(&state_path_owned)
+                                                    .env("AGENTGRAPH_BACKGROUND", "1")
+                                                    .stdout(std::process::Stdio::from(log_file.try_clone().unwrap()))
+                                                    .stderr(std::process::Stdio::from(log_file))
+                                                    .spawn();
+                                            }
+                                        }
+
+                                        // Remove the signal file and exit the leader.
+                                        let _ = tokio::fs::remove_file(entry.path()).await;
+                                        let _ = std::fs::remove_file(LEADER_PID_FILE);
+                                        std::process::exit(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                }
+                }
+            });
+        }
 
         // Accept loop — polls the shared listener; handles None (during
         // socket recovery) by sleeping briefly and retrying.
@@ -922,20 +1229,26 @@ impl Leader {
                     let (mut stream, _) = match accept_result {
                         Ok(v) => v,
                         Err(_) => {
+                            // Listener likely closed during swap — retry
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             continue;
                         }
                     };
 
                     let agents = agents.clone();
+                    
+                    let _config_mutex = config_mutex.clone();
                     let leader = leader_for_ipc.clone();
                     let sessions = sessions.clone();
-                    let _ = &sessions;
+                    let _ = &sessions; // used by session command handler closure capture
 
                     tokio::spawn(async move {
                         let mut buf = Vec::new();
                         if let Ok(_) = stream.read_to_end(&mut buf).await {
                             if let Ok(cmd) = serde_json::from_slice::<Command>(&buf) {
+                                // Check if the binary has been updated since startup.
+                                // If so, restart with the new binary and replay the
+                                // current command on the new leader.
                                 if leader.binary_changed() {
                                     leader.prepare_restart(&cmd);
                                     let _ = stream.write_all(b"RESTARTING").await;
@@ -962,11 +1275,18 @@ impl Leader {
                                             }
                                         }
                                     }
-                                    Command::SpawnAgent { name, config: agent_config } => {
-                                        if let Err(e) = leader.spawn_agent(name, agent_config).await {
-                                            let _ = stream.write_all(
-                                                format!("Error spawning agent: {}", e).as_bytes(),
-                                            ).await;
+                                    Command::SpawnAgent {
+                                        name,
+                                        config: agent_config,
+                                    } => {
+                                        if let Err(e) = leader.spawn_agent(name, agent_config).await
+                                        {
+                                            let _ = stream
+                                                .write_all(
+                                                    format!("Error spawning agent: {}", e)
+                                                        .as_bytes(),
+                                                )
+                                                .await;
                                         } else {
                                             let _ = stream.write_all(b"Agent Spawned").await;
                                         }
@@ -976,9 +1296,16 @@ impl Leader {
                                             let agents_map = agents.lock().await;
                                             if let Some(entry) = agents_map.get(&name) {
                                                 if let Some(msg) = message {
-                                                    entry.volatile_context.lock().await.push((Role::User, msg));
+                                                    entry
+                                                        .volatile_context
+                                                        .lock()
+                                                        .await
+                                                        .push((Role::User, msg));
                                                 }
-                                                Some((entry.output_forwarder.clone(), entry.trigger_path.clone()))
+                                                Some((
+                                                    entry.output_forwarder.clone(),
+                                                    entry.trigger_path.clone(),
+                                                ))
                                             } else {
                                                 None
                                             }
@@ -986,7 +1313,9 @@ impl Leader {
 
                                         match forwarder_opt {
                                             Some((forwarder, trigger_path)) => {
-                                                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                                let (tx, mut rx) =
+                                                    tokio::sync::mpsc::unbounded_channel::<String>(
+                                                    );
                                                 forwarder.lock().await.replace(tx);
 
                                                 let trigger_file = trigger_path.join(format!(
@@ -1000,9 +1329,12 @@ impl Leader {
                                                 let _ = tokio::fs::remove_file(&trigger_file).await;
 
                                                 if !quiet {
-                                                    let _ = stream.write_all(
-                                                        format!("Triggered agent {}\n", name).as_bytes(),
-                                                    ).await;
+                                                    let _ = stream
+                                                        .write_all(
+                                                            format!("Triggered agent {}\n", name)
+                                                                .as_bytes(),
+                                                        )
+                                                        .await;
                                                 }
 
                                                 let output = tokio::time::timeout(
@@ -1019,9 +1351,12 @@ impl Leader {
                                                 let _ = stream.write_all(output.as_bytes()).await;
                                             }
                                             None => {
-                                                let _ = stream.write_all(
-                                                    format!("Agent {} not found", name).as_bytes(),
-                                                ).await;
+                                                let _ = stream
+                                                    .write_all(
+                                                        format!("Agent {} not found", name)
+                                                            .as_bytes(),
+                                                    )
+                                                    .await;
                                             }
                                         }
                                     }
@@ -1047,6 +1382,7 @@ impl Leader {
                                         let _ = stream.write_all(b"Shutting down...").await;
                                         std::process::exit(0);
                                     }
+                                    // ── Session-tree commands ────────
                                     Command::SessionChat { .. }
                                     | Command::SessionListChildren { .. }
                                     | Command::SessionPath { .. }
@@ -1082,19 +1418,25 @@ impl Leader {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 if !pipe_path_clone.exists() {
+                    // Take the old listener (closes fd), remove any
+                    // leftover socket inode, then rebind.
                     let old = listener_ref.lock().await.take();
                     drop(old);
                     let _ = tokio::fs::remove_file(&pipe_path_clone).await;
                     match UnixListener::bind(&pipe_path_clone) {
                         Ok(new_listener) => {
                             *listener_ref.lock().await = Some(new_listener);
-                            println!("Socket recreated at {:?} (was deleted externally)", pipe_path_clone);
+                            println!(
+                                "Socket recreated at {:?} (was deleted externally)",
+                                pipe_path_clone
+                            );
                         }
                         Err(e) => {
                             eprintln!("Failed to recreate socket {:?}: {}", pipe_path_clone, e);
                         }
                     }
                 }
+                // Also ensure the PID file exists
                 let pid_file = std::path::Path::new(LEADER_PID_FILE);
                 if !pid_file.exists() {
                     let _ = std::fs::write(pid_file, pid.to_string());

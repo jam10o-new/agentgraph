@@ -198,6 +198,14 @@ enum Commands {
     },
     /// Print the full version string (including git commit hash)
     Version,
+    /// Run a heavy tool in the background and resume the leader afterwards.
+    /// This is invoked automatically when the agent detects a heavy tool
+    /// call during inference.  Not intended for direct human use.
+    HeavyToolRunner {
+        /// Path to the HeavyToolState JSON file.
+        #[arg(long)]
+        state_file: String,
+    },
 }
 
 #[tokio::main]
@@ -224,6 +232,9 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::HeavyToolRunner { state_file } => {
+            return run_heavy_tool_runner(&state_file).await;
+        }
         Commands::Leader {
             config,
             pending_command: _,
@@ -342,6 +353,8 @@ async fn main() -> Result<()> {
                         excluded_from_summary,
                         prepend_file_metadata: false,
                         tools,
+                        heavy_tools: vec![],
+                        provider: None,
                         enable_thinking,
                         inference_retries: inference_retries.unwrap_or(3),
                         inference_retry_delay_ms: inference_retry_delay_ms.unwrap_or(500),
@@ -502,4 +515,137 @@ async fn send_command(cmd: Command) -> Result<()> {
     }
 
     Err(anyhow!("Failed to send command after {} retries", max_retries))
+}
+
+/// The heavy-tool-runner: reads the saved state, executes the heavy tool
+/// binary, wires the result back into the agent's directories, and then
+/// respawns the leader so inference can resume where it left off.
+async fn run_heavy_tool_runner(state_file: &str) -> Result<()> {
+    use agentgraph::ipc::HeavyToolState;
+    use std::path::PathBuf;
+
+    let state: HeavyToolState = {
+        let content = std::fs::read_to_string(state_file)
+            .map_err(|e| anyhow!("Failed to read state file {}: {}", state_file, e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| anyhow!("Failed to parse state file {}: {}", state_file, e))?
+    };
+
+    eprintln!(
+        "[heavy-tool-runner] Executing '{}' for agent '{}'",
+        state.tool_name, state.agent_name
+    );
+
+    // 1. Find and run the tool binary with the saved arguments.
+    let tool_path = which::which(&state.tool_binary)
+        .map_err(|e| anyhow!("Tool binary '{}' not found on PATH: {}", state.tool_binary, e))?;
+
+    let tool_output = {
+        let mut child = std::process::Command::new(&tool_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn '{}': {}", state.tool_binary, e))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(state.tool_args.as_bytes())?;
+        }
+        drop(child.stdin.take());
+
+        let output = child.wait_with_output()
+            .map_err(|e| anyhow!("Failed to wait for '{}': {}", state.tool_binary, e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            format!(
+                "Error: tool '{}' exited with status {}.\nStderr: {}",
+                state.tool_binary, output.status, stderr
+            )
+        } else {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+    };
+
+    eprintln!(
+        "[heavy-tool-runner] Tool '{}' completed ({} chars)",
+        state.tool_name,
+        tool_output.len()
+    );
+
+    // 2. Determine the agent's directories from the saved config.
+    let config = &state.agent_config;
+
+    // Tool output directory.
+    let tool_dest_dir = config.tool_output.clone().unwrap_or_else(|| {
+        config
+            .output
+            .first()
+            .map(|o| format!("{}/tool_output", o))
+            .unwrap_or_else(|| "/tmp/agentgraph_tool_output".to_string())
+    });
+    let _ = std::fs::create_dir_all(&tool_dest_dir);
+
+    // Output directory for accumulated assistant content.
+    let output_dir = config.output.first().cloned().unwrap_or_else(|| ".".to_string());
+    let _ = std::fs::create_dir_all(&output_dir);
+
+    // 3. Write the tool result as a tool output file.
+    let tool_output_path = PathBuf::from(&tool_dest_dir).join(format!(
+        "tool-{}-0-{}-{}.txt",
+        state.tool_name, state.timestamp, state.tool_call_id
+    ));
+    std::fs::write(&tool_output_path, &tool_output)
+        .map_err(|e| anyhow!("Failed to write tool output: {}", e))?;
+    eprintln!("[heavy-tool-runner] Wrote tool result to {:?}", tool_output_path);
+
+    // 4. Write the accumulated assistant content as an output file so
+    //    the model can see it as prior assistant history on the next turn.
+    if !state.accumulated_content.is_empty() {
+        let accum_path = PathBuf::from(&output_dir).join(format!(
+            "accum-{}.txt", state.timestamp
+        ));
+        std::fs::write(&accum_path, &state.accumulated_content)?;
+        eprintln!("[heavy-tool-runner] Wrote accumulated content to {:?}", accum_path);
+    }
+
+    // 5. Create a trigger file in the first input directory to re-trigger
+    //    inference for this agent.
+    if let Some(input_dir) = config.inputs.first() {
+        let _ = std::fs::create_dir_all(input_dir);
+        let trigger_path = PathBuf::from(input_dir).join(format!(
+            ".heavy-resume-{}.txt", state.timestamp
+        ));
+        // Write a resume message that the agent's next inference turn will
+        // pick up as user input.
+        std::fs::write(&trigger_path, "")?;
+        // Remove the trigger so it doesn't accumulate (the agent watches
+        // for file creation, so the brief existence is enough).
+        let _ = std::fs::remove_file(&trigger_path);
+        eprintln!("[heavy-tool-runner] Triggered resume for agent '{}'", state.agent_name);
+    }
+
+    // 6. Respawn the leader.
+    let exe = std::env::current_exe()?;
+    let config_path = resolve_config_path(None);
+    let log_dir = std::path::Path::new("/tmp/agentgraph");
+    let _ = std::fs::create_dir_all(log_dir);
+    if let Ok(log_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("leader.log"))
+    {
+        let _ = std::process::Command::new(&exe)
+            .arg("leader")
+            .arg("--config")
+            .arg(&config_path)
+            .env("AGENTGRAPH_BACKGROUND", "1")
+            .stdout(std::process::Stdio::from(log_file.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(log_file))
+            .spawn();
+    }
+
+    eprintln!("[heavy-tool-runner] Leader respawned — done");
+    Ok(())
 }

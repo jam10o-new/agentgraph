@@ -18,6 +18,7 @@ struct Args {
     realtime_audio: bool,
     prompt: Option<String>,
     tools: Vec<String>,
+    heavy_tools: Vec<String>,
     excluded_from_summary: Vec<String>,
     context_checkpoint_limit: Option<usize>,
 }
@@ -64,6 +65,7 @@ fn parse_args() -> Result<Args, String> {
         realtime_audio: bool_def(&raw, "realtime_audio", true),
         prompt: str_opt(&raw, "prompt"),
         tools: arr(&raw, "tools"),
+        heavy_tools: arr(&raw, "heavy_tools"),
         excluded_from_summary: arr(&raw, "excluded_from_summary"),
         context_checkpoint_limit: int_opt(&raw, "context_checkpoint_limit"),
     })
@@ -89,6 +91,7 @@ async fn main() {
                     "realtime_audio": { "type": "boolean" },
                     "prompt": { "type": "string", "nullable": true, "description": "Optional system prompt suffix." },
                     "tools": { "type": "array", "items": { "type": "string" }, "description": "Tool binary names to enable (e.g. ag-tool-bash, ag-tool-read). Empty = no tools." },
+                    "heavy_tools": { "type": "array", "items": { "type": "string" }, "description": "Heavy tool binaries that trigger model offloading (e.g. ag-tool-generate)." },
                     "excluded_from_summary": { "type": "array", "items": { "type": "string" } },
                     "context_checkpoint_limit": { "type": "integer", "nullable": true }
                 }
@@ -113,7 +116,7 @@ async fn main() {
     // ── Execute ──
     let Args {
         name, inputs, output, stream_output, tool_output, system, model,
-        history_limit, realtime_audio, prompt, tools,
+        history_limit, realtime_audio, prompt, tools, heavy_tools,
         excluded_from_summary, context_checkpoint_limit,
     } = parse_args().unwrap_or_else(|e| {
         eprintln!("Error: {e}");
@@ -139,6 +142,7 @@ async fn main() {
         excluded_from_summary,
         prepend_file_metadata: false,
         tools,
+        heavy_tools,
         consume_tool_calls: false,
         enable_thinking: false,
         inference_retries: 3,

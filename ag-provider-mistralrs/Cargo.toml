@@ -1,0 +1,32 @@
+[package]
+name = "ag-provider-mistralrs"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ag-provider-mistralrs"
+path = "src/main.rs"
+
+[dependencies]
+ag-provider-common = { path = "../ag-provider-common" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "macros", "io-util", "io-std"] }
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs" }
+mistralrs-core = { git = "https://github.com/EricLBuehler/mistral.rs" }
+either = "1"
+image = "0.25"
+serde_yaml = "0.9"
+futures = "0.3"
+
+[features]
+default = ["cuda", "cudnn", "flash-attn", "cutile"]
+cuda = ["mistralrs/cuda"]
+cudnn = ["mistralrs/cudnn"]
+flash-attn = ["mistralrs/flash-attn"]
+mkl = ["mistralrs/mkl"]
+nccl = ["mistralrs/nccl"]
+ring = ["mistralrs/ring"]
+cutile = ["mistralrs-core/cutile"]
+metal = ["mistralrs-core/metal"]
