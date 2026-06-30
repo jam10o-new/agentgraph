@@ -1,6 +1,8 @@
 # AgentGraph
 
-An async-first multi-agent daemon for real-time vision, audio, and text inference using [`mistral.rs`](https://github.com/EricLBuehler/mistral.rs). AgentGraph orchestrates multiple independent agents that communicate via the filesystem, utilizing a leader/follower pattern to maximize VRAM efficiency.
+An async-first multi-agent daemon for real-time vision, audio, and text inference. AgentGraph orchestrates multiple independent agents that communicate via the filesystem, utilizing a leader/follower pattern to maximize VRAM efficiency.
+
+Originally designed around [`mistral.rs`](https://github.com/EricLBuehler/mistral.rs) for local GPU inference, AgentGraph has evolved toward a pluggable, modular backend architecture. Inference providers are swappable at the agent or model level — you can use the built-in OpenAI-compatible provider, spawn your own subprocess server, or write a custom provider plugin — all without recompiling the core daemon.
 
 The usecases this was built for:
 - realtime chat summarization for streaming
@@ -22,7 +24,7 @@ What I am actively working on/roadmap:
 - running into issues that warrant upstream contribution.
 - testing tool use and colony orchestration.
 
-tl;dr: this is basically an opinionated, **vibecoded** (DO NOT USE FOR CRITICAL USECASES OR WITH UNTRUSTED INPUT! WE HAVE COMMAND EXECUTION AND NO SECURITY GUARDRAILS WHATSOEVER), wrapper and orchastration layer around [`mistral.rs`](https://github.com/EricLBuehler/mistral.rs) where the filesystem is the primary medium for context engineering and management.
+tl;dr: this is basically an opinionated, **vibecoded** (DO NOT USE FOR CRITICAL USECASES OR WITH UNTRUSTED INPUT! WE HAVE COMMAND EXECUTION AND NO SECURITY GUARDRAILS WHATSOEVER), agent orchestration layer where the filesystem is the primary medium for context engineering and management.
 
 Protip: Use and spawn with [`psi-cli`](https://github.com/jam10o-new/psi-cli) - a minimal AF chat harness.
 
@@ -31,11 +33,12 @@ Protip: Use and spawn with [`psi-cli`](https://github.com/jam10o-new/psi-cli) - 
 ## Core Features
 
 - **Async-First Architecture**: Every agent runs in its own coroutine with dedicated filesystem watchers and interrupt logic.
-- **Leader/Follower Pattern**: A single leader process manages model loading and inference, while followers (CLI subcommands) communicate via Unix Domain Sockets. This ensures VRAM is never duplicated across processes.
-- **Idiomatic Tool Calling**: Supports native `mistralrs` tool calling for models like Qwen or Llama. Tools are implemented as independent plugin binaries discovered from `$PATH` at runtime (see Plugin System below).
+- **Leader/Follower Pattern**: A single leader process manages inference, while followers (CLI subcommands) communicate via Unix Domain Sockets. This ensures VRAM is never duplicated across processes.
+- **Pluggable Inference Providers**: Backends are swappable at the agent or model level — OpenAI-compatible APIs, local subprocess servers, or custom provider plugins — without recompiling the daemon.
+- **Idiomatic Tool Calling**: Supports native tool calling via provider (Qwen, Llama, etc.). Tools are implemented as independent plugin binaries discovered from `$PATH` at runtime (see Plugin System below).
 - **Multimodal Support (Vision)**: Automatically detects images (`jpg`, `jpeg`, `png`, `webp`) in an agent's input directory and attaches them to the inference request.
 - **Context Compression**: Just-in-time summarization that compresses older conversation turns into contextually relevant "domains" to save context window space over time.
-- **Configuration-Driven**: All models, agents, and sampling parameters are managed via a simple YAML configuration.
+- **Configuration-Driven**: All models, agents, sampling parameters, and provider backends are managed via a simple YAML configuration.
 
 ## Installation
 
@@ -96,7 +99,7 @@ When a model issues a tool call, the agent loop hands it off to the configured t
 
 ## Plugin System
 
-AgentGraph supports two types of plugins, both discovered from `$PATH` via naming convention:
+AgentGraph supports three types of plugins, all discovered from `$PATH` via naming convention:
 
 ### Tool Plugins (`ag-tool-*`)
 
@@ -150,6 +153,53 @@ api-telegram:
 The leader spawns `ag-api-<name>` from `$PATH` with `--config`, `--socket`, and `--section <json>` arguments. Section values are opaque to the leader — each binary parses its own config independently. Missing binaries are logged but never prevent startup.
 
 **Third-party plugins** follow the same conventions without requiring leader or config-schema changes.
+
+### Provider Plugins (`ag-provider-*`)
+
+Provider plugins implement inference backends. Each agent or model in the config can specify a provider to use instead of loading models directly:
+
+```yaml
+models:
+  vision:
+    provider:
+      type: openai
+      api_base: "http://127.0.0.1:8338"
+      model: "google/gemma-4-12B-it"
+      server_command: "mistralrs serve --port 8338 -i google/gemma-4-12B-it --isq Q4_K_M"
+      startup_timeout_secs: 300
+
+agents:
+  researcher:
+    model: vision
+    provider:
+      type: plugin
+      name: custom-backend
+```
+
+Provider resolution is hierarchical: the agent-level `provider` takes precedence; if absent, the leader falls back to the model-level provider. Providers are created once per agent spawn and shared for the lifetime of that agent's session.
+
+| Config | Type | Description |
+|--------|------|-------------|
+| `type: openai` | Built-in | OpenAI-compatible HTTP API. Spawns `server_command` as a subprocess, waits for health, then routes all inference through its REST endpoint. Supports any server exposing a `/v1/chat/completions` endpoint (`mistralrs serve`, `llama.cpp`, `vLLM`, etc.). |
+| `type: plugin` | External | Custom provider binary named `ag-provider-{name}` on `$PATH`. The leader spawns it as a subprocess and communicates via its stdin/stdout protocol. Useful for wrapping proprietary or exotic backends without modifying the core daemon. |
+
+**OpenAI provider fields:**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `api_base` | `http://127.0.0.1:8338` | Base URL of the OpenAI-compatible API. |
+| `api_key` | `""` | API key (empty for local servers). |
+| `model` | `"default"` | Model name sent in API requests. |
+| `server_command` | `null` | Shell command to start the server. The provider spawns this and waits for the API to become healthy. |
+| `max_seq_len` | `null` | Override maximum sequence length (for context window management). |
+| `startup_timeout_secs` | `300` | Seconds to wait for the server to become healthy after spawning. |
+
+**Plugin provider fields:**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | required | Plugin name — the leader looks for `ag-provider-{name}` on `$PATH`. |
+| `max_seq_len` | `null` | Override maximum sequence length. |
 
 ### Training guidance in system prompts
 The `--help` output of each tool binary is injected into the system prompt during inference, so the model receives tool-specific usage guidance in natural language alongside the structured function schema.
